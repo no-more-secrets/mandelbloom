@@ -27,3 +27,20 @@ struct BlaTable {
 // cMax: largest |dc| in the image. eps: relative truncation tolerance for
 // dropping the dz^2 term (2^-24 is float-level accuracy).
 void buildBla(const ReferenceOrbit& ref, double cMax, double eps, BlaTable& out);
+
+// Float form of a node: mantissas with power-of-two exponents so deep
+// zooms fit in float. A = (ar, ai) * 2^ae, B = (br, bi) * 2^be,
+// r^2 = r2m * 2^r2e (r2m == 0 means never valid). 40 bytes.
+struct BlaNodeF {
+    float ar, ai;
+    float br, bi;
+    int ae, be;
+    float r2m;
+    int r2e;
+    int l;
+    int pad;
+};
+
+// Convert a double table to float nodes (same layout and offsets).
+void buildBlaFloat(const BlaTable& in, std::vector<BlaNodeF>& out);
+

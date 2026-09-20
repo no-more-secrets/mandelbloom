@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cmath>
 #include <algorithm>
+#include <cmath>
 
 namespace {
 
@@ -82,4 +83,44 @@ void buildBla(const ReferenceOrbit& ref, double cMax, double eps, BlaTable& out)
         prevCount = count;
     }
     out.buildMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+namespace {
+// Split a complex double into a float mantissa pair and a shared exponent.
+void splitComplex(double r, double i, float& mr, float& mi, int& e) {
+    const double mag = std::max(std::fabs(r), std::fabs(i));
+    if (!(mag > 0.0) || !std::isfinite(mag)) {
+        mr = std::isfinite(mag) ? 0.f : INFINITY;
+        mi = 0.f;
+        e = 0;
+        return;
+    }
+    int k;
+    std::frexp(mag, &k);
+    mr = (float)std::ldexp(r, -k);
+    mi = (float)std::ldexp(i, -k);
+    e = k;
+}
+}  // namespace
+
+void buildBlaFloat(const BlaTable& in, std::vector<BlaNodeF>& out) {
+    out.resize(in.nodes.size());
+    for (size_t i = 0; i < in.nodes.size(); ++i) {
+        const BlaNode& n = in.nodes[i];
+        BlaNodeF f{};
+        splitComplex(n.ar, n.ai, f.ar, f.ai, f.ae);
+        splitComplex(n.br, n.bi, f.br, f.bi, f.be);
+        if (n.r2 > 0.0 && std::isfinite(n.r2) && std::isfinite(n.ar) && std::isfinite(n.ai) &&
+            std::isfinite(n.br) && std::isfinite(n.bi)) {
+            int k;
+            const double m = std::frexp(n.r2, &k);
+            f.r2m = (float)m;
+            f.r2e = k;
+        } else {
+            f.r2m = 0.f;
+            f.r2e = 0;
+        }
+        f.l = n.l;
+        out[i] = f;
+    }
 }

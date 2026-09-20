@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cuda_runtime.h>
 #include "field.h"
 
 // The pixel grid of the render pass and how it maps onto the complex
@@ -15,6 +16,7 @@ struct ViewParams {
     int height = 0;
     int maxIter = 512;
     bool useBla = true;
+    bool useFloat = true;  // float kernel with per-value exponents (default); else double
 };
 
 // BLA table as uploaded to the device (see bla.h for the layout).
@@ -71,8 +73,8 @@ public:
     // Upload a new reference orbit (host arrays of `length` doubles).
     bool uploadReference(const double* zr, const double* zi, int length, bool escaped);
     // Upload a BLA table built for the current reference and view.
-    bool uploadBla(const struct BlaNode* nodes, int count, const int* levelOffset, int levels,
-                   int steps);
+    bool uploadBla(const struct BlaNode* nodes, const struct BlaNodeF* nodesF, int count,
+                   const int* levelOffset, int levels, int steps);
 
     // Heavy pass, run in slices so the UI stays live and no kernel runs long
     // enough to trip the Windows GPU watchdog. beginIterate resets state;
@@ -132,6 +134,8 @@ private:
     int refCapacity_ = 0;
     DeviceReference ref_;
     struct BlaNode* blaNodes_ = nullptr;
+    struct BlaNodeF* blaNodesF_ = nullptr;
+    float2* refF_ = nullptr;  // float2 copy of the reference orbit
     int* blaOffsets_ = nullptr;
     int blaNodeCapacity_ = 0;
     int blaLevelCapacity_ = 0;

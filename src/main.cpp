@@ -60,6 +60,7 @@ struct App {
     bool panDirty = false;
     ReferenceOrbit ref;
     BlaTable bla;
+    std::vector<BlaNodeF> blaF;
     float blaEpsLog2 = -24.f;
     ShadeParams shade;
     bool dirty = true;  // render view changed: restart the pass
@@ -225,7 +226,8 @@ void updateRefOffset(App& app) {
 void rebuildBla(App& app) {
     const double cMax = halfDiagonal(app) + std::hypot(app.view.refOffX, app.view.refOffY);
     buildBla(app.ref, cMax, std::exp2((double)app.blaEpsLog2), app.bla);
-    app.renderer.uploadBla(app.bla.nodes.data(), (int)app.bla.nodes.size(),
+    buildBlaFloat(app.bla, app.blaF);
+    app.renderer.uploadBla(app.bla.nodes.data(), app.blaF.data(), (int)app.bla.nodes.size(),
                            app.bla.levelOffset.data(), app.bla.levels, app.bla.steps);
 }
 
@@ -454,6 +456,8 @@ void drawUi(App& app) {
                     app.bla.nodes.size());
         if (ImGui::Checkbox("use BLA", &app.view.useBla)) app.dirty = true;
         ImGui::SameLine();
+        if (ImGui::Checkbox("float kernel", &app.view.useFloat)) app.dirty = true;
+        ImGui::SameLine();
         ImGui::SetNextItemWidth(120 * app.uiScale);
         if (ImGui::SliderFloat("eps log2", &app.blaEpsLog2, -40.f, -8.f, "%.0f")) app.dirty = true;
         if (app.renderer.iterateDone()) {
@@ -590,6 +594,7 @@ int main(int argc, char** argv) {
     int argPreset = 0;
     int argSs = 1;
     bool argNoBla = false;
+    bool argDouble = false;
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
@@ -600,6 +605,8 @@ int main(int argc, char** argv) {
             argSs = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--nobla") == 0) {
             argNoBla = true;
+        } else if (std::strcmp(argv[i], "--double") == 0) {
+            argDouble = true;
         } else {
             positional.push_back(argv[i]);
         }
@@ -656,6 +663,7 @@ int main(int argc, char** argv) {
     if (argPreset > 0) applyPreset(app.shade, argPreset);
     app.ss = std::min(3, std::max(1, argSs));
     if (argNoBla) app.view.useBla = false;
+    if (argDouble) app.view.useFloat = false;
 
     Uint64 lastTick = SDL_GetPerformanceCounter();
     bool running = true;

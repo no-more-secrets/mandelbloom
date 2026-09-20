@@ -11,7 +11,7 @@
 // through the view they were rendered with.
 struct FieldSample {
     float iter;   // smooth escape iteration; < 0 means inside the set
-    float de;     // distance estimate in complex units (0 if inside)
+    float de;     // distance estimate in pixels of the render field (0 if inside)
     float angle;  // arg(z_final) in [-pi, pi]
     float nx, ny; // exterior surface normal (Milnor: z / dz, normalised), 0 inside
     float gen;    // generation id, 0 = none

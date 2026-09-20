@@ -90,8 +90,8 @@ __device__ __forceinline__ void writeSample(FieldSample* __restrict__ field, siz
         s.iter = (float)(st.n + 1.0 - log2(logMag / 0.6931471805599453));
         const double dmag2 = st.dr * st.dr + st.di * st.di;
         const double dmag = sqrt(dmag2);
-        // Derivative was scaled by pixel size; undo it so de is in complex units.
-        s.de = dmag > 0.0 ? (float)(sqrt(mag2) * logMag / dmag * scale) : 0.f;
+        // Derivative was scaled by pixel size, so this DE is in pixels.
+        s.de = dmag > 0.0 ? (float)(sqrt(mag2) * logMag / dmag) : 0.f;
         s.angle = (float)atan2(zi, zr);
         // Milnor normal u = z / dz, normalised.
         if (dmag2 > 0.0) {
@@ -117,6 +117,10 @@ __device__ __forceinline__ unsigned long long globalTimerNs() {
 // Stamps the GPU clock right before the slice so the deadline is relative
 // to when the GPU actually started it, not when the host queued it.
 __global__ void stampTimer(unsigned long long* __restrict__ out) { *out = globalTimerNs(); }
+
+}  // namespace
+#include "iterate_float.cuh"
+namespace {
 
 // Find the longest BLA node starting at reference index m that is valid
 // for |dz|^2 = dzmag2. Returns nullptr if none.
@@ -461,7 +465,9 @@ void CudaRenderer::freeReference() {
     syncAll();
     if (refZr_) cudaFree(refZr_);
     if (refZi_) cudaFree(refZi_);
+    if (refF_) cudaFree(refF_);
     refZr_ = refZi_ = nullptr;
+    refF_ = nullptr;
     refCapacity_ = 0;
     ref_ = DeviceReference{};
 }
@@ -469,25 +475,30 @@ void CudaRenderer::freeReference() {
 void CudaRenderer::freeBla() {
     syncAll();
     if (blaNodes_) cudaFree(blaNodes_);
+    if (blaNodesF_) cudaFree(blaNodesF_);
     if (blaOffsets_) cudaFree(blaOffsets_);
     blaNodes_ = nullptr;
+    blaNodesF_ = nullptr;
     blaOffsets_ = nullptr;
     blaNodeCapacity_ = blaLevelCapacity_ = 0;
     bla_ = DeviceBla{};
 }
 
-bool CudaRenderer::uploadBla(const BlaNode* nodes, int count, const int* levelOffset, int levels,
-                             int steps) {
+bool CudaRenderer::uploadBla(const BlaNode* nodes, const BlaNodeF* nodesF, int count,
+                             const int* levelOffset, int levels, int steps) {
     CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream_));
     if (count > blaNodeCapacity_ || levels > blaLevelCapacity_) {
         freeBla();
         blaNodeCapacity_ = count + count / 4 + 1024;
         blaLevelCapacity_ = levels + 8;
         CUDA_CHECK(cudaMalloc(&blaNodes_, sizeof(BlaNode) * (size_t)blaNodeCapacity_));
+        CUDA_CHECK(cudaMalloc(&blaNodesF_, sizeof(BlaNodeF) * (size_t)blaNodeCapacity_));
         CUDA_CHECK(cudaMalloc(&blaOffsets_, sizeof(int) * (size_t)blaLevelCapacity_));
     }
     if (count > 0) {
         CUDA_CHECK(cudaMemcpy(blaNodes_, nodes, sizeof(BlaNode) * (size_t)count,
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(blaNodesF_, nodesF, sizeof(BlaNodeF) * (size_t)count,
                               cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(blaOffsets_, levelOffset, sizeof(int) * (size_t)levels,
                               cudaMemcpyHostToDevice));
@@ -506,9 +517,16 @@ bool CudaRenderer::uploadReference(const double* zr, const double* zi, int lengt
         refCapacity_ = length + length / 4 + 1024;
         CUDA_CHECK(cudaMalloc(&refZr_, sizeof(double) * (size_t)refCapacity_));
         CUDA_CHECK(cudaMalloc(&refZi_, sizeof(double) * (size_t)refCapacity_));
+        CUDA_CHECK(cudaMalloc(&refF_, sizeof(float2) * (size_t)refCapacity_));
     }
     CUDA_CHECK(cudaMemcpy(refZr_, zr, sizeof(double) * (size_t)length, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(refZi_, zi, sizeof(double) * (size_t)length, cudaMemcpyHostToDevice));
+    {
+        std::vector<float2> f((size_t)length);
+        for (int i = 0; i < length; ++i) f[(size_t)i] = make_float2((float)zr[i], (float)zi[i]);
+        CUDA_CHECK(cudaMemcpy(refF_, f.data(), sizeof(float2) * (size_t)length,
+                              cudaMemcpyHostToDevice));
+    }
     ref_.zr = refZr_;
     ref_.zi = refZi_;
     ref_.length = length;
@@ -640,11 +658,29 @@ bool CudaRenderer::stepIterate() {
     CUDA_CHECK(cudaMemsetAsync(activeCount_, 0, sizeof(int), stream));
     cudaEventRecord((cudaEvent_t)evStart_, stream);
     stampTimer<<<1, 1, 0, stream>>>(sliceStart_ns_);
-    iterateSlice<<<grid, block, 0, stream>>>(state_, field_, fieldW_, fieldH_, marginX_, marginY_,
-                                             viewW_, viewH_, stride_, iterView_.scale,
-                                             iterView_.refOffX, iterView_.refOffY,
-                                             iterView_.maxIter, sliceIters_, sliceStart_ns_,
-                                             kSliceBudgetNs, ref_, bla_, gen_, activeCount_);
+    if (iterView_.useFloat) {
+        int eP;
+        const double mP = std::frexp(iterView_.scale, &eP);
+        DeviceReferenceF rf;
+        rf.z = refF_;
+        rf.length = ref_.length;
+        DeviceBlaF bf;
+        bf.nodes = blaNodesF_;
+        bf.levelOffset = bla_.levelOffset;
+        bf.levels = bla_.levels;
+        bf.steps = bla_.steps;
+        bf.enabled = bla_.enabled;
+        iterateSliceF<<<grid, block, 0, stream>>>(
+            (PixelStateF*)state_, field_, fieldW_, fieldH_, marginX_, marginY_, viewW_, viewH_,
+            stride_, (float)mP, eP, iterView_.refOffX / iterView_.scale,
+            iterView_.refOffY / iterView_.scale, iterView_.maxIter, sliceIters_, sliceStart_ns_,
+            kSliceBudgetNs, rf, bf, gen_, activeCount_);
+    } else {
+        iterateSlice<<<grid, block, 0, stream>>>(
+            state_, field_, fieldW_, fieldH_, marginX_, marginY_, viewW_, viewH_, stride_,
+            iterView_.scale, iterView_.refOffX, iterView_.refOffY, iterView_.maxIter, sliceIters_,
+            sliceStart_ns_, kSliceBudgetNs, ref_, bla_, gen_, activeCount_);
+    }
     CUDA_CHECK(cudaGetLastError());
     cudaEventRecord((cudaEvent_t)evStop_, stream);
     CUDA_CHECK(cudaMemcpyAsync(activeCountHost_, activeCount_, sizeof(int),
@@ -676,8 +712,11 @@ bool CudaRenderer::debugStats(float gen, DebugStats& out) {
             } else {
                 ++out.genOther;
             }
-            if (st[i].status == 0) ++out.stActive;
-            else if (st[i].status == 1) ++out.stEscaped;
+            const int status = iterView_.useFloat
+                                   ? reinterpret_cast<const PixelStateF*>(st.data())[i].status
+                                   : st[i].status;
+            if (status == 0) ++out.stActive;
+            else if (status == 1) ++out.stEscaped;
             else ++out.stInside;
         }
     }

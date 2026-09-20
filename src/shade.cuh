@@ -72,8 +72,8 @@ struct IterGradient {
     bool valid = false;
 };
 
-// Shade one sample to linear RGB. pixelScale is complex units per pixel,
-// used to turn the distance estimate into an edge weight.
+// Shade one sample to linear RGB. de is in pixels; pixelScale is unused
+// now but kept for future colourings in complex units.
 __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeParams& p,
                                               float timeSec, float pixelScale,
                                               const IterGradient& g) {
@@ -125,7 +125,7 @@ __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeP
         }
         case SHADE_DISTANCE: {
             // Log distance from the set, in pixels; `special` decades per cycle.
-            const float dpx = fmaxf(s.de / pixelScale, 1e-6f);
+            const float dpx = fmaxf(s.de, 1e-6f);
             const float v = log10f(dpx) / fmaxf(p.special, 0.01f);
             col = palette(p, v + p.offset + p.cycleSpeed * timeSec);
             break;
@@ -164,7 +164,7 @@ __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeP
     }
 
     if (p.deStrength > 0.f) {
-        float edge = s.de / pixelScale;
+        float edge = s.de;
         edge = fminf(fmaxf(edge, 0.f), 1.f);
         edge = powf(edge, 0.5f * p.deStrength);
         col.x *= edge;
