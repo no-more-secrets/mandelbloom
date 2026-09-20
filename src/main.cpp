@@ -483,7 +483,18 @@ void drawUi(App& app) {
             char label[64];
             if (eta >= 0.f) std::snprintf(label, sizeof label, "%.0f%%  %.1f s left", pr * 100.f, eta / 1000.f);
             else std::snprintf(label, sizeof label, "%.0f%%", pr * 100.f);
-            ImGui::ProgressBar(pr, ImVec2(-1.f, 0.f), label);
+            // Bar without ImGui's moving label, then the label centred and
+            // outlined so it reads over both the filled and empty parts.
+            ImGui::ProgressBar(pr, ImVec2(-1.f, 0.f), "");
+            const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+            const ImVec2 ts = ImGui::CalcTextSize(label);
+            const ImVec2 pos(0.5f * (mn.x + mx.x - ts.x), 0.5f * (mn.y + mx.y - ts.y));
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const ImU32 outline = IM_COL32(0, 0, 0, 255), fill = IM_COL32(255, 255, 255, 255);
+            for (int oy = -1; oy <= 1; ++oy)
+                for (int ox = -1; ox <= 1; ++ox)
+                    if (ox || oy) dl->AddText(ImVec2(pos.x + ox, pos.y + oy), outline, label);
+            dl->AddText(pos, fill, label);
             ImGui::Text("iterate %.0f ms  (stride %d, slice %.1f ms)", app.renderer.lastIterateMs(),
                         app.renderer.currentStride(), app.renderer.lastSliceMs());
         }
