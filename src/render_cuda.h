@@ -74,8 +74,12 @@ public:
     bool bindOutput(void* sharedHandle, size_t sharedSize, int rowPitchBytes, int width,
                     int height, int ss);
     // Linear multiplier applied when writing output (SDR white level in
-    // scRGB: 1.0 on SDR displays, e.g. 2.5 for a 200-nit SDR white in HDR).
-    void setOutputScale(float s) { outScale_ = s; }
+    // scRGB: 1.0 on SDR displays, e.g. 2.5 for a 200-nit SDR white in HDR),
+    // and the display's headroom above it (peak / SDR white).
+    void setOutputScale(float s, float headroom) { outScale_ = s; headroom_ = headroom; }
+    // Post-process the linear image written by composite()/shadeCached()
+    // into the output buffer. Must run after either before presenting.
+    bool postProcess(const PostParams& params, uint32_t frame);
     // Wait for the display stream, so D3D12 may copy the output buffer.
     bool syncDisplay();
     // Read the output back as 8-bit sRGB (divided by the output scale).
@@ -132,6 +136,7 @@ public:
     float lastIterateMs() const { return iterateMs_; }  // total for the last full pass
     float lastSliceMs() const { return sliceMs_; }
     float lastShadeMs() const { return shadeMs_; }
+    float lastPostMs() const { return postMs_; }
     const char* deviceName() const { return deviceName_; }
 
 private:
@@ -146,6 +151,13 @@ private:
     uint16_t* out_ = nullptr;   // mapped shared buffer, RGBA16F
     int outPitchPx_ = 0;        // pixels per row in out_
     float outScale_ = 1.f;
+    float headroom_ = 1.f;
+    uint16_t* hdr_ = nullptr;      // linear RGBA16F, display size, written by shading
+    float4* bloomA_ = nullptr;     // 1/4 res
+    float4* bloomT_ = nullptr;     // 1/4 res temp
+    float4* bloomB_ = nullptr;     // 1/8 res
+    float4* bloomT2_ = nullptr;    // 1/8 res temp
+    float postMs_ = 0.f;
     FieldSample* field_ = nullptr;
     struct PixelState* state_ = nullptr;
     FieldSample* fieldAlt_ = nullptr;

@@ -1,7 +1,8 @@
 # mandelgpu
 
 Mandelbrot viewer for Windows. CUDA does the iteration, SDL3 and Dear ImGui
-do the window and UI, OpenGL shows the result through CUDA interop (no copies).
+do the window and UI, Direct3D 12 presents an FP16 scRGB swapchain (HDR on
+HDR displays) that CUDA writes into directly through a shared buffer.
 
 ## How it renders
 
@@ -14,13 +15,19 @@ do the window and UI, OpenGL shows the result through CUDA interop (no copies).
    per-value exponent on every small quantity (`iterate_float.cuh`), so
    depth is not limited by float range; `--double` selects the double
    kernel (`render_cuda.cu`) for comparison.
-4. A separate shading kernel colors the field each frame (`shade.cuh`).
-   Palette changes and animation never re-iterate.
+4. A separate shading kernel colors the field (`shade.cuh`). Palette changes
+   and animation never re-iterate. Once the view has settled, the resolved
+   subsamples are cached and animated frames are a single streaming pass.
+5. Post-processing runs on the linear image (`post.cuh`): bloom (two blur
+   levels), vignette, chromatic aberration, grain, sharpen, saturation,
+   contrast, gain, and tone mapping (clamp, Reinhard, ACES) into the
+   display's HDR headroom. The output is scaled to the display's SDR white
+   level so the picture looks the same on SDR and HDR monitors.
 
 ## Build
 
-Requires Visual Studio 2026 with the C++ workload, CUDA Toolkit 13.4, and an
-NVIDIA GPU. Dependencies come from the vcpkg bundled with Visual Studio.
+Requires Visual Studio 2026 with the C++ workload, the Windows SDK, CUDA
+Toolkit 13.4, and an NVIDIA GPU. Dependencies come from the vcpkg bundled with Visual Studio.
 
 ```powershell
 .\build.ps1 -Run
@@ -49,8 +56,9 @@ animation.
 `--script "wait:1500;wheel:5;drag:300,120,12;pan:8,0;shot:out.png;quit"`
 replays input through SDL events and saves the composited frame, with field
 statistics on stdout. `--preset N` picks a shading preset, `--ss N`
-supersampling, `--nobla` and `--double` select the slow paths for
-comparison. Run it minimised.
+supersampling, `--post "bloom=1.5,vignette=0.4,tonemap=2"` sets post
+parameters, `--nobla` and `--double` select the slow paths for comparison.
+Run it minimised. `build/shots/cmp.py a.png b.png` reports differing pixels.
 
 ## Plan
 
@@ -62,8 +70,9 @@ comparison. Run it minimised.
 6. Shaders: gradient/cosine palettes, slope lighting, iteration lines, modes, presets. (done)
 7. Supersampling 1x/2x/3x. (done)
 8. Better BLA validity (Imagina-style) for spiral regions.
-9. HDR output (D3D12 swapchain), 4K export, zoom video export.
-10. CPU SIMD path (ISPC) for glitch repair and second references.
+9. HDR output (D3D12 swapchain) and post-processing. (done)
+10. 4K image export, zoom video export.
+11. CPU SIMD path (ISPC) for glitch repair and second references.
 
 Timings on an RTX 4080, 1920x1200, 1x:
 

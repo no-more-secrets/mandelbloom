@@ -65,6 +65,11 @@ struct App {
     std::vector<BlaNodeF> blaF;
     float blaEpsLog2 = -24.f;
     ShadeParams shade;
+    PostParams post;
+    PostParams lastPost;
+    bool lastPostValid = false;
+    uint32_t frameIndex = 0;
+    bool imageDirty = false;  // shading wrote a new linear image this frame
     bool dirty = true;  // render view changed: restart the pass
     bool animate = false;
     float animTime = 0.f;  // seconds of animation elapsed (advances only while animating)
@@ -119,7 +124,7 @@ void readHdrState(App& app) {
     app.sdrWhite = SDL_GetFloatProperty(props, SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT, 1.f);
     app.hdrHeadroom = SDL_GetFloatProperty(props, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.f);
     if (app.sdrWhite <= 0.f) app.sdrWhite = 1.f;
-    app.renderer.setOutputScale(app.sdrWhite);
+    app.renderer.setOutputScale(app.sdrWhite, app.hdrHeadroom);
     app.uiScale = 0.f;  // re-apply style with the new white level
     applyUiScale(app);
 }
@@ -435,7 +440,7 @@ bool handleEvent(App& app, const SDL_Event& e) {
             break;
         case SDL_EVENT_WINDOW_HDR_STATE_CHANGED:
             readHdrState(app);
-            app.cachedShown = false;  // output scale changed: recolour
+            app.lastPostValid = false;  // output scale changed: re-run post
             break;
         case SDL_EVENT_KEY_DOWN:
             if (io.WantCaptureKeyboard) break;
@@ -536,6 +541,7 @@ void drawUi(App& app) {
         }
         ImGui::Text("display %.2f ms%s", app.renderer.lastShadeMs(),
                     app.cachedShown ? "  (cached)" : "");
+        ImGui::Text("post    %.2f ms", app.renderer.lastPostMs());
         ImGui::Text("output  %s  SDR white %.2f  headroom %.2f",
                     app.hdrEnabled ? "HDR scRGB FP16" : "SDR (FP16 scRGB)", app.sdrWhite,
                     app.hdrHeadroom);
@@ -649,6 +655,29 @@ void drawUi(App& app) {
             ImGui::SliderFloat("wave cyc/s", &sp.waveSpeed, -2.f, 2.f, "%.2f");
             ImGui::SliderFloat("settled fps cap", &app.bgFps, 0.f, 240.f, "%.0f (0 = every frame)");
         }
+        if (ImGui::CollapsingHeader("Post")) {
+            PostParams& pp = app.post;
+            const char* tms[] = {"clamp", "Reinhard", "ACES"};
+            ImGui::Combo("tone map", &pp.tonemap, tms, 3);
+            ImGui::SliderFloat("HDR boost", &pp.hdrBoost, 0.25f, 8.f, "%.2f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SeparatorText("bloom");
+            ImGui::SliderFloat("intensity", &pp.bloomIntensity, 0.f, 3.f);
+            ImGui::SliderFloat("threshold", &pp.bloomThreshold, 0.f, 3.f);
+            ImGui::SliderFloat("knee", &pp.bloomKnee, 0.f, 1.f);
+            ImGui::SliderInt("radius", &pp.bloomRadius, 1, 24);
+            ImGui::SliderFloat("wide level", &pp.bloomWide, 0.f, 2.f);
+            ImGui::SeparatorText("lens");
+            ImGui::SliderFloat("vignette", &pp.vignette, 0.f, 1.f);
+            ImGui::SliderFloat("vignette soft", &pp.vignetteSoft, 0.05f, 1.2f);
+            ImGui::SliderFloat("aberration px", &pp.aberration, 0.f, 12.f);
+            ImGui::SliderFloat("grain", &pp.grain, 0.f, 1.f);
+            ImGui::SliderFloat("sharpen", &pp.sharpen, 0.f, 2.f);
+            ImGui::SeparatorText("grade");
+            ImGui::SliderFloat("saturation", &pp.saturation, 0.f, 2.f);
+            ImGui::SliderFloat("contrast", &pp.contrast, 0.5f, 2.f);
+            ImGui::SliderFloat("gain", &pp.gain, 0.f, 4.f);
+            if (ImGui::Button("reset post")) pp = PostParams();
+        }
     }
     ImGui::End();
 }
@@ -668,6 +697,7 @@ int main(int argc, char** argv) {
     int argSs = 1;
     bool argNoBla = false;
     bool argDouble = false;
+    std::string argPost;  // "bloom=1.2,vignette=0.4,tonemap=2,..." 
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
@@ -680,6 +710,8 @@ int main(int argc, char** argv) {
             argNoBla = true;
         } else if (std::strcmp(argv[i], "--double") == 0) {
             argDouble = true;
+        } else if (std::strcmp(argv[i], "--post") == 0 && i + 1 < argc) {
+            argPost = argv[++i];
         } else {
             positional.push_back(argv[i]);
         }
@@ -730,6 +762,35 @@ int main(int argc, char** argv) {
     app.ss = std::min(3, std::max(1, argSs));
     if (argNoBla) app.view.useBla = false;
     if (argDouble) app.view.useFloat = false;
+    if (!argPost.empty()) {
+        // Comma-separated key=value pairs.
+        size_t start = 0;
+        while (start < argPost.size()) {
+            size_t end = argPost.find(',', start);
+            if (end == std::string::npos) end = argPost.size();
+            const std::string kv = argPost.substr(start, end - start);
+            const size_t eq = kv.find('=');
+            if (eq != std::string::npos) {
+                const std::string k = kv.substr(0, eq);
+                const float v = (float)std::atof(kv.substr(eq + 1).c_str());
+                PostParams& pp = app.post;
+                if (k == "tonemap") pp.tonemap = (int)v;
+                else if (k == "boost") pp.hdrBoost = v;
+                else if (k == "bloom") pp.bloomIntensity = v;
+                else if (k == "threshold") pp.bloomThreshold = v;
+                else if (k == "radius") pp.bloomRadius = (int)v;
+                else if (k == "wide") pp.bloomWide = v;
+                else if (k == "vignette") pp.vignette = v;
+                else if (k == "aberration") pp.aberration = v;
+                else if (k == "grain") pp.grain = v;
+                else if (k == "saturation") pp.saturation = v;
+                else if (k == "contrast") pp.contrast = v;
+                else if (k == "gain") pp.gain = v;
+                else if (k == "sharpen") pp.sharpen = v;
+            }
+            start = end + 1;
+        }
+    }
 
     Uint64 lastTick = SDL_GetPerformanceCounter();
     bool running = true;
@@ -859,6 +920,7 @@ int main(int argc, char** argv) {
                 app.cacheValid = false;
                 app.cachedShown = false;
                 app.renderer.composite(app.shade, app.animTime, m);
+                app.imageDirty = true;
             } else {
                 if (!app.cacheValid || staticChanged || app.cacheGen != gen0) {
                     app.renderer.buildShadeCache(app.shade, m);
@@ -875,11 +937,24 @@ int main(int argc, char** argv) {
                     if (app.renderer.shadeCached(app.shade, app.animTime)) {
                         app.cachedShown = true;
                         app.lastShadeSec = nowSeconds();
+                        app.imageDirty = true;
                     }
                 }
             }
             app.lastShade = app.shade;
             app.lastShadeValid = true;
+
+            // Post-processing: whenever the image or its parameters changed,
+            // and every frame while grain animates.
+            const bool postChanged = !app.lastPostValid ||
+                                     std::memcmp(&app.post, &app.lastPost, sizeof(PostParams)) != 0;
+            if (app.imageDirty || postChanged || (app.post.grain > 0.f && app.animate)) {
+                app.renderer.postProcess(app.post, app.frameIndex);
+                app.imageDirty = false;
+            }
+            app.lastPost = app.post;
+            app.lastPostValid = true;
+            ++app.frameIndex;
         }
 
         app.display.imguiNewFrame();

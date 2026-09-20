@@ -80,3 +80,24 @@ struct ShadeParams {
     float lightSpeed = 0.f;     // light angle, degrees per second
     float waveSpeed = 0.f;      // wave/panel phase, cycles per second
 };
+
+// Post-processing on the linear image, applied after shading each time the
+// image or these parameters change. Bloom radii are in pixels of the
+// quarter-resolution buffer.
+struct PostParams {
+    int tonemap = 0;              // 0 clamp, 1 Reinhard extended, 2 ACES fitted
+    float hdrBoost = 1.f;         // multiplier before tone mapping; >1 reaches into HDR headroom
+    float bloomIntensity = 0.f;   // 0 = off
+    float bloomThreshold = 0.8f;  // luminance where bloom starts
+    float bloomKnee = 0.3f;
+    int bloomRadius = 8;          // 1..24
+    float bloomWide = 0.5f;       // weight of the wide (1/8 res) level
+    float vignette = 0.f;
+    float vignetteSoft = 0.6f;
+    float aberration = 0.f;       // pixels at the corners
+    float grain = 0.f;
+    float saturation = 1.f;
+    float contrast = 1.f;
+    float gain = 1.f;
+    float sharpen = 0.f;
+};

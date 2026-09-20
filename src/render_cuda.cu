@@ -7,6 +7,7 @@
 #include "render_cuda.h"
 #include "bla.h"
 #include "shade.cuh"
+#include "post.cuh"
 
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \
@@ -374,7 +375,7 @@ __device__ __forceinline__ bool sampleBest(const FieldSample* __restrict__ field
     return true;
 }
 
-// Write a linear colour as RGBA16F into the output buffer (scRGB).
+// Write a linear colour as RGBA16F into the shading result buffer.
 __device__ __forceinline__ void storeOut(uint16_t* __restrict__ out, int pitchPx, int x, int y,
                                          float3 c, float scale) {
     ushort4 v;
@@ -583,9 +584,16 @@ void CudaRenderer::freeField() {
     if (fieldAlt_) cudaFree(fieldAlt_);
     if (stateAlt_) cudaFree(stateAlt_);
     if (shadeCache_) cudaFree(shadeCache_);
+    if (hdr_) cudaFree(hdr_);
+    if (bloomA_) cudaFree(bloomA_);
+    if (bloomT_) cudaFree(bloomT_);
+    if (bloomB_) cudaFree(bloomB_);
+    if (bloomT2_) cudaFree(bloomT2_);
     field_ = fieldAlt_ = nullptr;
     state_ = stateAlt_ = nullptr;
     shadeCache_ = nullptr;
+    hdr_ = nullptr;
+    bloomA_ = bloomT_ = bloomB_ = bloomT2_ = nullptr;
     iterDone_ = true;
     sliceInFlight_ = false;
 }
@@ -700,6 +708,15 @@ bool CudaRenderer::bindOutput(void* sharedHandle, size_t sharedSize, int rowPitc
     CUDA_CHECK(cudaMalloc(&fieldAlt_, sizeof(FieldSample) * fn));
     CUDA_CHECK(cudaMalloc(&stateAlt_, sizeof(PixelState) * fn));
     CUDA_CHECK(cudaMalloc(&shadeCache_, sizeof(ShadeInput) * n * (size_t)(ss_ * ss_)));
+    CUDA_CHECK(cudaMalloc(&hdr_, sizeof(uint16_t) * 4 * n));
+    {
+        const size_t aw = (width + 3) / 4, ah = (height + 3) / 4;
+        const size_t bw = (aw + 1) / 2, bh = (ah + 1) / 2;
+        CUDA_CHECK(cudaMalloc(&bloomA_, sizeof(float4) * aw * ah));
+        CUDA_CHECK(cudaMalloc(&bloomT_, sizeof(float4) * aw * ah));
+        CUDA_CHECK(cudaMalloc(&bloomB_, sizeof(float4) * bw * bh));
+        CUDA_CHECK(cudaMalloc(&bloomT2_, sizeof(float4) * bw * bh));
+    }
     if (!paletteLut_) CUDA_CHECK(cudaMalloc(&paletteLut_, sizeof(float4) * PALETTE_LUT_SIZE));
     clearField<<<(int)((fn + 255) / 256), 256>>>(field_, (int)fn);
     CUDA_CHECK(cudaGetLastError());
@@ -869,7 +886,7 @@ bool CudaRenderer::debugStats(int gen, DebugStats& out) {
 }
 
 bool CudaRenderer::composite(const ShadeParams& params, float timeSec, const CompositeMap& map) {
-    if (!out_ || !field_) return false;
+    if (!hdr_ || !field_) return false;
     cudaStream_t stream = (cudaStream_t)dispStream_;
     const dim3 block(16, 16);
     const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
@@ -879,9 +896,9 @@ bool CudaRenderer::composite(const ShadeParams& params, float timeSec, const Com
         shadePending_ = false;
     }
     if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
-    compositeKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, marginX_, marginY_, out_,
-                                                outPitchPx_, outScale_, width_, height_, params,
-                                                timeSec, map, paletteLut_);
+    compositeKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, marginX_, marginY_, hdr_,
+                                                width_, 1.f, width_, height_, params, timeSec, map,
+                                                paletteLut_);
     const cudaError_t err = cudaGetLastError();
     if (!shadePending_) {
         cudaEventRecord((cudaEvent_t)evShadeB_, stream);
@@ -914,7 +931,7 @@ bool CudaRenderer::buildShadeCache(const ShadeParams& params, const CompositeMap
 }
 
 bool CudaRenderer::shadeCached(const ShadeParams& params, float timeSec) {
-    if (!out_ || !shadeCache_) return false;
+    if (!hdr_ || !shadeCache_) return false;
     cudaStream_t stream = (cudaStream_t)dispStream_;
     const dim3 block(16, 16);
     const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
@@ -923,8 +940,8 @@ bool CudaRenderer::shadeCached(const ShadeParams& params, float timeSec) {
         shadePending_ = false;
     }
     if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
-    shadeCachedKernel<<<grid, block, 0, stream>>>(shadeCache_, out_, outPitchPx_, outScale_, width_,
-                                                  height_, ss_, params, timeSec, paletteLut_);
+    shadeCachedKernel<<<grid, block, 0, stream>>>(shadeCache_, hdr_, width_, 1.f, width_, height_,
+                                                  ss_, params, timeSec, paletteLut_);
     const cudaError_t err = cudaGetLastError();
     if (!shadePending_) {
         cudaEventRecord((cudaEvent_t)evShadeB_, stream);
@@ -932,6 +949,42 @@ bool CudaRenderer::shadeCached(const ShadeParams& params, float timeSec) {
     }
     if (err != cudaSuccess) {
         std::fprintf(stderr, "shadeCached kernel failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool CudaRenderer::postProcess(const PostParams& params, uint32_t frame) {
+    if (!out_ || !hdr_) return false;
+    cudaStream_t stream = (cudaStream_t)dispStream_;
+    const dim3 block(16, 16);
+    const int aw = (width_ + 3) / 4, ah = (height_ + 3) / 4;
+    const int bw = (aw + 1) / 2, bh = (ah + 1) / 2;
+    cudaEvent_t t0, t1;
+    cudaEventCreate(&t0);
+    cudaEventCreate(&t1);
+    cudaEventRecord(t0, stream);
+    if (params.bloomIntensity > 0.f) {
+        const dim3 ga((aw + 15) / 16, (ah + 15) / 16), gb((bw + 15) / 16, (bh + 15) / 16);
+        postBloomDown<<<ga, block, 0, stream>>>(hdr_, width_, height_, bloomA_, aw, ah,
+                                                params.bloomThreshold, params.bloomKnee);
+        postBlur<<<ga, block, 0, stream>>>(bloomA_, bloomT_, aw, ah, params.bloomRadius, 1, 0);
+        postBlur<<<ga, block, 0, stream>>>(bloomT_, bloomA_, aw, ah, params.bloomRadius, 0, 1);
+        postDown2<<<gb, block, 0, stream>>>(bloomA_, aw, ah, bloomB_, bw, bh);
+        postBlur<<<gb, block, 0, stream>>>(bloomB_, bloomT2_, bw, bh, params.bloomRadius, 1, 0);
+        postBlur<<<gb, block, 0, stream>>>(bloomT2_, bloomB_, bw, bh, params.bloomRadius, 0, 1);
+    }
+    const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
+    postFinal<<<grid, block, 0, stream>>>(hdr_, width_, height_, bloomA_, aw, ah, bloomB_, bw, bh,
+                                          out_, outPitchPx_, params, outScale_, headroom_, frame);
+    const cudaError_t err = cudaGetLastError();
+    cudaEventRecord(t1, stream);
+    cudaEventSynchronize(t1);
+    cudaEventElapsedTime(&postMs_, t0, t1);
+    cudaEventDestroy(t0);
+    cudaEventDestroy(t1);
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "post kernel failed: %s\n", cudaGetErrorString(err));
         return false;
     }
     return true;
