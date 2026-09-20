@@ -405,7 +405,7 @@ void writeLocationFile(App& app, const std::string& stem) {
     std::ofstream loc(stem + ".txt");
     // A complete command line for this exact picture.
     loc << app.render.cx.toString(dg) << " " << app.render.cy.toString(dg) << " "
-        << app.render.scale * app.ss << " " << app.view.maxIter << " --ss " << app.ss << " --aa "
+        << app.render.scale << " " << app.view.maxIter << " --ss " << app.ss << " --aa "
         << app.aa.pattern << "," << app.aa.filter << "," << app.aa.radius << " --loadfile \""
         << stem << ".preset\"\n";
     savePresetFile(stem + ".preset", currentLook(app));

@@ -1,0 +1,46 @@
+mandelgpu-preset 1
+animate 0
+mode 0
+density 107.8
+offset 0.073
+logScale 1
+special 4
+paletteType 0
+stopCount 5
+stopPos 0 0.38 0.55 0.58 1 0 0 0
+stopColor 0.06 0.07 0.22 0.35 0.55 0.85 1 1 1 1 0.6 0.1 0.06 0.07 0.22 0 0 0 0 0 0 0 0 0
+cosA 0.5 0.5 0.5
+cosB 0.5 0.5 0.5
+cosC 1 1 1
+cosD 0 0.33 0.67
+deStrength 0.899
+exposure 0.852
+inside 0 0 0
+slopes 1
+slopeAngle 30
+slopeHeight 1
+slopeStrength 0.85
+lines 0
+lineDensity 1
+lineWidth 1.2
+lineStrength 0.85
+lineColor 0 0 0
+wavePhase 0
+cycleSpeed -0.42
+lightSpeed 0
+waveSpeed 0
+tonemap 2
+hdrBoost 1.5
+bloomIntensity 0.574
+bloomThreshold 0.292
+bloomKnee 0.3
+bloomRadius 9
+bloomWide 1.644
+vignette 0.926
+vignetteSoft 0.546
+aberration 1.49
+grain 0
+saturation 1.409
+contrast 1.287
+gain 1.832
+sharpen 0

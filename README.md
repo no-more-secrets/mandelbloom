@@ -2,10 +2,11 @@
 
 ![mandelbloom cover: a minibrot at 3.6e16 zoom in the solar preset with bloom](docs/cover.jpg)
 
-Cover location: `-0.67032685353483673009225 0.4581119683700364283828 2.29e-20 19552`,
-solar preset with bloom. Every F2 capture writes a `.txt` beside it holding
-the full command line and a `.preset` with the exact look, so any shot can be
-reproduced with `--loadfile`.
+The cover, reproducible (the preset is `docs/cover.preset`):
+
+```
+mandelgpu.exe -0.67032685353483673009225 0.4581119683700364283828 2.29e-20 19552 --ss 2 --aa 2,3,1.5 --loadfile docs\cover.preset
+```
 
 GPU Mandelbrot viewer for Windows, built for 4K HDR and smooth deep zooms. CUDA does the iteration, SDL3 and Dear ImGui
 do the window and UI, Direct3D 12 presents an FP16 scRGB swapchain (HDR on
