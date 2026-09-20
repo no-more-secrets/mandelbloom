@@ -231,6 +231,50 @@ void mapOnto(const App& app, const View& src, double& ox, double& oy, double& ra
     oy = 0.5 * app.view.height - BigFloat::diff(app.shown.cy, src.cy) / src.scale;
 }
 
+// Shading presets. Each fully replaces the shading parameters.
+void applyPreset(ShadeParams& sp, int which) {
+    sp = ShadeParams();
+    switch (which) {
+        case 1: {  // Pastel lines: pale palette, relief lighting, thin dark lines
+            const float a[3] = {0.86f, 0.84f, 0.88f}, b[3] = {0.14f, 0.16f, 0.12f};
+            const float d[3] = {0.00f, 0.25f, 0.55f};
+            for (int i = 0; i < 3; ++i) { sp.a[i] = a[i]; sp.b[i] = b[i]; sp.d[i] = d[i]; }
+            sp.density = 24.f;
+            sp.slopes = 1;
+            sp.slopeAngle = 60.f;
+            sp.slopeHeight = 1.2f;
+            sp.slopeStrength = 0.55f;
+            sp.lines = 1;
+            sp.lineDensity = 1.f;
+            sp.lineWidth = 1.1f;
+            sp.lineStrength = 0.8f;
+            sp.deStrength = 0.6f;
+            sp.inside[0] = sp.inside[1] = sp.inside[2] = 0.05f;
+            break;
+        }
+        case 2: {  // Relief: classic colours with strong slope lighting
+            sp.slopes = 1;
+            sp.slopeAngle = 30.f;
+            sp.slopeHeight = 1.0f;
+            sp.slopeStrength = 0.85f;
+            sp.deStrength = 0.f;
+            break;
+        }
+        case 3: {  // Mono lines: white paper, ink lines, soft relief
+            for (int i = 0; i < 3; ++i) { sp.a[i] = 0.93f; sp.b[i] = 0.05f; }
+            sp.slopes = 1;
+            sp.slopeStrength = 0.35f;
+            sp.lines = 1;
+            sp.lineWidth = 1.0f;
+            sp.lineStrength = 0.9f;
+            sp.deStrength = 0.4f;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 bool handleEvent(App& app, const SDL_Event& e) {
     ImGui_ImplSDL3_ProcessEvent(&e);
     const ImGuiIO& io = ImGui::GetIO();
@@ -343,6 +387,31 @@ void drawUi(App& app) {
 
         if (ImGui::CollapsingHeader("Shading")) {
             ShadeParams& sp = app.shade;
+            ImGui::TextDisabled("presets");
+            ImGui::SameLine();
+            if (ImGui::SmallButton("classic")) applyPreset(sp, 0);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("pastel lines")) applyPreset(sp, 1);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("relief")) applyPreset(sp, 2);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("mono lines")) applyPreset(sp, 3);
+            bool slopes = sp.slopes != 0;
+            if (ImGui::Checkbox("slope light", &slopes)) sp.slopes = slopes;
+            if (slopes) {
+                ImGui::SliderFloat("angle", &sp.slopeAngle, 0.f, 360.f, "%.0f deg");
+                ImGui::SliderFloat("height", &sp.slopeHeight, 0.2f, 4.f);
+                ImGui::SliderFloat("strength", &sp.slopeStrength, 0.f, 1.f);
+            }
+            bool lines = sp.lines != 0;
+            if (ImGui::Checkbox("iteration lines", &lines)) sp.lines = lines;
+            if (lines) {
+                ImGui::SliderFloat("per iter", &sp.lineDensity, 0.05f, 4.f, "%.2f",
+                                   ImGuiSliderFlags_Logarithmic);
+                ImGui::SliderFloat("width px", &sp.lineWidth, 0.5f, 4.f);
+                ImGui::SliderFloat("opacity", &sp.lineStrength, 0.f, 1.f);
+                ImGui::ColorEdit3("line colour", sp.lineColor, ImGuiColorEditFlags_Float);
+            }
             ImGui::Checkbox("animate", &app.animate);
             ImGui::SameLine();
             ImGui::SliderFloat("speed", &app.animSpeed, -1.f, 1.f, "%.3f cyc/s");
@@ -375,10 +444,13 @@ int main(int argc, char** argv) {
     std::string argRe, argIm, scriptText;
     double argScale = 0.0;
     int argIter = 0;
+    int argPreset = 0;
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
             scriptText = argv[++i];
+        } else if (std::strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
+            argPreset = std::atoi(argv[++i]);
         } else {
             positional.push_back(argv[i]);
         }
@@ -432,6 +504,7 @@ int main(int argc, char** argv) {
 
     if (!app.renderer.init()) return 1;
     std::printf("CUDA: %s\n", app.renderer.deviceName());
+    if (argPreset > 0) applyPreset(app.shade, argPreset);
 
     Uint64 lastTick = SDL_GetPerformanceCounter();
     bool running = true;

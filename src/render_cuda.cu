@@ -308,12 +308,22 @@ __global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, i
     const bool haveOld = map.oldDetail > 0.f && ou >= 0.0 && ov >= 0.0 &&
                          ou <= (double)(w - 1) && ov <= (double)(h - 1);
 
-    if (haveNew && (!haveOld || map.newDetail >= map.oldDetail)) {
-        out[idx] = packSRGB8(shadeSample(s, p, timeSec, map.pixelScaleN));
+    const bool useNew = haveNew && (!haveOld || map.newDetail >= map.oldDetail);
+    if (useNew || (haveNew && !haveOld)) {
+        IterGradient g;
+        if (p.lines && xi + 1 < fw && yi + 1 < fh && s.iter >= 0.f) {
+            // Forward differences in field pixels, scaled to display pixels.
+            const FieldSample sx = fetchFilled(field, fw, xi + 1, yi);
+            const FieldSample sy = fetchFilled(field, fw, xi, yi + 1);
+            if (sx.flags < 0.5f && sy.flags < 0.5f && sx.iter >= 0.f && sy.iter >= 0.f) {
+                g.dx = (sx.iter - s.iter) * (float)map.ratioN;
+                g.dy = (sy.iter - s.iter) * (float)map.ratioN;
+                g.valid = true;
+            }
+        }
+        out[idx] = packSRGB8(shadeSample(s, p, timeSec, map.pixelScaleN, g));
     } else if (haveOld) {
         out[idx] = bilinear(old, w, h, ou, ov);
-    } else if (haveNew) {
-        out[idx] = packSRGB8(shadeSample(s, p, timeSec, map.pixelScaleN));
     } else {
         out[idx] = 0xFF000000u;
     }

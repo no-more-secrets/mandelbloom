@@ -25,4 +25,17 @@ struct ShadeParams {
     float deStrength = 1.f; // 0 disables distance-estimate edge darkening
     float exposure = 1.f;
     float inside[3] = {0.f, 0.f, 0.f};
+
+    // Slope lighting from the exterior normal (pseudo-3D relief).
+    int slopes = 0;
+    float slopeAngle = 45.f;    // light direction, degrees, 0 = from the right
+    float slopeHeight = 1.5f;   // light elevation; higher = flatter relief
+    float slopeStrength = 0.7f; // 0..1, how dark the shadow side gets
+
+    // Thin antialiased lines on iteration band boundaries.
+    int lines = 0;
+    float lineDensity = 1.f;    // lines per iteration (fractions allowed)
+    float lineWidth = 1.2f;     // pixels
+    float lineStrength = 0.85f; // 0..1 blend toward lineColor
+    float lineColor[3] = {0.f, 0.f, 0.f};
 };

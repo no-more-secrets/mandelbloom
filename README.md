@@ -32,6 +32,20 @@ NVIDIA GPU. Dependencies come from the vcpkg bundled with Visual Studio.
 | Tab | Hide or show the overlay |
 | Esc | Quit |
 
+## Shading
+
+Shading never re-iterates. The Shading section of the overlay has presets
+(classic, pastel lines, relief, mono lines) and the controls behind them:
+cosine palette, slope lighting from the exterior normal, antialiased lines on
+iteration band boundaries, distance-estimate edge darkening, palette
+animation.
+
+## Testing without touching the desktop
+
+`--script "wait:1500;wheel:5;drag:300,120,12;shot:out.png;quit"` replays
+input through SDL events and saves the composited frame. `--preset N` picks a
+shading preset. Run it minimised.
+
 ## Plan
 
 1. Double-precision kernel, interop display, pan and zoom. (done)
