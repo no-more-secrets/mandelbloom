@@ -21,7 +21,8 @@ struct PixelStateF {
     int m;
     int n;
     int status;  // 0 active, 1 escaped, 2 inside
-    int pad[3];
+    int hint;    // BLA level used last time (search starts one above it)
+    int pad[2];
 };
 
 struct DeviceReferenceF {
@@ -63,17 +64,37 @@ __device__ __forceinline__ void addFx(float& r, float& i, int& e, float ar, floa
 
 // Longest valid BLA node starting at reference index m, for |dz| = |wz| 2^ez.
 __device__ __forceinline__ const BlaNodeF* findBla(const DeviceBlaF& bla, int m, float wzmag2,
-                                                   int ez, int refLast) {
+                                                   int ez, int refLast, int& hint) {
     const int j0 = m - 1;
     if (j0 < 0 || j0 >= bla.steps) return nullptr;
-    int k = j0 == 0 ? bla.levels - 1 : min(bla.levels - 1, __ffs(j0) - 1);
+    const int kmax = j0 == 0 ? bla.levels - 1 : min(bla.levels - 1, __ffs(j0) - 1);
+    // Try one level above the last successful one first; if that is valid,
+    // climb while valid, else descend.
+    int k = min(kmax, hint + 1);
+    const BlaNodeF* best = nullptr;
     for (; k >= 0; --k) {
         const BlaNodeF* n = bla.nodes + bla.levelOffset[k] + (j0 >> k);
         if (n->r2m > 0.f && m + n->l <= refLast &&
-            ldexpf(wzmag2, 2 * ez - n->r2e) < n->r2m)
-            return n;
+            ldexpf(wzmag2, 2 * ez - n->r2e) < n->r2m) {
+            best = n;
+            break;
+        }
     }
-    return nullptr;
+    if (best && k == min(kmax, hint + 1)) {
+        // Valid at the first probe: maybe a higher level is valid too.
+        for (int k2 = k + 1; k2 <= kmax; ++k2) {
+            const BlaNodeF* n = bla.nodes + bla.levelOffset[k2] + (j0 >> k2);
+            if (n->r2m > 0.f && m + n->l <= refLast &&
+                ldexpf(wzmag2, 2 * ez - n->r2e) < n->r2m) {
+                best = n;
+                k = k2;
+            } else {
+                break;
+            }
+        }
+    }
+    hint = best ? k : -1;
+    return best;
 }
 
 }  // namespace fx
@@ -109,6 +130,7 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
         float wzr = st.wzr, wzi = st.wzi, wdr = st.wdr, wdi = st.wdi;
         int ez = st.ez, ed = st.ed;
         int m = st.m, n = st.n;
+        int hint = st.hint;
         float zr = 0.f, zi = 0.f;
         const float bailout = 65536.f;
         const int refLast = ref.length - 1;
@@ -120,7 +142,7 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
             if ((++budgetCheck & 63) == 0 && globalTimerNs() > deadlineNs) break;
             bool stepped = false;
             if (bla.enabled) {
-                const BlaNodeF* nd = fx::findBla(bla, m, wzr * wzr + wzi * wzi, ez, refLast);
+                const BlaNodeF* nd = fx::findBla(bla, m, wzr * wzr + wzi * wzi, ez, refLast, hint);
                 if (nd) {
                     // dz' = A dz + B dc
                     {
@@ -205,6 +227,7 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
         st.ed = ed;
         st.m = m;
         st.n = n;
+        st.hint = hint;
         if (escaped) st.status = 1;
         else if (n >= maxIter) st.status = 2;
         const bool pending = st.status == 0;

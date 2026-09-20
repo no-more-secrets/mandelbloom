@@ -8,8 +8,12 @@ do the window and UI, OpenGL shows the result through CUDA interop (no copies).
 1. The view centre is an MPFR number. Its precision follows the zoom.
 2. The CPU iterates one reference orbit at that centre (`reference.cpp`).
 3. The GPU iterates every pixel as a small delta from the reference
-   (perturbation with rebasing) and writes a float field per pixel: smooth
-   iteration count, distance estimate, final angle (`render_cuda.cu`).
+   (perturbation with rebasing and bilinear approximation) and writes a
+   float field per pixel: smooth iteration count, distance estimate in
+   pixels, exterior normal, final angle. The default kernel is float with a
+   per-value exponent on every small quantity (`iterate_float.cuh`), so
+   depth is not limited by float range; `--double` selects the double
+   kernel (`render_cuda.cu`) for comparison.
 4. A separate shading kernel colors the field each frame (`shade.cuh`).
    Palette changes and animation never re-iterate.
 
@@ -42,14 +46,28 @@ animation.
 
 ## Testing without touching the desktop
 
-`--script "wait:1500;wheel:5;drag:300,120,12;shot:out.png;quit"` replays
-input through SDL events and saves the composited frame. `--preset N` picks a
-shading preset. Run it minimised.
+`--script "wait:1500;wheel:5;drag:300,120,12;pan:8,0;shot:out.png;quit"`
+replays input through SDL events and saves the composited frame, with field
+statistics on stdout. `--preset N` picks a shading preset, `--ss N`
+supersampling, `--nobla` and `--double` select the slow paths for
+comparison. Run it minimised.
 
 ## Plan
 
 1. Double-precision kernel, interop display, pan and zoom. (done)
 2. Perturbation: MPFR reference orbit on the CPU, deltas on the GPU. (done)
-3. Bilinear approximation tables, floatexp for depths past 1e-300.
-4. CPU SIMD path (ISPC) for tiles the GPU is not touching and for glitch repair.
-5. Progressive refinement, coloring controls, image export.
+3. Bilinear approximation tables. (done)
+4. Float kernel with exponents (floatexp). (done)
+5. Progressive refinement, generational field, tweened zoom, pan inertia. (done)
+6. Shaders: gradient/cosine palettes, slope lighting, iteration lines, modes, presets. (done)
+7. Supersampling 1x/2x/3x. (done)
+8. Better BLA validity (Imagina-style) for spiral regions.
+9. HDR output (D3D12 swapchain), 4K export, zoom video export.
+10. CPU SIMD path (ISPC) for glitch repair and second references.
+
+Timings on an RTX 4080, 1920x1200, 1x:
+
+| view | double | float |
+|---|---|---|
+| 8e5 zoom, 4000 iterations | 770 ms | 150 ms |
+| 1.7e25 zoom, 20000 iterations | 406 ms | 88 ms |

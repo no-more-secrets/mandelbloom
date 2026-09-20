@@ -41,7 +41,7 @@ struct ShadeParams {
     float special = 4.f;     // per-mode parameter (steps/waves/panels per cycle, DE falloff)
 
     // Palette: gradient stops blended in OKLab, or a cosine palette.
-    int paletteType = 0;     // 0 gradient, 1 cosine
+    int paletteType = 1;     // 0 gradient, 1 cosine (default: bright everywhere)
     int stopCount = 5;
     float stopPos[MAX_STOPS] = {0.f, 0.25f, 0.5f, 0.75f, 1.f, 0, 0, 0};
     float stopColor[MAX_STOPS][3] = {{0.02f, 0.02f, 0.10f}, {0.10f, 0.40f, 0.85f},
