@@ -30,18 +30,20 @@ struct PixelState {
 
 namespace {
 
-__device__ __forceinline__ FieldSample pendingSample() {
-    FieldSample s{};
-    s.flags = 1.f;
-    return s;
-}
+__device__ __forceinline__ FieldSample emptySample() { return FieldSample{}; }  // gen 0
 
-__global__ void resetState(PixelState* __restrict__ st, FieldSample* __restrict__ field,
-                           int count) {
+// New pass: reset iteration state only. Field samples from earlier
+// generations stay until overwritten.
+__global__ void resetState(PixelState* __restrict__ st, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
     st[i] = PixelState{};
-    field[i] = pendingSample();
+}
+
+__global__ void clearField(FieldSample* __restrict__ field, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    field[i] = emptySample();
 }
 
 // Reset only pixels that have not finished (their dz referred to an old
@@ -67,16 +69,16 @@ __global__ void shiftKernel(const PixelState* __restrict__ srcS,
         dstF[di] = srcF[si];
     } else {
         dstS[di] = PixelState{};
-        dstF[di] = pendingSample();
+        dstF[di] = emptySample();
     }
 }
 
 __device__ __forceinline__ void writeSample(FieldSample* __restrict__ field, size_t idx,
                                             const PixelState& st, double zr, double zi,
-                                            double scale, bool escaped, bool pending) {
+                                            double scale, bool escaped, float gen) {
     FieldSample s{};
     if (!escaped) {
-        s.iter = pending ? (float)st.n : -1.f;
+        s.iter = -1.f;
     } else {
         const double mag2 = zr * zr + zi * zi;
         const double logMag = 0.5 * log(mag2);
@@ -97,7 +99,7 @@ __device__ __forceinline__ void writeSample(FieldSample* __restrict__ field, siz
             }
         }
     }
-    s.flags = pending ? 1.f : 0.f;
+    s.gen = gen;
     field[idx] = s;
 }
 
@@ -137,7 +139,7 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
                              double scale, double refOffX, double refOffY, int maxIter,
                              int sliceIters, const unsigned long long* __restrict__ startNs,
                              unsigned long long budgetNs, DeviceReference ref, DeviceBla bla,
-                             int* __restrict__ activeCount) {
+                             float gen, int* __restrict__ activeCount) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
     int x, y;
     bool inBounds;
@@ -240,7 +242,8 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
         if (escaped) st.status = 1;
         else if (n >= maxIter) st.status = 2;
         const bool pending = st.status == 0;
-        writeSample(field, idx, st, zr, zi, scale, escaped, pending);
+        // In-progress pixels keep whatever older sample sits there.
+        if (!pending) writeSample(field, idx, st, zr, zi, scale, escaped, gen);
         state[idx] = st;
         active = pending;
     }
@@ -250,92 +253,100 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
     if ((threadIdx.x & 31) == 0 && mask) atomicAdd(activeCount, __popc(mask));
 }
 
-// The pixel's own sample, or the nearest finished coarse-level anchor
-// (stride 2, 4, 8) if the pixel itself is still pending.
-__device__ __forceinline__ FieldSample fetchFilled(const FieldSample* __restrict__ field, int w,
-                                                   int x, int y) {
-    FieldSample s = field[(size_t)y * w + x];
-    if (s.flags < 0.5f) return s;
+// Best sample of generation g at field pixel (x, y): the pixel itself, or
+// the nearest coarse-level anchor (stride 2, 4, 8) if the pixel itself was
+// not produced by that generation. level receives 1, 2, 4, 8 (0 = none).
+__device__ __forceinline__ FieldSample fetchGen(const FieldSample* __restrict__ field, int fw,
+                                                int x, int y, float g, int& level) {
+    FieldSample s = field[(size_t)y * fw + x];
+    if (s.gen == g) {
+        level = 1;
+        return s;
+    }
     for (int k = 2; k <= 8; k *= 2) {
         const int bx = x - (x % k), by = y - (y % k);
-        const FieldSample a = field[(size_t)by * w + bx];
-        if (a.flags < 0.5f) return a;
+        const FieldSample a = field[(size_t)by * fw + bx];
+        if (a.gen == g) {
+            level = k;
+            return a;
+        }
     }
+    level = 0;
     return s;
 }
 
-__device__ __forceinline__ float4 unpack(uint32_t c) {
-    return make_float4((float)(c & 255u), (float)((c >> 8) & 255u), (float)((c >> 16) & 255u), 1.f);
-}
-
-__device__ __forceinline__ uint32_t bilinear(const uint32_t* __restrict__ img, int w, int h,
-                                             double u, double v) {
-    const int x0 = (int)u, y0 = (int)v;
-    const int x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
-    const float fx = (float)(u - x0), fy = (float)(v - y0);
-    const float4 a = unpack(img[(size_t)y0 * w + x0]), b = unpack(img[(size_t)y0 * w + x1]);
-    const float4 c = unpack(img[(size_t)y1 * w + x0]), d = unpack(img[(size_t)y1 * w + x1]);
-    const float r = (a.x * (1 - fx) + b.x * fx) * (1 - fy) + (c.x * (1 - fx) + d.x * fx) * fy;
-    const float g = (a.y * (1 - fx) + b.y * fx) * (1 - fy) + (c.y * (1 - fx) + d.y * fx) * fy;
-    const float bl = (a.z * (1 - fx) + b.z * fx) * (1 - fy) + (c.z * (1 - fx) + d.z * fx) * fy;
-    return (uint32_t)(r + 0.5f) | ((uint32_t)(g + 0.5f) << 8) | ((uint32_t)(bl + 0.5f) << 16) |
-           0xFF000000u;
-}
-
-// Shade one field sample (with neighbour gradient for lines).
+// Shade one field sample (with same-generation neighbour gradient for lines).
 __device__ __forceinline__ float3 shadeField(const FieldSample* __restrict__ field, int fw, int fh,
                                              int xi, int yi, const FieldSample& s,
                                              const ShadeParams& p, float timeSec,
-                                             const CompositeMap& map) {
+                                             const GenMap& gm) {
     IterGradient g;
     if (p.lines && xi + 1 < fw && yi + 1 < fh && s.iter >= 0.f) {
-        // Forward differences in field pixels, scaled to display pixels.
-        const FieldSample sx = fetchFilled(field, fw, xi + 1, yi);
-        const FieldSample sy = fetchFilled(field, fw, xi, yi + 1);
-        if (sx.flags < 0.5f && sy.flags < 0.5f && sx.iter >= 0.f && sy.iter >= 0.f) {
-            g.dx = (sx.iter - s.iter) * (float)map.ratioN;
-            g.dy = (sy.iter - s.iter) * (float)map.ratioN;
+        const FieldSample sx = field[(size_t)yi * fw + xi + 1];
+        const FieldSample sy = field[(size_t)(yi + 1) * fw + xi];
+        if (sx.gen == s.gen && sy.gen == s.gen && sx.iter >= 0.f && sy.iter >= 0.f) {
+            g.dx = (sx.iter - s.iter) * (float)gm.ratio;
+            g.dy = (sy.iter - s.iter) * (float)gm.ratio;
             g.valid = true;
         }
     }
-    return shadeSample(s, p, timeSec, map.pixelScaleN, g);
+    return shadeSample(s, p, timeSec, gm.pixelScale, g);
 }
 
-// Display composite: per pixel pick the running pass's field or the last
-// finished frame, whichever has more detail for this display pixel. The
-// field is sampled ss x ss times per display pixel and averaged.
+// One subsample: search the generations for the best data at this point.
+// Returns false if no generation has anything here.
+__device__ __forceinline__ bool sampleBest(const FieldSample* __restrict__ field, int fw, int fh,
+                                           int mx, int my, double px, double py,
+                                           const CompositeMap& map, const ShadeParams& p,
+                                           float timeSec, float3& col) {
+    // Newest generation: exact pixel or coarse anchor.
+    float bestDetail = 0.f;
+    FieldSample best{};
+    int bestX = 0, bestY = 0, bestGen = -1;
+    for (int k = 0; k < map.genCount; ++k) {
+        const GenMap& gm = map.gens[k];
+        const double u = gm.ox + px * gm.ratio + mx, v = gm.oy + py * gm.ratio + my;
+        const int xi = (int)floor(u + 0.5), yi = (int)floor(v + 0.5);
+        if (xi < 0 || xi >= fw || yi < 0 || yi >= fh) continue;
+        int level = 0;
+        const FieldSample s = fetchGen(field, fw, xi, yi, gm.gen, level);
+        if (level == 0) continue;
+        const float detail = (float)gm.ratio / (float)level;  // field px per display px
+        if (detail > bestDetail) {
+            bestDetail = detail;
+            best = s;
+            bestX = xi;
+            bestY = yi;
+            bestGen = k;
+        }
+        // An exact hit in this generation beats anything older unless the
+        // older one is genuinely finer (zoomed out). Stop early when the
+        // remaining generations cannot beat it.
+        if (level == 1 && k + 1 < map.genCount && map.gens[k + 1].ratio <= gm.ratio) break;
+    }
+    if (bestGen < 0) return false;
+    col = shadeField(field, fw, fh, bestX, bestY, best, p, timeSec, map.gens[bestGen]);
+    return true;
+}
+
+// Display composite: ss x ss subsamples per display pixel, each taken from
+// the generation with the most detail at that point.
 __global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, int fh, int mx,
-                                int my, const uint32_t* __restrict__ old,
-                                uint32_t* __restrict__ out, int w, int h, ShadeParams p,
+                                int my, uint32_t* __restrict__ out, int w, int h, ShadeParams p,
                                 float timeSec, CompositeMap map) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t idx = (size_t)y * w + x;
     const double px = (double)x - 0.5 * w, py = (double)y - 0.5 * h;
-
-    // Last finished frame (already at display resolution).
-    const double ou = map.oox + px * map.ratioO, ov = map.ooy + py * map.ratioO;
-    const bool haveOld = map.oldDetail > 0.f && ou >= 0.0 && ov >= 0.0 &&
-                         ou <= (double)(w - 1) && ov <= (double)(h - 1);
-
-    // Running pass: centre of this display pixel in field coordinates, then
-    // ss x ss subsamples spread across the pixel's footprint.
-    const double u0 = map.nox + px * map.ratioN + mx, v0 = map.noy + py * map.ratioN + my;
     const int ss = map.ss < 1 ? 1 : map.ss;
     float3 acc = make_float3(0.f, 0.f, 0.f);
     int have = 0;
-    const bool wantNew = !haveOld || map.newDetail >= map.oldDetail;
-    if (wantNew) {
-        for (int j = 0; j < ss; ++j) {
-            for (int i = 0; i < ss; ++i) {
-                const double u = u0 + ((i + 0.5) / ss - 0.5) * map.ratioN;
-                const double v = v0 + ((j + 0.5) / ss - 0.5) * map.ratioN;
-                const int xi = (int)floor(u + 0.5), yi = (int)floor(v + 0.5);
-                if (xi < 0 || xi >= fw || yi < 0 || yi >= fh) continue;
-                const FieldSample s = fetchFilled(field, fw, xi, yi);
-                if (s.flags > 0.5f) continue;
-                const float3 c = shadeField(field, fw, fh, xi, yi, s, p, timeSec, map);
+    for (int j = 0; j < ss; ++j) {
+        for (int i = 0; i < ss; ++i) {
+            const double sx = px + (i + 0.5) / ss - 0.5, sy = py + (j + 0.5) / ss - 0.5;
+            float3 c;
+            if (sampleBest(field, fw, fh, mx, my, sx, sy, map, p, timeSec, c)) {
                 acc.x += c.x;
                 acc.y += c.y;
                 acc.z += c.z;
@@ -346,8 +357,6 @@ __global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, i
     if (have > 0) {
         const float inv = 1.f / have;
         out[idx] = packSRGB8(make_float3(acc.x * inv, acc.y * inv, acc.z * inv));
-    } else if (haveOld) {
-        out[idx] = bilinear(old, w, h, ou, ov);
     } else {
         out[idx] = 0xFF000000u;
     }
@@ -421,10 +430,8 @@ void CudaRenderer::freeField() {
     if (state_) cudaFree(state_);
     if (fieldAlt_) cudaFree(fieldAlt_);
     if (stateAlt_) cudaFree(stateAlt_);
-    if (lastImage_) cudaFree(lastImage_);
     field_ = fieldAlt_ = nullptr;
     state_ = stateAlt_ = nullptr;
-    lastImage_ = nullptr;
     iterDone_ = true;
     sliceInFlight_ = false;
 }
@@ -509,8 +516,10 @@ bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height, int ss
     CUDA_CHECK(cudaMalloc(&state_, sizeof(PixelState) * fn));
     CUDA_CHECK(cudaMalloc(&fieldAlt_, sizeof(FieldSample) * fn));
     CUDA_CHECK(cudaMalloc(&stateAlt_, sizeof(PixelState) * fn));
-    CUDA_CHECK(cudaMalloc(&lastImage_, sizeof(uint32_t) * n));
-    CUDA_CHECK(cudaMemset(lastImage_, 0, sizeof(uint32_t) * n));
+    (void)n;
+    clearField<<<(int)((fn + 255) / 256), 256>>>(field_, (int)fn);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
     return true;
 }
 
@@ -526,14 +535,15 @@ void CudaRenderer::resetPass(const ViewParams& view) {
     passMs_ = 0.f;
 }
 
-bool CudaRenderer::beginIterate(const ViewParams& view) {
+bool CudaRenderer::beginIterate(const ViewParams& view, float gen) {
     if (!field_ || !state_ || view.width != viewW_ || view.height != viewH_) return false;
     if (ref_.length < 2) return false;
     cudaStream_t stream = (cudaStream_t)stream_;
     CUDA_CHECK(cudaStreamSynchronize(stream));  // cancel the slice in flight
     resetPass(view);
+    gen_ = gen;
     const int count = fieldW_ * fieldH_;
-    resetState<<<(count + 255) / 256, 256, 0, stream>>>(state_, field_, count);
+    resetState<<<(count + 255) / 256, 256, 0, stream>>>(state_, count);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
@@ -619,7 +629,7 @@ bool CudaRenderer::stepIterate() {
                                              viewW_, viewH_, stride_, iterView_.scale,
                                              iterView_.refOffX, iterView_.refOffY,
                                              iterView_.maxIter, sliceIters_, sliceStart_ns_,
-                                             50ull * 1000000ull, ref_, bla_, activeCount_);
+                                             50ull * 1000000ull, ref_, bla_, gen_, activeCount_);
     CUDA_CHECK(cudaGetLastError());
     cudaEventRecord((cudaEvent_t)evStop_, stream);
     CUDA_CHECK(cudaMemcpyAsync(activeCountHost_, activeCount_, sizeof(int),
@@ -651,13 +661,8 @@ bool CudaRenderer::composite(const ShadeParams& params, float timeSec, const Com
     }
     if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
     compositeKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, marginX_, marginY_,
-                                                lastImage_, devPtr, width_, height_, params,
-                                                timeSec, map);
+                                                devPtr, width_, height_, params, timeSec, map);
     err = cudaGetLastError();
-    if (map.snapshot) {
-        cudaMemcpyAsync(lastImage_, devPtr, sizeof(uint32_t) * (size_t)width_ * height_,
-                        cudaMemcpyDeviceToDevice, stream);
-    }
     if (!shadePending_) {
         cudaEventRecord((cudaEvent_t)evShadeB_, stream);
         shadePending_ = true;

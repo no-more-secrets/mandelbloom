@@ -34,16 +34,22 @@ struct DeviceReference {
     bool escaped = false;
 };
 
-// How the display view maps onto the two image sources. A display pixel p
-// lands on source pixel (ox, oy) + (p - centre) * ratio.
+// One render generation still present in the field: how the display view
+// maps onto the field through the view that generation was rendered with.
+// A display pixel p lands on field pixel (ox, oy) + (p - centre) * ratio,
+// in view-region coordinates (the kernel adds the margin).
+struct GenMap {
+    double ox = 0, oy = 0, ratio = 1;
+    float pixelScale = 1.f;  // complex units per field pixel for this generation
+    float gen = 0.f;         // generation id as stored in FieldSample::gen
+};
+
+#define MAX_GENS 8
+
 struct CompositeMap {
-    double nox = 0, noy = 0, ratioN = 1;  // running pass's field
-    double oox = 0, ooy = 0, ratioO = 1;  // last finished frame
-    float newDetail = 0.f;  // source pixels per display pixel, 0 = unusable
-    float oldDetail = 0.f;
-    float pixelScaleN = 1.f;  // field's complex units per field pixel
-    int snapshot = 0;         // keep the result as the new "last frame"
-    int ss = 1;               // subsamples per axis averaged per display pixel
+    GenMap gens[MAX_GENS];  // newest first
+    int genCount = 0;
+    int ss = 1;             // subsamples per axis averaged per display pixel
 };
 
 // Owns the CUDA side: the iteration field, the interop registration of
@@ -71,7 +77,8 @@ public:
     // Heavy pass, run in slices so the UI stays live and no kernel runs long
     // enough to trip the Windows GPU watchdog. beginIterate resets state;
     // call stepIterate whenever !iterateBusy() until iterateDone().
-    bool beginIterate(const ViewParams& view);
+    // gen: the id written into samples this pass produces (> 0, increasing).
+    bool beginIterate(const ViewParams& view, float gen);
     // Pan: shift field and state by (dx, dy) pixels (content moves by
     // -dx, -dy), keep finished pixels, mark exposed strips pending, and
     // continue the pass coarse-to-fine on what is pending. Same reference.
@@ -89,8 +96,8 @@ public:
     // True once after each slice completes (cleared by the call).
     bool takeSliceFinished() { bool f = sliceFinished_; sliceFinished_ = false; return f; }
 
-    // Display pass: colour the running field and the last finished frame
-    // into the bound pixel buffer through the given mappings. Runs on its
+    // Display pass: colour the field into the bound pixel buffer, taking
+    // each pixel from the best generation that has data for it. Runs on its
     // own stream so it never waits for a slice.
     bool composite(const ShadeParams& params, float timeSec, const CompositeMap& map);
 
@@ -112,7 +119,6 @@ private:
     struct PixelState* state_ = nullptr;
     FieldSample* fieldAlt_ = nullptr;
     struct PixelState* stateAlt_ = nullptr;
-    uint32_t* lastImage_ = nullptr;  // copy of the last finished frame
     double* refZr_ = nullptr;
     double* refZi_ = nullptr;
     int refCapacity_ = 0;
@@ -129,6 +135,7 @@ private:
     void* dispStream_ = nullptr;  // composite
     void* evSlice_ = nullptr;
     ViewParams iterView_;
+    float gen_ = 0.f;
     int sliceStart_ = 0;
     int sliceIters_ = 512;
     int stride_ = 1;

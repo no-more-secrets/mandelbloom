@@ -33,14 +33,18 @@ struct App {
     GlDisplay display;
     CudaRenderer renderer;
 
-    // Three views. render: where the pass computes (the target). shown: what
-    // the display shows, tweened toward render. last: the last finished
-    // frame kept on the GPU for reprojection.
+    // render: where the pass computes (the target). shown: what the display
+    // shows, tweened toward render. gens: the views of the generations whose
+    // samples may still be in the field, newest first (gens[0] == render).
     ViewParams view;   // render pass grid + scale
     View render;
     View shown;
-    View last;
-    bool lastValid = false;
+    struct Gen {
+        View view;
+        float id = 0.f;
+    };
+    std::vector<Gen> gens;
+    float nextGen = 1.f;
     int ss = 1;          // supersampling factor per axis (field = display * ss)
     int ssApplied = 0;   // what the renderer is currently bound with
     bool tweening = false;
@@ -170,6 +174,12 @@ void panPixels(App& app, int dx, int dy) {
     app.panDx -= dx * app.ss;
     app.panDy -= dy * app.ss;
     app.panDirty = true;
+    // The field array shifts under every generation, so their centres move
+    // by the same number of field pixels at their own scale.
+    for (auto& g : app.gens) {
+        g.view.cx.subDouble(dx * g.view.scale);
+        g.view.cy.addDouble(dy * g.view.scale);
+    }
 }
 
 // Coast after a drag, slowing with friction.
@@ -564,7 +574,7 @@ int main(int argc, char** argv) {
                 }
             }
             app.renderer.bindPixelBuffer(app.display.pbo(), pw, ph, app.ss);
-            app.lastValid = false;
+            app.gens.clear();
             app.dirty = true;
         }
         if (pw <= 0 || ph <= 0) continue;
@@ -585,7 +595,13 @@ int main(int argc, char** argv) {
         }
         if (app.dirty) {
             rebuildReference(app);
-            app.renderer.beginIterate(app.view);
+            // New generation: remember its view; older ones keep theirs.
+            App::Gen g;
+            g.view = app.render;
+            g.id = app.nextGen++;
+            app.gens.insert(app.gens.begin(), g);
+            if (app.gens.size() > MAX_GENS) app.gens.resize(MAX_GENS);
+            app.renderer.beginIterate(app.view, g.id);
             app.panDx = app.panDy = 0;
             app.panDirty = false;
             app.dirty = false;
@@ -598,33 +614,21 @@ int main(int argc, char** argv) {
             if (!app.renderer.iterateDone()) app.renderer.stepIterate();
         }
 
-        // Display: composite the running field and the last finished frame
-        // onto the shown view. Cheap, runs every frame on its own stream.
+        // Display: composite the field onto the shown view, each pixel from
+        // the generation with the most detail there. Cheap, every frame.
         {
             CompositeMap m;
             m.ss = app.ss;
-            mapOnto(app, app.render, app.ss, app.view.width, app.view.height, m.nox, m.noy,
-                    m.ratioN);
-            const int done = app.renderer.completedStride();
-            m.newDetail = app.renderer.iterateDone() ? (float)m.ratioN
-                          : done > 0                 ? (float)(m.ratioN / done)
-                                                     : 0.f;
-            if (app.lastValid) {
-                mapOnto(app, app.last, 1, pw, ph, m.oox, m.ooy, m.ratioO);
-                m.oldDetail = (float)m.ratioO;
+            m.genCount = 0;
+            for (const auto& g : app.gens) {
+                if (m.genCount >= MAX_GENS) break;
+                GenMap& gm = m.gens[m.genCount++];
+                mapOnto(app, g.view, app.ss, app.view.width, app.view.height, gm.ox, gm.oy,
+                        gm.ratio);
+                gm.pixelScale = (float)(g.view.scale / app.ss);
+                gm.gen = g.id;
             }
-            m.pixelScaleN = (float)app.view.scale;
-            const bool settled = app.renderer.iterateDone() && !app.tweening;
-            m.snapshot = settled ? 1 : 0;
-            if (app.renderer.composite(app.shade, app.animTime, m)) {
-                app.display.upload();
-                if (settled) {
-                    app.last.cx = app.shown.cx;
-                    app.last.cy = app.shown.cy;
-                    app.last.scale = app.shown.scale;
-                    app.lastValid = true;
-                }
-            }
+            if (app.renderer.composite(app.shade, app.animTime, m)) app.display.upload();
         }
 
         ImGui_ImplOpenGL3_NewFrame();
