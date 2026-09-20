@@ -41,7 +41,16 @@ Toolkit 13.4, and an NVIDIA GPU. Dependencies come from the vcpkg bundled with V
 | Wheel | Zoom around the cursor |
 | R | Reset view |
 | Tab | Hide or show the overlay |
+| F11 | Fullscreen |
 | Esc | Quit |
+
+## Presets
+
+The Shading section has nine built-in presets and a save box. Saved presets
+are plain text files in `%APPDATA%/sam/mandelgpu/presets/` and cover
+shading, post-processing and the animation flag. `--load NAME` starts with a
+saved preset, `--save NAME` writes the starting parameters, `--fullscreen`
+starts fullscreen.
 
 ## Shading
 

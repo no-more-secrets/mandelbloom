@@ -14,6 +14,7 @@
 #include "dx_display.h"
 #include "image_io.h"
 #include "script.h"
+#include "presets.h"
 #include "reference.h"
 #include "render_cuda.h"
 
@@ -91,6 +92,10 @@ struct App {
     bool inertiaEnabled = true;
     float inertiaTau = 0.25f;  // seconds for the velocity to fall to 37%
     bool showUi = true;
+    bool fullscreen = false;
+    char presetName[64] = "my preset";
+    std::vector<std::string> savedPresets;
+    bool savedPresetsValid = false;
     double fps = 0.0;
     float uiScale = 1.f;
 };
@@ -314,111 +319,18 @@ void mapOnto(const App& app, const View& src, int sub, int srcW, int srcH, doubl
 }
 
 // Shading presets. Each fully replaces the shading parameters.
-void setStops(ShadeParams& sp, int n, const float* pos, const float (*rgb)[3]) {
-    sp.paletteType = 0;
-    sp.stopCount = n;
-    for (int i = 0; i < n; ++i) {
-        sp.stopPos[i] = pos[i];
-        for (int k = 0; k < 3; ++k) sp.stopColor[i][k] = rgb[i][k];
-    }
+// Apply a preset (shading, post, animation flag).
+void applyPresetTo(App& app, const Preset& p) {
+    app.shade = p.shade;
+    app.post = p.post;
+    app.animate = p.animate;
 }
 
-// Shading presets. Each fully replaces the shading parameters.
-enum { PRESET_COUNT = 8 };
-const char* const kPresetNames[PRESET_COUNT] = {"classic",  "pastel lines", "relief",
-                                                "mono lines", "ocean wave", "ember panels",
-                                                "angle",    "distance"};
+void applyPreset(App& app, int which) { applyPresetTo(app, builtinPreset(which)); }
 
-void applyPreset(ShadeParams& sp, int which) {
-    sp = ShadeParams();
-    switch (which) {
-        case 1: {  // Pastel lines: pale gradient, relief lighting, thin dark lines
-            const float pos[5] = {0.f, 0.25f, 0.5f, 0.75f, 1.f};
-            const float rgb[5][3] = {{0.98f, 0.80f, 0.86f}, {0.72f, 0.86f, 0.98f},
-                                     {0.99f, 0.96f, 0.72f}, {0.86f, 0.74f, 0.96f},
-                                     {0.98f, 0.80f, 0.86f}};
-            setStops(sp, 5, pos, rgb);
-            sp.density = 24.f;
-            sp.slopes = 1;
-            sp.slopeAngle = 60.f;
-            sp.slopeHeight = 1.2f;
-            sp.slopeStrength = 0.55f;
-            sp.lines = 1;
-            sp.lineDensity = 1.f;
-            sp.lineWidth = 1.1f;
-            sp.lineStrength = 0.8f;
-            sp.deStrength = 0.6f;
-            sp.inside[0] = sp.inside[1] = sp.inside[2] = 0.05f;
-            break;
-        }
-        case 2: {  // Relief: classic colours with strong slope lighting
-            sp.paletteType = 1;
-            sp.slopes = 1;
-            sp.slopeAngle = 30.f;
-            sp.slopeHeight = 1.0f;
-            sp.slopeStrength = 0.85f;
-            sp.deStrength = 0.f;
-            break;
-        }
-        case 3: {  // Mono lines: white paper, ink lines, soft relief
-            const float pos[2] = {0.f, 1.f};
-            const float rgb[2][3] = {{0.96f, 0.96f, 0.96f}, {0.90f, 0.90f, 0.90f}};
-            setStops(sp, 2, pos, rgb);
-            sp.slopes = 1;
-            sp.slopeStrength = 0.35f;
-            sp.lines = 1;
-            sp.lineWidth = 1.0f;
-            sp.lineStrength = 0.9f;
-            sp.deStrength = 0.4f;
-            break;
-        }
-        case 4: {  // Ocean wave: blue-teal gradient with a travelling brightness wave
-            const float pos[4] = {0.f, 0.35f, 0.7f, 1.f};
-            const float rgb[4][3] = {{0.02f, 0.05f, 0.20f}, {0.05f, 0.45f, 0.75f},
-                                     {0.75f, 0.95f, 0.95f}, {0.02f, 0.05f, 0.20f}};
-            setStops(sp, 4, pos, rgb);
-            sp.mode = SHADE_WAVE;
-            sp.special = 3.f;
-            sp.waveSpeed = 0.15f;
-            sp.slopes = 1;
-            sp.slopeStrength = 0.4f;
-            break;
-        }
-        case 5: {  // Ember panels: fire gradient in flat panels with dark gaps
-            const float pos[5] = {0.f, 0.3f, 0.55f, 0.8f, 1.f};
-            const float rgb[5][3] = {{0.05f, 0.0f, 0.0f}, {0.6f, 0.05f, 0.0f},
-                                     {1.0f, 0.55f, 0.05f}, {1.0f, 0.95f, 0.6f},
-                                     {0.05f, 0.0f, 0.0f}};
-            setStops(sp, 5, pos, rgb);
-            sp.mode = SHADE_PANELS;
-            sp.special = 4.f;
-            sp.density = 48.f;
-            sp.deStrength = 0.5f;
-            break;
-        }
-        case 6: {  // Angle: escape angle over a rainbow, lit
-            sp.paletteType = 1;
-            sp.mode = SHADE_ANGLE;
-            sp.special = 1.f;
-            sp.slopes = 1;
-            sp.slopeStrength = 0.5f;
-            sp.deStrength = 0.8f;
-            break;
-        }
-        case 7: {  // Distance: greys by distance from the set, one decade per cycle
-            const float pos[3] = {0.f, 0.5f, 1.f};
-            const float rgb[3][3] = {{0.05f, 0.05f, 0.08f}, {0.55f, 0.55f, 0.6f},
-                                     {0.98f, 0.98f, 1.0f}};
-            setStops(sp, 3, pos, rgb);
-            sp.mode = SHADE_DISTANCE;
-            sp.special = 3.f;
-            sp.deStrength = 0.f;
-            sp.cycleSpeed = 0.f;
-            break;
-        }
-        default:
-            break;
-    }
+void setFullscreen(App& app, bool on) {
+    app.fullscreen = on;
+    SDL_SetWindowFullscreen(app.window, on);
 }
 
 bool handleEvent(App& app, const SDL_Event& e) {
@@ -440,6 +352,7 @@ bool handleEvent(App& app, const SDL_Event& e) {
             if (e.key.key == SDLK_ESCAPE) return false;
             if (e.key.key == SDLK_R) resetView(app);
             if (e.key.key == SDLK_TAB) app.showUi = !app.showUi;
+            if (e.key.key == SDLK_F11) setFullscreen(app, !app.fullscreen);
             break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
             if (io.WantCaptureMouse) break;
@@ -539,6 +452,9 @@ void drawUi(App& app) {
                     app.hdrEnabled ? "HDR scRGB FP16" : "SDR (FP16 scRGB)", app.sdrWhite,
                     app.hdrHeadroom);
         ImGui::Checkbox("vsync", &app.vsync);
+        ImGui::SameLine();
+        bool fs = app.fullscreen;
+        if (ImGui::Checkbox("fullscreen (F11)", &fs)) setFullscreen(app, fs);
         ImGui::Text("frame   %.0f fps", app.fps);
         ImGui::Checkbox("smooth zoom", &app.tweenEnabled);
         ImGui::SameLine();
@@ -548,15 +464,47 @@ void drawUi(App& app) {
         ImGui::SameLine();
         ImGui::SetNextItemWidth(100 * app.uiScale);
         ImGui::SliderFloat("##itau", &app.inertiaTau, 0.05f, 1.0f, "%.2f s");
-        ImGui::TextDisabled("drag: pan  wheel: zoom  R: reset  Tab: hide");
+        ImGui::TextDisabled("drag: pan  wheel: zoom  R: reset  Tab: hide  F11: fullscreen");
 
         if (ImGui::CollapsingHeader("Shading")) {
             ShadeParams& sp = app.shade;
             ImGui::TextDisabled("presets");
-            for (int i = 0; i < PRESET_COUNT; ++i) {
+            for (int i = 0; i < BUILTIN_PRESET_COUNT; ++i) {
                 if (i % 4 != 0) ImGui::SameLine();
-                if (ImGui::SmallButton(kPresetNames[i])) applyPreset(sp, i);
+                if (ImGui::SmallButton(kBuiltinPresetNames[i])) applyPreset(app, i);
             }
+            if (!app.savedPresetsValid) {
+                app.savedPresets = listSavedPresets();
+                app.savedPresetsValid = true;
+            }
+            ImGui::SetNextItemWidth(160 * app.uiScale);
+            ImGui::InputText("##pname", app.presetName, sizeof app.presetName);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("save")) {
+                Preset cur;
+                cur.shade = app.shade;
+                cur.post = app.post;
+                cur.animate = app.animate;
+                if (savePreset(app.presetName, cur)) app.savedPresetsValid = false;
+            }
+            for (size_t i = 0; i < app.savedPresets.size(); ++i) {
+                ImGui::PushID((int)i);
+                if (ImGui::SmallButton(app.savedPresets[i].c_str())) {
+                    Preset pr;
+                    if (loadPreset(app.savedPresets[i], pr)) {
+                        applyPresetTo(app, pr);
+                        std::snprintf(app.presetName, sizeof app.presetName, "%s",
+                                      app.savedPresets[i].c_str());
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("x")) {
+                    deletePreset(app.savedPresets[i]);
+                    app.savedPresetsValid = false;
+                }
+                ImGui::PopID();
+            }
+            ImGui::TextDisabled("%s", presetDir().c_str());
             const char* modes[] = {"smooth", "log steps", "wave", "panels", "angle", "distance"};
             ImGui::Combo("mode", &sp.mode, modes, SHADE_MODE_COUNT);
             if (sp.mode == SHADE_LOGSTEPS || sp.mode == SHADE_WAVE || sp.mode == SHADE_PANELS) {
@@ -690,7 +638,10 @@ int main(int argc, char** argv) {
     int argSs = 1;
     bool argNoBla = false;
     bool argDouble = false;
-    std::string argPost;  // "bloom=1.2,vignette=0.4,tonemap=2,..." 
+    std::string argPost;
+    std::string argLoad;  // saved preset name
+    std::string argSave;  // save the starting parameters under this name
+    bool argFullscreen = false;  // "bloom=1.2,vignette=0.4,tonemap=2,..." 
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
@@ -705,6 +656,12 @@ int main(int argc, char** argv) {
             argDouble = true;
         } else if (std::strcmp(argv[i], "--post") == 0 && i + 1 < argc) {
             argPost = argv[++i];
+        } else if (std::strcmp(argv[i], "--fullscreen") == 0) {
+            argFullscreen = true;
+        } else if (std::strcmp(argv[i], "--load") == 0 && i + 1 < argc) {
+            argLoad = argv[++i];
+        } else if (std::strcmp(argv[i], "--save") == 0 && i + 1 < argc) {
+            argSave = argv[++i];
         } else {
             positional.push_back(argv[i]);
         }
@@ -751,7 +708,20 @@ int main(int argc, char** argv) {
     readHdrState(app);
     std::printf("HDR: %s, SDR white %.2f, headroom %.2f\n", app.hdrEnabled ? "on" : "off",
                 app.sdrWhite, app.hdrHeadroom);
-    if (argPreset > 0) applyPreset(app.shade, argPreset);
+    if (argPreset > 0) applyPreset(app, argPreset);
+    if (!argLoad.empty()) {
+        Preset pr;
+        if (loadPreset(argLoad, pr)) applyPresetTo(app, pr);
+        else std::fprintf(stderr, "preset not found: %s\n", argLoad.c_str());
+    }
+    if (!argSave.empty()) {
+        Preset cur;
+        cur.shade = app.shade;
+        cur.post = app.post;
+        cur.animate = app.animate;
+        std::printf("save preset %s: %s\n", argSave.c_str(), savePreset(argSave, cur) ? "ok" : "failed");
+    }
+    if (argFullscreen) setFullscreen(app, true);
     app.ss = std::min(3, std::max(1, argSs));
     if (argNoBla) app.view.useBla = false;
     if (argDouble) app.view.useFloat = false;

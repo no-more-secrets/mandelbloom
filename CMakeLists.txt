@@ -19,6 +19,7 @@ find_library(GMP_LIBRARY NAMES gmp REQUIRED)
 add_executable(mandelgpu
   src/main.cpp
   src/dx_display.cpp
+  src/presets.cpp
   src/reference.cpp
   src/bla.cpp
   src/script.cpp
