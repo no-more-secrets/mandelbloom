@@ -56,7 +56,8 @@ public:
 
     // Call after the GL context is current. Returns false on failure.
     bool init();
-    // (Re)register the GL pixel unpack buffer and size the field to match.
+    // (Re)register the GL pixel unpack buffer and size the field to match,
+    // plus a margin around the view so pans land on existing coarse data.
     bool bindPixelBuffer(unsigned glPbo, int width, int height);
     // Upload a new reference orbit (host arrays of `length` doubles).
     bool uploadReference(const double* zr, const double* zi, int length, bool escaped);
@@ -136,7 +137,9 @@ private:
     void* evShadeA_ = nullptr;
     void* evShadeB_ = nullptr;
     bool shadePending_ = false;
-    int width_ = 0, height_ = 0;
+    int width_ = 0, height_ = 0;    // view (pixel buffer) size
+    int fieldW_ = 0, fieldH_ = 0;   // field size = view + margins
+    int marginX_ = 0, marginY_ = 0; // margin each side, computed at stride >= 2 only
     float iterateMs_ = 0.f, shadeMs_ = 0.f;
     float sliceMs_ = 0.f;
     float passMs_ = 0.f;

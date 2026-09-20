@@ -44,6 +44,10 @@ struct App {
     bool tweening = false;
     float tweenTau = 0.08f;  // seconds to close ~63% of the gap
     bool tweenEnabled = true;
+    // Zoom anchor: the plane point under the cursor stays put while the
+    // scale glides. shown.centre = anchor - anchorPx * shown.scale.
+    BigFloat anchorX{64}, anchorY{64};
+    double anchorPxX = 0, anchorPxY = 0;
 
     BigFloat refCx{64}, refCy{64};  // reference orbit centre (kept across pans)
     int panDx = 0, panDy = 0;       // accumulated pan this frame, field pixels
@@ -57,6 +61,13 @@ struct App {
     float animSpeed = 0.05f;  // palette cycles per second
     float animTime = 0.f;
     bool dragging = false;
+    // Pan inertia: velocity in pixels per second, carried after release.
+    double velX = 0, velY = 0;
+    double inertiaAccX = 0, inertiaAccY = 0;  // sub-pixel remainder
+    double lastMotionSec = 0;
+    bool inertia = false;
+    bool inertiaEnabled = true;
+    float inertiaTau = 0.25f;  // seconds for the velocity to fall to 37%
     bool showUi = true;
     double fps = 0.0;
     float uiScale = 1.f;
@@ -102,15 +113,26 @@ void snapShown(App& app) {
 }
 
 void zoomAt(App& app, float mx, float my, double factor) {
-    // Keep the complex point under the cursor fixed while scaling.
+    // The point under the cursor in the view the user is looking at (the
+    // shown view) is the anchor. The target scale accumulates; the target
+    // centre is whatever keeps the anchor under the cursor at that scale.
     const double hx = 0.5 * app.view.width, hy = 0.5 * app.view.height;
     const double px = mx - hx, py = my - hy;
-    const double oldScale = app.render.scale;
     app.render.scale *= factor;
     app.view.scale = app.render.scale;
     updatePrecision(app);
-    app.render.cx.addDouble(px * (oldScale - app.render.scale));
-    app.render.cy.subDouble(py * (oldScale - app.render.scale));
+    app.anchorX = app.shown.cx;
+    app.anchorY = app.shown.cy;
+    app.anchorX.setPrec(app.render.cx.prec());
+    app.anchorY.setPrec(app.render.cy.prec());
+    app.anchorX.addDouble(px * app.shown.scale);
+    app.anchorY.subDouble(py * app.shown.scale);
+    app.anchorPxX = px;
+    app.anchorPxY = py;
+    app.render.cx = app.anchorX;
+    app.render.cy = app.anchorY;
+    app.render.cx.subDouble(px * app.render.scale);
+    app.render.cy.addDouble(py * app.render.scale);
     app.dirty = true;
     if (app.tweenEnabled) app.tweening = true;
     else snapShown(app);
@@ -126,18 +148,51 @@ void resetView(App& app) {
     app.dirty = true;
 }
 
+double nowSeconds() {
+    return (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency();
+}
+
+// Pan the render (and shown) view by whole pixels; the field shifts to match.
+void panPixels(App& app, int dx, int dy) {
+    if (dx == 0 && dy == 0) return;
+    if (app.tweening) snapShown(app);  // a pan is 1:1, cut any zoom tween short
+    app.render.cx.subDouble(dx * app.render.scale);
+    app.render.cy.addDouble(dy * app.render.scale);
+    app.shown.cx = app.render.cx;
+    app.shown.cy = app.render.cy;
+    // Content moves with the mouse: new pixel x shows old pixel x - dx.
+    app.panDx -= dx;
+    app.panDy -= dy;
+    app.panDirty = true;
+}
+
+// Coast after a drag, slowing with friction.
+void applyInertia(App& app, double dt) {
+    if (!app.inertia) return;
+    const double decay = std::exp(-dt / app.inertiaTau);
+    app.inertiaAccX += app.velX * dt;
+    app.inertiaAccY += app.velY * dt;
+    app.velX *= decay;
+    app.velY *= decay;
+    const int dx = (int)app.inertiaAccX, dy = (int)app.inertiaAccY;
+    app.inertiaAccX -= dx;
+    app.inertiaAccY -= dy;
+    panPixels(app, dx, dy);
+    if (std::hypot(app.velX, app.velY) < 15.0) app.inertia = false;
+}
+
 // Move the shown view toward the render view.
 void tweenShown(App& app, double dt) {
     if (!app.tweening) return;
     const double k = 1.0 - std::exp(-dt / app.tweenTau);
     const double logRatio = std::log(app.render.scale / app.shown.scale);
-    const double dx = BigFloat::diff(app.render.cx, app.shown.cx);
-    const double dy = BigFloat::diff(app.render.cy, app.shown.cy);
     app.shown.scale *= std::exp(logRatio * k);
-    app.shown.cx.addDouble(dx * k);
-    app.shown.cy.addDouble(dy * k);
-    const double pxErr = std::hypot(dx, dy) / app.render.scale;
-    if (std::fabs(logRatio) < 2e-4 && pxErr < 0.05) snapShown(app);
+    // Centre follows from the anchor so the cursor point never drifts.
+    app.shown.cx = app.anchorX;
+    app.shown.cy = app.anchorY;
+    app.shown.cx.subDouble(app.anchorPxX * app.shown.scale);
+    app.shown.cy.addDouble(app.anchorPxY * app.shown.scale);
+    if (std::fabs(logRatio) < 2e-4) snapShown(app);
 }
 
 // Half the image diagonal in complex units.
@@ -194,28 +249,42 @@ bool handleEvent(App& app, const SDL_Event& e) {
             break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
             if (io.WantCaptureMouse) break;
-            if (e.button.button == SDL_BUTTON_LEFT) app.dragging = true;
+            if (e.button.button == SDL_BUTTON_LEFT) {
+                app.dragging = true;
+                app.inertia = false;  // grabbing stops the coast
+                app.velX = app.velY = 0;
+                app.lastMotionSec = nowSeconds();
+            }
             break;
         case SDL_EVENT_MOUSE_BUTTON_UP:
-            if (e.button.button == SDL_BUTTON_LEFT) app.dragging = false;
+            if (e.button.button == SDL_BUTTON_LEFT && app.dragging) {
+                app.dragging = false;
+                // Release after a pause means "stop here", not "fling".
+                const bool fresh = nowSeconds() - app.lastMotionSec < 0.08;
+                if (app.inertiaEnabled && fresh && std::hypot(app.velX, app.velY) > 50.0) {
+                    app.inertia = true;
+                    app.inertiaAccX = app.inertiaAccY = 0;
+                } else {
+                    app.velX = app.velY = 0;
+                }
+            }
             break;
         case SDL_EVENT_MOUSE_MOTION:
             if (app.dragging && !io.WantCaptureMouse) {
-                // A drag is 1:1, so cut any zoom tween short first.
-                if (app.tweening) snapShown(app);
                 const int dx = (int)e.motion.xrel, dy = (int)e.motion.yrel;
-                app.render.cx.subDouble(dx * app.render.scale);
-                app.render.cy.addDouble(dy * app.render.scale);
-                app.shown.cx = app.render.cx;
-                app.shown.cy = app.render.cy;
-                // Content moves with the mouse: new pixel x shows old pixel x - dx.
-                app.panDx -= dx;
-                app.panDy -= dy;
-                app.panDirty = true;
+                const double t = nowSeconds();
+                const double dt = std::max(t - app.lastMotionSec, 0.002);
+                app.lastMotionSec = t;
+                // Smoothed velocity from the last few motion events.
+                const double k = dt > 0.05 ? 1.0 : 0.4;
+                app.velX += (dx / dt - app.velX) * k;
+                app.velY += (dy / dt - app.velY) * k;
+                panPixels(app, dx, dy);
             }
             break;
         case SDL_EVENT_MOUSE_WHEEL: {
             if (io.WantCaptureMouse) break;
+            app.inertia = false;
             const double factor = std::pow(0.8, (double)e.wheel.y);
             zoomAt(app, e.wheel.mouse_x, e.wheel.mouse_y, factor);
             break;
@@ -264,8 +333,12 @@ void drawUi(App& app) {
         ImGui::Text("frame   %.0f fps", app.fps);
         ImGui::Checkbox("smooth zoom", &app.tweenEnabled);
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(120 * app.uiScale);
-        ImGui::SliderFloat("tau", &app.tweenTau, 0.02f, 0.3f, "%.2f s");
+        ImGui::SetNextItemWidth(100 * app.uiScale);
+        ImGui::SliderFloat("##tau", &app.tweenTau, 0.02f, 0.3f, "%.2f s");
+        ImGui::Checkbox("pan inertia", &app.inertiaEnabled);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(100 * app.uiScale);
+        ImGui::SliderFloat("##itau", &app.inertiaTau, 0.05f, 1.0f, "%.2f s");
         ImGui::TextDisabled("drag: pan  wheel: zoom  R: reset  Tab: hide");
 
         if (ImGui::CollapsingHeader("Shading")) {
@@ -373,6 +446,7 @@ int main(int argc, char** argv) {
         lastTick = now;
         if (dt > 0) app.fps = 0.9 * app.fps + 0.1 * (1.0 / dt);
         if (app.animate) app.animTime += (float)dt * app.animSpeed;
+        applyInertia(app, dt);
 
         int pw = 0, ph = 0;
         SDL_GetWindowSizeInPixels(app.window, &pw, &ph);
@@ -479,10 +553,14 @@ int main(int argc, char** argv) {
                     writePng(shot.c_str(), px.data(), pw, ph);
                 }
                 const double zoom = 3.2 / (app.render.scale * app.view.width);
-                std::printf("shot %s zoom=%.3g iterate=%.0fms done=%d stride=%d/%d tween=%d\n",
+                const int dg = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
+                std::printf("shot %s zoom=%.3g iterate=%.0fms done=%d stride=%d/%d tween=%d "
+                            "inertia=%d centre=%s %s\n",
                             shot.c_str(), zoom, app.renderer.lastIterateMs(),
                             app.renderer.iterateDone() ? 1 : 0, app.renderer.currentStride(),
-                            app.renderer.completedStride(), app.tweening ? 1 : 0);
+                            app.renderer.completedStride(), app.tweening ? 1 : 0,
+                            app.inertia ? 1 : 0, app.render.cx.toString(dg).c_str(),
+                            app.render.cy.toString(dg).c_str());
                 std::fflush(stdout);
             }
             if (quit) running = false;

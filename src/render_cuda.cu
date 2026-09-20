@@ -130,24 +130,35 @@ __device__ __forceinline__ const BlaNode* findBla(const DeviceBla& bla, int m, d
 // never past the GPU-clock deadline.
 //   dz_{n+1} = 2 Z_m dz_n + dz_n^2 + dc
 //   rebase when |Z_m + dz| < |dz|: dz = Z_m + dz, m = 0
+// Field layout: fw x fh with the view (w x h) at offset (mx, my). Pixel
+// (x, y) in field coordinates sits at view offset (x - mx, y - my).
 __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __restrict__ field,
-                             int w, int h, int stride, double scale, double refOffX,
-                             double refOffY, int maxIter, int sliceIters,
-                             const unsigned long long* __restrict__ startNs,
+                             int fw, int fh, int mx, int my, int w, int h, int stride,
+                             double scale, double refOffX, double refOffY, int maxIter,
+                             int sliceIters, const unsigned long long* __restrict__ startNs,
                              unsigned long long budgetNs, DeviceReference ref, DeviceBla bla,
                              int* __restrict__ activeCount) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
-    const int x = (blockIdx.x * blockDim.x + threadIdx.x) * stride;
-    const int y = (blockIdx.y * blockDim.y + threadIdx.y) * stride;
-    const bool inBounds = x < w && y < h;
-    const size_t idx = inBounds ? (size_t)y * w + x : 0;
+    int x, y;
+    bool inBounds;
+    if (stride == 1) {
+        // Full resolution only inside the view; the margin stays coarse.
+        x = mx + blockIdx.x * blockDim.x + threadIdx.x;
+        y = my + blockIdx.y * blockDim.y + threadIdx.y;
+        inBounds = x < mx + w && y < my + h;
+    } else {
+        x = (blockIdx.x * blockDim.x + threadIdx.x) * stride;
+        y = (blockIdx.y * blockDim.y + threadIdx.y) * stride;
+        inBounds = x < fw && y < fh;
+    }
+    const size_t idx = inBounds ? (size_t)y * fw + x : 0;
     PixelState st{};
     if (inBounds) st = state[idx];
     bool active = inBounds && st.status == 0;
 
     if (active) {
-        const double dcr = refOffX + ((double)x - 0.5 * w) * scale;
-        const double dci = refOffY - ((double)y - 0.5 * h) * scale;
+        const double dcr = refOffX + ((double)(x - mx) - 0.5 * w) * scale;
+        const double dci = refOffY - ((double)(y - my) - 0.5 * h) * scale;
         double dzr = st.dzr, dzi = st.dzi, dr = st.dr, di = st.di;
         int m = st.m, n = st.n;
         double zr = 0.0, zi = 0.0;
@@ -273,22 +284,23 @@ __device__ __forceinline__ uint32_t bilinear(const uint32_t* __restrict__ img, i
 
 // Display composite: per pixel pick the running pass's field or the last
 // finished frame, whichever has more detail for this display pixel.
-__global__ void compositeKernel(const FieldSample* __restrict__ field,
-                                const uint32_t* __restrict__ old, uint32_t* __restrict__ out,
-                                int w, int h, ShadeParams p, float timeSec, CompositeMap map) {
+__global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, int fh, int mx,
+                                int my, const uint32_t* __restrict__ old,
+                                uint32_t* __restrict__ out, int w, int h, ShadeParams p,
+                                float timeSec, CompositeMap map) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t idx = (size_t)y * w + x;
     const double px = (double)x - 0.5 * w, py = (double)y - 0.5 * h;
 
-    // Running pass.
-    const double u = map.nox + px * map.ratioN, v = map.noy + py * map.ratioN;
+    // Running pass (map is in view pixels; the field adds its margin).
+    const double u = map.nox + px * map.ratioN + mx, v = map.noy + py * map.ratioN + my;
     const int xi = (int)floor(u + 0.5), yi = (int)floor(v + 0.5);
     FieldSample s{};
     bool haveNew = false;
-    if (xi >= 0 && xi < w && yi >= 0 && yi < h) {
-        s = fetchFilled(field, w, xi, yi);
+    if (xi >= 0 && xi < fw && yi >= 0 && yi < fh) {
+        s = fetchFilled(field, fw, xi, yi);
         haveNew = s.flags < 0.5f;
     }
     // Last finished frame.
@@ -448,13 +460,18 @@ bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height) {
     width_ = width;
     height_ = height;
     if (!glPbo || width <= 0 || height <= 0) return true;
+    marginX_ = (width + 7) / 8;
+    marginY_ = (height + 7) / 8;
+    fieldW_ = width + 2 * marginX_;
+    fieldH_ = height + 2 * marginY_;
     const size_t n = (size_t)width * height;
+    const size_t fn = (size_t)fieldW_ * fieldH_;
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&pboResource_, glPbo,
                                             cudaGraphicsRegisterFlagsWriteDiscard));
-    CUDA_CHECK(cudaMalloc(&field_, sizeof(FieldSample) * n));
-    CUDA_CHECK(cudaMalloc(&state_, sizeof(PixelState) * n));
-    CUDA_CHECK(cudaMalloc(&fieldAlt_, sizeof(FieldSample) * n));
-    CUDA_CHECK(cudaMalloc(&stateAlt_, sizeof(PixelState) * n));
+    CUDA_CHECK(cudaMalloc(&field_, sizeof(FieldSample) * fn));
+    CUDA_CHECK(cudaMalloc(&state_, sizeof(PixelState) * fn));
+    CUDA_CHECK(cudaMalloc(&fieldAlt_, sizeof(FieldSample) * fn));
+    CUDA_CHECK(cudaMalloc(&stateAlt_, sizeof(PixelState) * fn));
     CUDA_CHECK(cudaMalloc(&lastImage_, sizeof(uint32_t) * n));
     CUDA_CHECK(cudaMemset(lastImage_, 0, sizeof(uint32_t) * n));
     return true;
@@ -478,7 +495,7 @@ bool CudaRenderer::beginIterate(const ViewParams& view) {
     cudaStream_t stream = (cudaStream_t)stream_;
     CUDA_CHECK(cudaStreamSynchronize(stream));  // cancel the slice in flight
     resetPass(view);
-    const int count = width_ * height_;
+    const int count = fieldW_ * fieldH_;
     resetState<<<(count + 255) / 256, 256, 0, stream>>>(state_, field_, count);
     CUDA_CHECK(cudaGetLastError());
     return true;
@@ -490,9 +507,9 @@ bool CudaRenderer::shiftAndResume(const ViewParams& view, int dx, int dy) {
     syncAll();  // the composite may be reading the buffers we are about to swap
     if (dx != 0 || dy != 0) {
         const dim3 block(32, 8);
-        const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
-        shiftKernel<<<grid, block, 0, stream>>>(state_, field_, stateAlt_, fieldAlt_, width_,
-                                                height_, dx, dy);
+        const dim3 grid((fieldW_ + block.x - 1) / block.x, (fieldH_ + block.y - 1) / block.y);
+        shiftKernel<<<grid, block, 0, stream>>>(state_, field_, stateAlt_, fieldAlt_, fieldW_,
+                                                fieldH_, dx, dy);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaStreamSynchronize(stream));
         std::swap(state_, stateAlt_);
@@ -508,7 +525,7 @@ bool CudaRenderer::restartPending(const ViewParams& view) {
     if (!field_ || !state_) return false;
     cudaStream_t stream = (cudaStream_t)stream_;
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    const int count = width_ * height_;
+    const int count = fieldW_ * fieldH_;
     resetPendingState<<<(count + 255) / 256, 256, 0, stream>>>(state_, count);
     CUDA_CHECK(cudaGetLastError());
     const float keepPass = passMs_;
@@ -549,13 +566,21 @@ bool CudaRenderer::stepIterate() {
     if (iterDone_ || sliceInFlight_) return false;
     cudaStream_t stream = (cudaStream_t)stream_;
     const dim3 block(32, 8);
-    const int sw = (width_ + stride_ - 1) / stride_, sh = (height_ + stride_ - 1) / stride_;
+    int sw, sh;
+    if (stride_ == 1) {
+        sw = width_;
+        sh = height_;
+    } else {
+        sw = (fieldW_ + stride_ - 1) / stride_;
+        sh = (fieldH_ + stride_ - 1) / stride_;
+    }
     const dim3 grid((sw + block.x - 1) / block.x, (sh + block.y - 1) / block.y);
     CUDA_CHECK(cudaMemsetAsync(activeCount_, 0, sizeof(int), stream));
     cudaEventRecord((cudaEvent_t)evStart_, stream);
     stampTimer<<<1, 1, 0, stream>>>(sliceStart_ns_);
-    iterateSlice<<<grid, block, 0, stream>>>(state_, field_, width_, height_, stride_,
-                                             iterView_.scale, iterView_.refOffX, iterView_.refOffY,
+    iterateSlice<<<grid, block, 0, stream>>>(state_, field_, fieldW_, fieldH_, marginX_, marginY_,
+                                             width_, height_, stride_, iterView_.scale,
+                                             iterView_.refOffX, iterView_.refOffY,
                                              iterView_.maxIter, sliceIters_, sliceStart_ns_,
                                              50ull * 1000000ull, ref_, bla_, activeCount_);
     CUDA_CHECK(cudaGetLastError());
@@ -588,8 +613,9 @@ bool CudaRenderer::composite(const ShadeParams& params, float timeSec, const Com
         shadePending_ = false;
     }
     if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
-    compositeKernel<<<grid, block, 0, stream>>>(field_, lastImage_, devPtr, width_, height_,
-                                                params, timeSec, map);
+    compositeKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, marginX_, marginY_,
+                                                lastImage_, devPtr, width_, height_, params,
+                                                timeSec, map);
     err = cudaGetLastError();
     if (map.snapshot) {
         cudaMemcpyAsync(lastImage_, devPtr, sizeof(uint32_t) * (size_t)width_ * height_,
