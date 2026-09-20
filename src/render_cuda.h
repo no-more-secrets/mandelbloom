@@ -35,12 +35,21 @@ public:
     bool bindPixelBuffer(unsigned glPbo, int width, int height);
     // Upload a new reference orbit (host arrays of `length` doubles).
     bool uploadReference(const double* zr, const double* zi, int length, bool escaped);
-    // Heavy pass: fill the field for this view around the reference.
-    bool iterate(const ViewParams& view);
+    // Heavy pass, run in slices so the UI stays live and no kernel runs long
+    // enough to trip the Windows GPU watchdog. beginIterate resets state;
+    // call stepIterate whenever !iterateBusy() until iterateDone().
+    bool beginIterate(const ViewParams& view);
+    bool stepIterate();
+    bool iterateBusy();
+    bool iterateDone() const { return iterDone_; }
+    // True once after each slice completes (cleared by the call).
+    bool takeSliceFinished() { bool f = sliceFinished_; sliceFinished_ = false; return f; }
+    int iterateProgress() const { return sliceStart_; }  // iterations issued so far
     // Light pass: color the field into the bound pixel buffer.
     bool shade(const ShadeParams& params, float timeSec, double pixelScale);
 
-    float lastIterateMs() const { return iterateMs_; }
+    float lastIterateMs() const { return iterateMs_; }  // total for the last full pass
+    float lastSliceMs() const { return sliceMs_; }
     float lastShadeMs() const { return shadeMs_; }
     const char* deviceName() const { return deviceName_; }
 
@@ -50,6 +59,22 @@ private:
     void freeReference();
     struct cudaGraphicsResource* pboResource_ = nullptr;
     FieldSample* field_ = nullptr;
+    struct PixelState* state_ = nullptr;
+    int* activeCount_ = nullptr;      // device
+    int* activeCountHost_ = nullptr;  // pinned
+    void* stream_ = nullptr;
+    void* evSlice_ = nullptr;
+    ViewParams iterView_;
+    int sliceStart_ = 0;
+    int sliceIters_ = 256;
+    bool iterDone_ = true;
+    bool sliceInFlight_ = false;
+    bool sliceFinished_ = false;
+    void* evShadeA_ = nullptr;
+    void* evShadeB_ = nullptr;
+    bool shadePending_ = false;
+    float sliceMs_ = 0.f;
+    float passMs_ = 0.f;
     double* refZr_ = nullptr;
     double* refZi_ = nullptr;
     int refCapacity_ = 0;

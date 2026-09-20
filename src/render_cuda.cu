@@ -16,78 +16,121 @@
         }                                                                         \
     } while (0)
 
+// Per-pixel iteration state carried between slices.
+struct PixelState {
+    double dzr, dzi;  // dz = z - Z_m
+    double dr, di;    // dz/dc * scale, for the distance estimate
+    int m;            // reference index
+    int n;            // pixel iteration
+    int status;       // 0 active, 1 escaped, 2 inside
+    int pad;
+};
+
 namespace {
 
-// Perturbation iteration in double precision with Zhuoran's rebasing.
-// Pixel parameter c = C + dc where C is the reference centre. We track
-// dz = z - Z_m and the derivative dz/dc (scaled by pixel size) for the
-// distance estimate.
-//   dz_{n+1} = 2 Z_m dz_n + dz_n^2 + dc
-//   rebase when |Z_m + dz| < |dz|: dz = Z_m + dz, m = 0
-__global__ void iteratePerturb(FieldSample* __restrict__ field, int w, int h, double scale,
-                               int maxIter, DeviceReference ref) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
+__global__ void resetState(PixelState* __restrict__ st, FieldSample* __restrict__ field,
+                           int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    st[i] = PixelState{};
+    FieldSample s{};
+    s.iter = 0.f;
+    s.pad = 1.f;  // pending
+    field[i] = s;
+}
 
-    const double dcr = ((double)x - 0.5 * w) * scale;
-    const double dci = -((double)y - 0.5 * h) * scale;
-
-    double dzr = 0.0, dzi = 0.0;  // dz
-    double zr = 0.0, zi = 0.0;    // full z = Z_m + dz
-    double dr = 0.0, di = 0.0;    // d(z)/d(c) * scale
-    int m = 0;                    // reference index
-    int n = 0;                    // pixel iteration
-    const double bailout = 65536.0;
-    const int refLast = ref.length - 1;
-    bool escaped = false;
-
-    while (n < maxIter) {
-        const double Zr = ref.zr[m];
-        const double Zi = ref.zi[m];
-        // derivative uses full z_n = Z_m + dz_n (before the step)
-        const double fzr = Zr + dzr, fzi = Zi + dzi;
-        const double ndr = 2.0 * (fzr * dr - fzi * di) + scale;
-        const double ndi = 2.0 * (fzr * di + fzi * dr);
-        dr = ndr;
-        di = ndi;
-        // dz' = (2 Z + dz) dz + dc
-        const double ar = 2.0 * Zr + dzr, ai = 2.0 * Zi + dzi;
-        const double ndzr = ar * dzr - ai * dzi + dcr;
-        const double ndzi = ar * dzi + ai * dzr + dci;
-        dzr = ndzr;
-        dzi = ndzi;
-        ++m;
-        ++n;
-        zr = ref.zr[m] + dzr;
-        zi = ref.zi[m] + dzi;
-        const double zmag2 = zr * zr + zi * zi;
-        if (zmag2 > bailout) { escaped = true; break; }
-        const double dzmag2 = dzr * dzr + dzi * dzi;
-        if (zmag2 < dzmag2 || m >= refLast) {
-            dzr = zr;
-            dzi = zi;
-            m = 0;
-        }
-    }
-
+__device__ __forceinline__ void writeSample(FieldSample* __restrict__ field, size_t idx,
+                                            const PixelState& st, double zr, double zi,
+                                            double scale, bool escaped, bool pending) {
     FieldSample s;
     if (!escaped) {
-        s.iter = -1.f;
+        s.iter = pending ? (float)st.n : -1.f;
         s.de = 0.f;
         s.angle = 0.f;
     } else {
         const double mag2 = zr * zr + zi * zi;
         const double logMag = 0.5 * log(mag2);
-        s.iter = (float)(n + 1.0 - log2(logMag / 0.6931471805599453));
-        const double dmag = sqrt(dr * dr + di * di);
-        // de here is already in pixels (derivative was scaled), convert to
-        // complex units so the shader's pixelScale division still holds.
+        s.iter = (float)(st.n + 1.0 - log2(logMag / 0.6931471805599453));
+        const double dmag = sqrt(st.dr * st.dr + st.di * st.di);
         s.de = dmag > 0.0 ? (float)(sqrt(mag2) * logMag / dmag * scale) : 0.f;
         s.angle = (float)atan2(zi, zr);
     }
-    s.pad = 0.f;
-    field[(size_t)y * w + x] = s;
+    s.pad = pending ? 1.f : 0.f;
+    field[idx] = s;
+}
+
+// Perturbation iteration in double precision with Zhuoran's rebasing,
+// advanced by at most sliceIters iterations per launch.
+//   dz_{n+1} = 2 Z_m dz_n + dz_n^2 + dc
+//   rebase when |Z_m + dz| < |dz|: dz = Z_m + dz, m = 0
+__global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __restrict__ field,
+                             int w, int h, double scale, int maxIter, int sliceIters,
+                             DeviceReference ref, int* __restrict__ activeCount) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const bool inBounds = x < w && y < h;
+    const size_t idx = inBounds ? (size_t)y * w + x : 0;
+    PixelState st{};
+    if (inBounds) st = state[idx];
+    bool active = inBounds && st.status == 0;
+
+    if (active) {
+        const double dcr = ((double)x - 0.5 * w) * scale;
+        const double dci = -((double)y - 0.5 * h) * scale;
+        double dzr = st.dzr, dzi = st.dzi, dr = st.dr, di = st.di;
+        int m = st.m, n = st.n;
+        double zr = 0.0, zi = 0.0;
+        const double bailout = 65536.0;
+        const int refLast = ref.length - 1;
+        const int stop = min(maxIter, n + sliceIters);
+        bool escaped = false;
+
+        while (n < stop) {
+            const double Zr = ref.zr[m];
+            const double Zi = ref.zi[m];
+            const double fzr = Zr + dzr, fzi = Zi + dzi;
+            const double ndr = 2.0 * (fzr * dr - fzi * di) + scale;
+            const double ndi = 2.0 * (fzr * di + fzi * dr);
+            dr = ndr;
+            di = ndi;
+            const double ar = 2.0 * Zr + dzr, ai = 2.0 * Zi + dzi;
+            const double ndzr = ar * dzr - ai * dzi + dcr;
+            const double ndzi = ar * dzi + ai * dzr + dci;
+            dzr = ndzr;
+            dzi = ndzi;
+            ++m;
+            ++n;
+            zr = ref.zr[m] + dzr;
+            zi = ref.zi[m] + dzi;
+            const double zmag2 = zr * zr + zi * zi;
+            if (zmag2 > bailout) {
+                escaped = true;
+                break;
+            }
+            const double dzmag2 = dzr * dzr + dzi * dzi;
+            if (zmag2 < dzmag2 || m >= refLast) {
+                dzr = zr;
+                dzi = zi;
+                m = 0;
+            }
+        }
+        st.dzr = dzr;
+        st.dzi = dzi;
+        st.dr = dr;
+        st.di = di;
+        st.m = m;
+        st.n = n;
+        if (escaped) st.status = 1;
+        else if (n >= maxIter) st.status = 2;
+        const bool pending = st.status == 0;
+        writeSample(field, idx, st, zr, zi, scale, escaped, pending);
+        state[idx] = st;
+        active = pending;
+    }
+
+    // Warp-aggregated count of pixels still active.
+    const unsigned mask = __ballot_sync(0xffffffffu, active);
+    if ((threadIdx.x & 31) == 0 && mask) atomicAdd(activeCount, __popc(mask));
 }
 
 __global__ void shadeKernel(const FieldSample* __restrict__ field, uint32_t* __restrict__ out,
@@ -107,6 +150,12 @@ CudaRenderer::~CudaRenderer() {
     freeReference();
     if (evStart_) cudaEventDestroy((cudaEvent_t)evStart_);
     if (evStop_) cudaEventDestroy((cudaEvent_t)evStop_);
+    if (evSlice_) cudaEventDestroy((cudaEvent_t)evSlice_);
+    if (evShadeA_) cudaEventDestroy((cudaEvent_t)evShadeA_);
+    if (evShadeB_) cudaEventDestroy((cudaEvent_t)evShadeB_);
+    if (activeCount_) cudaFree(activeCount_);
+    if (activeCountHost_) cudaFreeHost(activeCountHost_);
+    if (stream_) cudaStreamDestroy((cudaStream_t)stream_);
 }
 
 bool CudaRenderer::init() {
@@ -116,11 +165,23 @@ bool CudaRenderer::init() {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
     std::snprintf(deviceName_, sizeof deviceName_, "%s (SM %d.%d, %d SMs)", prop.name,
                   prop.major, prop.minor, prop.multiProcessorCount);
-    cudaEvent_t a, b;
+    cudaEvent_t a, b, es, sa, sb;
     CUDA_CHECK(cudaEventCreate(&a));
     CUDA_CHECK(cudaEventCreate(&b));
+    CUDA_CHECK(cudaEventCreateWithFlags(&es, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreate(&sa));
+    CUDA_CHECK(cudaEventCreate(&sb));
     evStart_ = a;
     evStop_ = b;
+    evSlice_ = es;
+    evShadeA_ = sa;
+    evShadeB_ = sb;
+    cudaStream_t st;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
+    stream_ = st;
+    CUDA_CHECK(cudaMalloc(&activeCount_, sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&activeCountHost_, sizeof(int)));
+    *activeCountHost_ = 0;
     return true;
 }
 
@@ -132,13 +193,17 @@ void CudaRenderer::unregisterPbo() {
 }
 
 void CudaRenderer::freeField() {
-    if (field_) {
-        cudaFree(field_);
-        field_ = nullptr;
-    }
+    if (stream_) cudaStreamSynchronize((cudaStream_t)stream_);
+    if (field_) cudaFree(field_);
+    if (state_) cudaFree(state_);
+    field_ = nullptr;
+    state_ = nullptr;
+    iterDone_ = true;
+    sliceInFlight_ = false;
 }
 
 void CudaRenderer::freeReference() {
+    if (stream_) cudaStreamSynchronize((cudaStream_t)stream_);
     if (refZr_) cudaFree(refZr_);
     if (refZi_) cudaFree(refZi_);
     refZr_ = refZi_ = nullptr;
@@ -147,6 +212,8 @@ void CudaRenderer::freeReference() {
 }
 
 bool CudaRenderer::uploadReference(const double* zr, const double* zi, int length, bool escaped) {
+    cudaStream_t stream = (cudaStream_t)stream_;
+    CUDA_CHECK(cudaStreamSynchronize(stream));  // no slice may still read the old orbit
     if (length > refCapacity_) {
         freeReference();
         refCapacity_ = length + length / 4 + 1024;
@@ -171,44 +238,95 @@ bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height) {
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&pboResource_, glPbo,
                                             cudaGraphicsRegisterFlagsWriteDiscard));
     CUDA_CHECK(cudaMalloc(&field_, sizeof(FieldSample) * (size_t)width * height));
+    CUDA_CHECK(cudaMalloc(&state_, sizeof(PixelState) * (size_t)width * height));
     return true;
 }
 
-bool CudaRenderer::iterate(const ViewParams& view) {
-    if (!field_ || view.width != width_ || view.height != height_) return false;
+bool CudaRenderer::beginIterate(const ViewParams& view) {
+    if (!field_ || !state_ || view.width != width_ || view.height != height_) return false;
     if (ref_.length < 2) return false;
-    const dim3 block(16, 16);
-    const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
-    cudaEventRecord((cudaEvent_t)evStart_, 0);
-    iteratePerturb<<<grid, block>>>(field_, width_, height_, view.scale, view.maxIter, ref_);
-    cudaEventRecord((cudaEvent_t)evStop_, 0);
+    cudaStream_t stream = (cudaStream_t)stream_;
+    // Cancel whatever slice is in flight (bounded by one slice length).
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    iterView_ = view;
+    sliceStart_ = 0;
+    iterDone_ = false;
+    sliceInFlight_ = false;
+    passMs_ = 0.f;
+    const int count = width_ * height_;
+    resetState<<<(count + 255) / 256, 256, 0, stream>>>(state_, field_, count);
     CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)evStop_));
-    cudaEventElapsedTime(&iterateMs_, (cudaEvent_t)evStart_, (cudaEvent_t)evStop_);
+    return true;
+}
+
+bool CudaRenderer::iterateBusy() {
+    if (!sliceInFlight_) return false;
+    const cudaError_t q = cudaEventQuery((cudaEvent_t)evSlice_);
+    if (q == cudaErrorNotReady) return true;
+    // Slice finished: collect timing and the active count.
+    sliceInFlight_ = false;
+    sliceFinished_ = true;
+    cudaEventElapsedTime(&sliceMs_, (cudaEvent_t)evStart_, (cudaEvent_t)evStop_);
+    passMs_ += sliceMs_;
+    iterateMs_ = passMs_;
+    if (*activeCountHost_ == 0 || sliceStart_ >= iterView_.maxIter) iterDone_ = true;
+    // Adapt the slice length toward ~25 ms of GPU time.
+    if (sliceMs_ > 0.f) {
+        float f = 25.f / sliceMs_;
+        f = fminf(fmaxf(f, 0.5f), 2.f);
+        sliceIters_ = (int)fminf(fmaxf((float)sliceIters_ * f, 16.f), 65536.f);
+    }
+    return false;
+}
+
+bool CudaRenderer::stepIterate() {
+    if (iterDone_ || sliceInFlight_) return false;
+    cudaStream_t stream = (cudaStream_t)stream_;
+    const dim3 block(32, 8);
+    const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
+    CUDA_CHECK(cudaMemsetAsync(activeCount_, 0, sizeof(int), stream));
+    cudaEventRecord((cudaEvent_t)evStart_, stream);
+    iterateSlice<<<grid, block, 0, stream>>>(state_, field_, width_, height_, iterView_.scale,
+                                             iterView_.maxIter, sliceIters_, ref_, activeCount_);
+    CUDA_CHECK(cudaGetLastError());
+    cudaEventRecord((cudaEvent_t)evStop_, stream);
+    CUDA_CHECK(cudaMemcpyAsync(activeCountHost_, activeCount_, sizeof(int),
+                               cudaMemcpyDeviceToHost, stream));
+    cudaEventRecord((cudaEvent_t)evSlice_, stream);
+    sliceStart_ += sliceIters_;
+    sliceInFlight_ = true;
     return true;
 }
 
 bool CudaRenderer::shade(const ShadeParams& params, float timeSec, double pixelScale) {
     if (!pboResource_ || !field_) return false;
-    CUDA_CHECK(cudaGraphicsMapResources(1, &pboResource_, 0));
+    cudaStream_t stream = (cudaStream_t)stream_;
+    CUDA_CHECK(cudaGraphicsMapResources(1, &pboResource_, stream));
     uint32_t* devPtr = nullptr;
     size_t bytes = 0;
     cudaError_t err = cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &bytes, pboResource_);
     if (err != cudaSuccess) {
-        cudaGraphicsUnmapResources(1, &pboResource_, 0);
+        cudaGraphicsUnmapResources(1, &pboResource_, stream);
         std::fprintf(stderr, "map failed: %s\n", cudaGetErrorString(err));
         return false;
     }
     const dim3 block(16, 16);
     const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
-    cudaEventRecord((cudaEvent_t)evStart_, 0);
-    shadeKernel<<<grid, block>>>(field_, devPtr, width_, height_, params, timeSec,
-                                 (float)pixelScale);
-    cudaEventRecord((cudaEvent_t)evStop_, 0);
+    // Timing of the previous shade, harvested without blocking.
+    if (shadePending_ && cudaEventQuery((cudaEvent_t)evShadeB_) == cudaSuccess) {
+        cudaEventElapsedTime(&shadeMs_, (cudaEvent_t)evShadeA_, (cudaEvent_t)evShadeB_);
+        shadePending_ = false;
+    }
+    if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
+    shadeKernel<<<grid, block, 0, stream>>>(field_, devPtr, width_, height_, params, timeSec,
+                                            (float)pixelScale);
     err = cudaGetLastError();
-    cudaEventSynchronize((cudaEvent_t)evStop_);
-    cudaEventElapsedTime(&shadeMs_, (cudaEvent_t)evStart_, (cudaEvent_t)evStop_);
-    CUDA_CHECK(cudaGraphicsUnmapResources(1, &pboResource_, 0));
+    if (!shadePending_) {
+        cudaEventRecord((cudaEvent_t)evShadeB_, stream);
+        shadePending_ = true;
+    }
+    // Unmap is stream-ordered; later GL calls wait for it without a host sync.
+    CUDA_CHECK(cudaGraphicsUnmapResources(1, &pboResource_, stream));
     if (err != cudaSuccess) {
         std::fprintf(stderr, "shade kernel failed: %s\n", cudaGetErrorString(err));
         return false;

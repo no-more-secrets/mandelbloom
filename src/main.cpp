@@ -155,7 +155,13 @@ void drawUi(App& app) {
         ImGui::Separator();
         ImGui::Text("ref     %.2f ms  (%d iters%s)", app.ref.computeMs, app.ref.length,
                     app.ref.escaped ? ", escaped" : "");
-        ImGui::Text("iterate %.2f ms", app.renderer.lastIterateMs());
+        if (app.renderer.iterateDone()) {
+            ImGui::Text("iterate %.0f ms", app.renderer.lastIterateMs());
+        } else {
+            ImGui::Text("iterate %.0f ms  (%d / %d, slice %.1f ms)", app.renderer.lastIterateMs(),
+                        app.renderer.iterateProgress(), app.view.maxIter,
+                        app.renderer.lastSliceMs());
+        }
         ImGui::Text("shade   %.2f ms", app.renderer.lastShadeMs());
         ImGui::Text("frame   %.0f fps", app.fps);
         ImGui::TextDisabled("drag: pan  wheel: zoom  R: reset  Tab: hide");
@@ -273,14 +279,19 @@ int main(int argc, char** argv) {
 
         if (app.dirty && pw > 0 && ph > 0) {
             rebuildReference(app);
-            app.renderer.iterate(app.view);
+            app.renderer.beginIterate(app.view);
             app.dirty = false;
-            app.shadeDirty = true;
         }
-        if (app.animate) app.shadeDirty = true;
-        if (app.shadeDirty && pw > 0 && ph > 0) {
-            if (app.renderer.shade(app.shade, app.animTime, app.view.scale)) app.display.upload();
-            app.shadeDirty = false;
+        // One slice in flight at a time. Shade only when the stream is idle so
+        // the display never queues behind a slice.
+        if (!app.renderer.iterateBusy()) {
+            if (app.renderer.takeSliceFinished()) app.shadeDirty = true;
+            if (app.animate) app.shadeDirty = true;
+            if (app.shadeDirty && pw > 0 && ph > 0) {
+                if (app.renderer.shade(app.shade, app.animTime, app.view.scale)) app.display.upload();
+                app.shadeDirty = false;
+            }
+            if (!app.renderer.iterateDone()) app.renderer.stepIterate();
         }
 
         ImGui_ImplOpenGL3_NewFrame();

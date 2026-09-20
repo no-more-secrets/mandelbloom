@@ -25,7 +25,8 @@ __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeP
     t += p.offset + timeSec;
     float3 col = cosPalette(p, t);
 
-    if (p.deStrength > 0.f) {
+    const bool pending = s.pad > 0.5f;  // no distance estimate yet
+    if (p.deStrength > 0.f && !pending) {
         // Filaments thinner than a pixel still get drawn dark.
         float edge = s.de / pixelScale;
         edge = fminf(fmaxf(edge, 0.f), 1.f);
