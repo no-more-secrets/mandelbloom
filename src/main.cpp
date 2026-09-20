@@ -944,13 +944,39 @@ int main(int argc, char** argv) {
     if (argPreset > 0) applyPreset(app, argPreset);
     if (!argLoad.empty()) {
         Preset pr;
-        if (loadPreset(argLoad, pr)) applyPresetTo(app, pr);
-        else std::fprintf(stderr, "preset not found: %s\n", argLoad.c_str());
+        if (loadPreset(argLoad, pr)) {
+            applyPresetTo(app, pr);
+        } else {
+            app.toast = "preset not found: " + argLoad;
+            app.toastUntil = nowSeconds() + 8.0;
+        }
     }
     if (!argLoadFile.empty()) {
+        // Relative paths: the working directory, then beside the executable,
+        // then the repo root above build/<preset>/ (so docs\cover.preset works
+        // from anywhere).
+        std::vector<std::string> tries = {argLoadFile};
+        if (!std::filesystem::path(argLoadFile).is_absolute()) {
+            const char* base = SDL_GetBasePath();
+            if (base) {
+                tries.push_back(std::string(base) + argLoadFile);
+                tries.push_back(std::string(base) + "..\\..\\" + argLoadFile);
+            }
+        }
         Preset pr;
-        if (loadPresetFile(argLoadFile, pr)) applyPresetTo(app, pr);
-        else std::fprintf(stderr, "preset file not found: %s\n", argLoadFile.c_str());
+        bool loaded = false;
+        for (const auto& t : tries) {
+            std::error_code ec;
+            if (std::filesystem::exists(t, ec) && loadPresetFile(t, pr)) {
+                applyPresetTo(app, pr);
+                loaded = true;
+                break;
+            }
+        }
+        if (!loaded) {
+            app.toast = "preset file not found: " + argLoadFile;
+            app.toastUntil = nowSeconds() + 8.0;
+        }
     }
     if (!argAa.empty()) {
         int pat = 0, fil = 0;
