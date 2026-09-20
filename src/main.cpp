@@ -366,7 +366,7 @@ Preset currentLook(const App& app);
 std::string screenshotStem(App& app, int w) {
     const char* picsC = SDL_GetUserFolder(SDL_FOLDER_PICTURES);  // owned by SDL
     std::string dir = picsC ? picsC : "";
-    dir += "mandelgpu";
+    dir += "Mandelbloom";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
     const std::time_t t = std::time(nullptr);
@@ -591,7 +591,7 @@ void drawUi(App& app) {
     if (!app.showUi) return;
     ImGui::SetNextWindowPos(ImVec2(10 * app.uiScale, 10 * app.uiScale), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.75f);
-    if (ImGui::Begin("mandelgpu", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+    if (ImGui::Begin("mandelbloom", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted(app.renderer.deviceName());
         ImGui::Separator();
         const int digits = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
@@ -912,7 +912,7 @@ int main(int argc, char** argv) {
     App app;
     float initialScale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (initialScale <= 0.f) initialScale = 1.f;
-    app.window = SDL_CreateWindow("mandelgpu", (int)(1280 * initialScale),
+    app.window = SDL_CreateWindow("mandelbloom", (int)(1280 * initialScale),
                                   (int)(800 * initialScale),
                                   SDL_WINDOW_RESIZABLE |
                                       (argHidden ? (SDL_WINDOW_HIDDEN | SDL_WINDOW_NOT_FOCUSABLE)

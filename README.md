@@ -49,7 +49,7 @@ Toolkit 13.4, and an NVIDIA GPU. Dependencies come from the vcpkg bundled with V
 | R | Reset view |
 | Tab | Hide or show the overlay |
 | F11 | Fullscreen |
-| F2 | Screenshot to Pictures\mandelgpu (SDR PNG, HDR highlights rolled off) |
+| F2 | Screenshot to Pictures\Mandelbloom (SDR PNG, HDR highlights rolled off) |
 | Shift+F2 | Screenshot PNG plus linear EXR (1.0 = SDR white) |
 | Ctrl+F2 | Screenshot of the presented frame including the UI |
 
@@ -62,7 +62,7 @@ so the sliders always describe what is on screen.
 ## Presets
 
 The Shading section has nine built-in presets and a save box. Saved presets
-are plain text files in `%APPDATA%/sam/mandelgpu/presets/` and cover
+are plain text files in `%APPDATA%/NMS/Mandelbloom/presets/` and cover
 shading, post-processing and the animation flag. `--load NAME` starts with a
 saved preset, `--save NAME` writes the starting parameters, `--fullscreen`
 starts fullscreen.

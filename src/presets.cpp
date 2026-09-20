@@ -221,7 +221,7 @@ Preset builtinPreset(int which) {
 }
 
 std::string presetDir() {
-    char* pref = SDL_GetPrefPath("sam", "mandelgpu");
+    char* pref = SDL_GetPrefPath("NMS", "Mandelbloom");  // APPDATA/NMS/Mandelbloom/
     std::string dir = pref ? pref : "";
     if (pref) SDL_free(pref);
     dir += "presets";
