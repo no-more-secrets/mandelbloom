@@ -101,6 +101,14 @@ public:
     // own stream so it never waits for a slice.
     bool composite(const ShadeParams& params, float timeSec, const CompositeMap& map);
 
+    // Debug: read the view region back and count pixels by state. Slow.
+    struct DebugStats {
+        int total = 0, genMatch = 0, genZero = 0, genOther = 0;
+        int stActive = 0, stEscaped = 0, stInside = 0;
+        int genMatchInside = 0;  // gen matches and iter < 0
+    };
+    bool debugStats(float gen, DebugStats& out);
+
     float lastIterateMs() const { return iterateMs_; }  // total for the last full pass
     float lastSliceMs() const { return sliceMs_; }
     float lastShadeMs() const { return shadeMs_; }

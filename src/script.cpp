@@ -115,6 +115,14 @@ std::string Script::tick(double now, int winW, int winH, bool& quit) {
             dragStepsLeft_ = steps;
             pushButton(mouseX_, mouseY_, true);
             return "";
+        } else if (s.cmd == "pan") {
+            int dx = 0, dy = 0;
+            std::sscanf(s.arg.c_str(), "%d,%d", &dx, &dy);
+            panDx_ = dx;
+            panDy_ = dy;
+            panPending_ = true;
+            waitUntil_ = now + 0.016;
+            return "";
         } else if (s.cmd == "shot") {
             return s.arg;
         } else if (s.cmd == "quit") {

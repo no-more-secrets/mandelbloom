@@ -401,7 +401,7 @@ bool handleEvent(App& app, const SDL_Event& e) {
             if (app.dragging && !io.WantCaptureMouse) {
                 const int dx = (int)e.motion.xrel, dy = (int)e.motion.yrel;
                 const double t = nowSeconds();
-                const double dt = std::max(t - app.lastMotionSec, 0.002);
+                const double dt = std::max(t - app.lastMotionSec, 0.008);
                 app.lastMotionSec = t;
                 // Smoothed velocity from the last few motion events.
                 const double k = dt > 0.05 ? 1.0 : 0.4;
@@ -589,6 +589,7 @@ int main(int argc, char** argv) {
     int argIter = 0;
     int argPreset = 0;
     int argSs = 1;
+    bool argNoBla = false;
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
@@ -597,6 +598,8 @@ int main(int argc, char** argv) {
             argPreset = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--ss") == 0 && i + 1 < argc) {
             argSs = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--nobla") == 0) {
+            argNoBla = true;
         } else {
             positional.push_back(argv[i]);
         }
@@ -652,6 +655,7 @@ int main(int argc, char** argv) {
     std::printf("CUDA: %s\n", app.renderer.deviceName());
     if (argPreset > 0) applyPreset(app.shade, argPreset);
     app.ss = std::min(3, std::max(1, argSs));
+    if (argNoBla) app.view.useBla = false;
 
     Uint64 lastTick = SDL_GetPerformanceCounter();
     bool running = true;
@@ -705,9 +709,11 @@ int main(int argc, char** argv) {
             // view and the field placement until the next shift.
             const int qx = (app.panDx / 8) * 8, qy = (app.panDy / 8) * 8;
             if (qx != 0 || qy != 0) {
-                app.renderer.shiftAndResume(app.view, qx, qy);
-                // The field moved under every generation: their centres move
-                // by the shifted amount at their own scale.
+                // The field moves under every generation: their centres move
+                // by the shifted amount at their own scale. Do this first: the
+                // renderer snapshots app.view (with the reference offset) when
+                // it resumes, so the offset must already describe the shifted
+                // field.
                 for (auto& g : app.gens) {
                     g.view.cx.addDouble(qx * (g.view.scale / app.ss));
                     g.view.cy.subDouble(qy * (g.view.scale / app.ss));
@@ -715,6 +721,7 @@ int main(int argc, char** argv) {
                 app.panDx -= qx;
                 app.panDy -= qy;
                 updateRefOffset(app);
+                app.renderer.shiftAndResume(app.view, qx, qy);
                 if (std::hypot(app.view.refOffX, app.view.refOffY) > halfDiagonal(app)) {
                     rebuildReference(app);
                     app.renderer.restartPending(app.view);
@@ -777,6 +784,10 @@ int main(int argc, char** argv) {
 
         if (scripted) {
             bool quit = false;
+            {
+                int pdx, pdy;
+                if (script.takePan(pdx, pdy)) panPixels(app, pdx, pdy);
+            }
             const std::string shot = script.tick(
                 (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency(), pw,
                 ph, quit);
@@ -800,6 +811,14 @@ int main(int argc, char** argv) {
                             app.render.cy.toString(dg).c_str());
                 std::printf("  shown scale=%.6g render scale=%.6g gens=%zu\n", app.shown.scale,
                             app.render.scale, app.gens.size());
+                if (!app.gens.empty()) {
+                    CudaRenderer::DebugStats ds;
+                    app.renderer.debugStats(app.gens[0].id, ds);
+                    std::printf("  field: total=%d genMatch=%d (inside %d) genZero=%d genOther=%d | "
+                                "active=%d escaped=%d insideSt=%d\n",
+                                ds.total, ds.genMatch, ds.genMatchInside, ds.genZero, ds.genOther,
+                                ds.stActive, ds.stEscaped, ds.stInside);
+                }
                 for (const auto& g : app.gens) {
                     double ox, oy, ratio;
                     mapOnto(app, g.view, app.ss, app.view.width, app.view.height, ox, oy, ratio);

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cmath>
 #include <utility>
+#include <vector>
 #include "render_cuda.h"
 #include "bla.h"
 #include "shade.cuh"
@@ -651,6 +652,35 @@ bool CudaRenderer::stepIterate() {
     cudaEventRecord((cudaEvent_t)evSlice_, stream);
     sliceStart_ = iterView_.maxIter;
     sliceInFlight_ = true;
+    return true;
+}
+
+bool CudaRenderer::debugStats(float gen, DebugStats& out) {
+    out = DebugStats{};
+    if (!field_ || !state_) return false;
+    syncAll();
+    const size_t fn = (size_t)fieldW_ * fieldH_;
+    std::vector<FieldSample> f(fn);
+    std::vector<PixelState> st(fn);
+    CUDA_CHECK(cudaMemcpy(f.data(), field_, sizeof(FieldSample) * fn, cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(st.data(), state_, sizeof(PixelState) * fn, cudaMemcpyDeviceToHost));
+    for (int y = marginY_; y < marginY_ + viewH_; ++y) {
+        for (int x = marginX_; x < marginX_ + viewW_; ++x) {
+            const size_t i = (size_t)y * fieldW_ + x;
+            ++out.total;
+            if (f[i].gen == gen) {
+                ++out.genMatch;
+                if (f[i].iter < 0.f) ++out.genMatchInside;
+            } else if (f[i].gen == 0.f) {
+                ++out.genZero;
+            } else {
+                ++out.genOther;
+            }
+            if (st[i].status == 0) ++out.stActive;
+            else if (st[i].status == 1) ++out.stEscaped;
+            else ++out.stInside;
+        }
+    }
     return true;
 }
 
