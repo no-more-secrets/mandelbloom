@@ -20,6 +20,7 @@ add_executable(mandelgpu
   src/main.cpp
   src/gl_display.cpp
   src/reference.cpp
+  src/bla.cpp
   src/render_cuda.cu
 )
 target_include_directories(mandelgpu PRIVATE src ${MPFR_INCLUDE_DIR})

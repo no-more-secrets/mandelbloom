@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cmath>
 #include "render_cuda.h"
+#include "bla.h"
 #include "shade.cuh"
 
 #define CUDA_CHECK(call)                                                          \
@@ -63,9 +64,24 @@ __device__ __forceinline__ void writeSample(FieldSample* __restrict__ field, siz
 // advanced by at most sliceIters iterations per launch.
 //   dz_{n+1} = 2 Z_m dz_n + dz_n^2 + dc
 //   rebase when |Z_m + dz| < |dz|: dz = Z_m + dz, m = 0
+// Find the longest BLA node starting at reference index m that is valid
+// for |dz|^2 = dzmag2. Returns nullptr if none.
+__device__ __forceinline__ const BlaNode* findBla(const DeviceBla& bla, int m, double dzmag2,
+                                                  int refLast) {
+    const int j0 = m - 1;
+    if (j0 < 0 || j0 >= bla.steps) return nullptr;
+    // Highest level whose node is aligned at j0.
+    int k = j0 == 0 ? bla.levels - 1 : min(bla.levels - 1, __ffs(j0) - 1);
+    for (; k >= 0; --k) {
+        const BlaNode* n = bla.nodes + bla.levelOffset[k] + (j0 >> k);
+        if (dzmag2 < n->r2 && m + n->l <= refLast) return n;
+    }
+    return nullptr;
+}
+
 __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __restrict__ field,
                              int w, int h, double scale, int maxIter, int sliceIters,
-                             DeviceReference ref, int* __restrict__ activeCount) {
+                             DeviceReference ref, DeviceBla bla, int* __restrict__ activeCount) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const bool inBounds = x < w && y < h;
@@ -85,7 +101,39 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
         const int stop = min(maxIter, n + sliceIters);
         bool escaped = false;
 
+        double dzmag2 = dzr * dzr + dzi * dzi;
         while (n < stop) {
+            if (bla.enabled) {
+                const BlaNode* nd = findBla(bla, m, dzmag2, refLast);
+                if (nd) {
+                    // dz' = A dz + B dc ; d' = A d + B scale
+                    const double ndzr = nd->ar * dzr - nd->ai * dzi + nd->br * dcr - nd->bi * dci;
+                    const double ndzi = nd->ar * dzi + nd->ai * dzr + nd->br * dci + nd->bi * dcr;
+                    const double ndr = nd->ar * dr - nd->ai * di + nd->br * scale;
+                    const double ndi = nd->ar * di + nd->ai * dr + nd->bi * scale;
+                    dzr = ndzr;
+                    dzi = ndzi;
+                    dr = ndr;
+                    di = ndi;
+                    m += nd->l;
+                    n += nd->l;
+                    zr = ref.zr[m] + dzr;
+                    zi = ref.zi[m] + dzi;
+                    const double zmag2 = zr * zr + zi * zi;
+                    if (zmag2 > bailout) {
+                        escaped = true;
+                        break;
+                    }
+                    dzmag2 = dzr * dzr + dzi * dzi;
+                    if (zmag2 < dzmag2 || m >= refLast) {
+                        dzr = zr;
+                        dzi = zi;
+                        dzmag2 = zmag2;
+                        m = 0;
+                    }
+                    continue;
+                }
+            }
             const double Zr = ref.zr[m];
             const double Zi = ref.zi[m];
             const double fzr = Zr + dzr, fzi = Zi + dzi;
@@ -107,10 +155,11 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
                 escaped = true;
                 break;
             }
-            const double dzmag2 = dzr * dzr + dzi * dzi;
+            dzmag2 = dzr * dzr + dzi * dzi;
             if (zmag2 < dzmag2 || m >= refLast) {
                 dzr = zr;
                 dzi = zi;
+                dzmag2 = zmag2;
                 m = 0;
             }
         }
@@ -148,6 +197,7 @@ CudaRenderer::~CudaRenderer() {
     unregisterPbo();
     freeField();
     freeReference();
+    freeBla();
     if (evStart_) cudaEventDestroy((cudaEvent_t)evStart_);
     if (evStop_) cudaEventDestroy((cudaEvent_t)evStop_);
     if (evSlice_) cudaEventDestroy((cudaEvent_t)evSlice_);
@@ -211,6 +261,40 @@ void CudaRenderer::freeReference() {
     ref_ = DeviceReference{};
 }
 
+void CudaRenderer::freeBla() {
+    if (stream_) cudaStreamSynchronize((cudaStream_t)stream_);
+    if (blaNodes_) cudaFree(blaNodes_);
+    if (blaOffsets_) cudaFree(blaOffsets_);
+    blaNodes_ = nullptr;
+    blaOffsets_ = nullptr;
+    blaNodeCapacity_ = blaLevelCapacity_ = 0;
+    bla_ = DeviceBla{};
+}
+
+bool CudaRenderer::uploadBla(const BlaNode* nodes, int count, const int* levelOffset, int levels,
+                             int steps) {
+    cudaStream_t stream = (cudaStream_t)stream_;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (count > blaNodeCapacity_ || levels > blaLevelCapacity_) {
+        freeBla();
+        blaNodeCapacity_ = count + count / 4 + 1024;
+        blaLevelCapacity_ = levels + 8;
+        CUDA_CHECK(cudaMalloc(&blaNodes_, sizeof(BlaNode) * (size_t)blaNodeCapacity_));
+        CUDA_CHECK(cudaMalloc(&blaOffsets_, sizeof(int) * (size_t)blaLevelCapacity_));
+    }
+    if (count > 0) {
+        CUDA_CHECK(cudaMemcpy(blaNodes_, nodes, sizeof(BlaNode) * (size_t)count,
+                              cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(blaOffsets_, levelOffset, sizeof(int) * (size_t)levels,
+                              cudaMemcpyHostToDevice));
+    }
+    bla_.nodes = blaNodes_;
+    bla_.levelOffset = blaOffsets_;
+    bla_.levels = levels;
+    bla_.steps = steps;
+    return true;
+}
+
 bool CudaRenderer::uploadReference(const double* zr, const double* zi, int length, bool escaped) {
     cudaStream_t stream = (cudaStream_t)stream_;
     CUDA_CHECK(cudaStreamSynchronize(stream));  // no slice may still read the old orbit
@@ -249,6 +333,7 @@ bool CudaRenderer::beginIterate(const ViewParams& view) {
     // Cancel whatever slice is in flight (bounded by one slice length).
     CUDA_CHECK(cudaStreamSynchronize(stream));
     iterView_ = view;
+    bla_.enabled = view.useBla ? 1 : 0;
     sliceStart_ = 0;
     iterDone_ = false;
     sliceInFlight_ = false;
@@ -287,7 +372,8 @@ bool CudaRenderer::stepIterate() {
     CUDA_CHECK(cudaMemsetAsync(activeCount_, 0, sizeof(int), stream));
     cudaEventRecord((cudaEvent_t)evStart_, stream);
     iterateSlice<<<grid, block, 0, stream>>>(state_, field_, width_, height_, iterView_.scale,
-                                             iterView_.maxIter, sliceIters_, ref_, activeCount_);
+                                             iterView_.maxIter, sliceIters_, ref_, bla_,
+                                             activeCount_);
     CUDA_CHECK(cudaGetLastError());
     cudaEventRecord((cudaEvent_t)evStop_, stream);
     CUDA_CHECK(cudaMemcpyAsync(activeCountHost_, activeCount_, sizeof(int),

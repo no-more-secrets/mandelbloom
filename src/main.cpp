@@ -10,6 +10,7 @@
 #include <cmath>
 #include <string>
 #include "bigfloat.h"
+#include "bla.h"
 #include "gl_display.h"
 #include "reference.h"
 #include "render_cuda.h"
@@ -24,6 +25,8 @@ struct App {
     ViewParams view;
     BigFloat cx{64}, cy{64};   // view centre = reference parameter
     ReferenceOrbit ref;
+    BlaTable bla;
+    float blaEpsLog2 = -24.f;
     ShadeParams shade;
     bool dirty = true;        // view changed: re-iterate and re-shade
     bool shadeDirty = true;   // only coloring changed
@@ -84,11 +87,17 @@ void resetView(App& app) {
     app.dirty = true;
 }
 
-// Recompute the reference orbit at the current centre and hand it to the GPU.
+// Recompute the reference orbit at the current centre, build its BLA
+// table for this view, and hand both to the GPU.
 void rebuildReference(App& app) {
     computeReference(app.cx, app.cy, app.view.maxIter, 65536.0, app.ref);
     app.renderer.uploadReference(app.ref.zr.data(), app.ref.zi.data(), app.ref.length,
                                  app.ref.escaped);
+    const double cMax = 0.5 * std::hypot((double)app.view.width, (double)app.view.height) *
+                        app.view.scale;
+    buildBla(app.ref, cMax, std::exp2((double)app.blaEpsLog2), app.bla);
+    app.renderer.uploadBla(app.bla.nodes.data(), (int)app.bla.nodes.size(),
+                           app.bla.levelOffset.data(), app.bla.levels, app.bla.steps);
 }
 
 bool handleEvent(App& app, const SDL_Event& e) {
@@ -155,6 +164,12 @@ void drawUi(App& app) {
         ImGui::Separator();
         ImGui::Text("ref     %.2f ms  (%d iters%s)", app.ref.computeMs, app.ref.length,
                     app.ref.escaped ? ", escaped" : "");
+        ImGui::Text("bla     %.2f ms  (%d levels, %zu nodes)", app.bla.buildMs, app.bla.levels,
+                    app.bla.nodes.size());
+        if (ImGui::Checkbox("use BLA", &app.view.useBla)) app.dirty = true;
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120 * app.uiScale);
+        if (ImGui::SliderFloat("eps log2", &app.blaEpsLog2, -40.f, -8.f, "%.0f")) app.dirty = true;
         if (app.renderer.iterateDone()) {
             ImGui::Text("iterate %.0f ms", app.renderer.lastIterateMs());
         } else {

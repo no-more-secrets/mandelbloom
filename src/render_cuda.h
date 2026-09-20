@@ -10,6 +10,16 @@ struct ViewParams {
     int width = 0;
     int height = 0;
     int maxIter = 512;
+    bool useBla = true;
+};
+
+// BLA table as uploaded to the device (see bla.h for the layout).
+struct DeviceBla {
+    const struct BlaNode* nodes = nullptr;
+    const int* levelOffset = nullptr;  // levels entries
+    int levels = 0;
+    int steps = 0;
+    int enabled = 0;
 };
 
 // Reference orbit as uploaded to the device.
@@ -35,6 +45,9 @@ public:
     bool bindPixelBuffer(unsigned glPbo, int width, int height);
     // Upload a new reference orbit (host arrays of `length` doubles).
     bool uploadReference(const double* zr, const double* zi, int length, bool escaped);
+    // Upload a BLA table built for the current reference and view.
+    bool uploadBla(const struct BlaNode* nodes, int count, const int* levelOffset, int levels,
+                   int steps);
     // Heavy pass, run in slices so the UI stays live and no kernel runs long
     // enough to trip the Windows GPU watchdog. beginIterate resets state;
     // call stepIterate whenever !iterateBusy() until iterateDone().
@@ -57,6 +70,7 @@ private:
     void unregisterPbo();
     void freeField();
     void freeReference();
+    void freeBla();
     struct cudaGraphicsResource* pboResource_ = nullptr;
     FieldSample* field_ = nullptr;
     struct PixelState* state_ = nullptr;
@@ -79,6 +93,11 @@ private:
     double* refZi_ = nullptr;
     int refCapacity_ = 0;
     DeviceReference ref_;
+    struct BlaNode* blaNodes_ = nullptr;
+    int* blaOffsets_ = nullptr;
+    int blaNodeCapacity_ = 0;
+    int blaLevelCapacity_ = 0;
+    DeviceBla bla_;
     int width_ = 0, height_ = 0;
     float iterateMs_ = 0.f, shadeMs_ = 0.f;
     char deviceName_[256] = "none";
