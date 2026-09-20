@@ -63,6 +63,7 @@ std::vector<Field> fields(Preset& p) {
         {"lineWidth", Field::F, &s.lineWidth, 1},
         {"lineStrength", Field::F, &s.lineStrength, 1},
         {"lineColor", Field::F, s.lineColor, 3},
+        {"wavePhase", Field::F, &s.wavePhase, 1},
         {"cycleSpeed", Field::F, &s.cycleSpeed, 1},
         {"lightSpeed", Field::F, &s.lightSpeed, 1},
         {"waveSpeed", Field::F, &s.waveSpeed, 1},
@@ -241,8 +242,12 @@ std::vector<std::string> listSavedPresets() {
 
 bool savePreset(const std::string& name, const Preset& pIn) {
     if (!validName(name)) return false;
+    return savePresetFile((fs::path(presetDir()) / (name + ".preset")).string(), pIn);
+}
+
+bool savePresetFile(const std::string& path, const Preset& pIn) {
     Preset p = pIn;
-    std::ofstream out(fs::path(presetDir()) / (name + ".preset"));
+    std::ofstream out(path);
     if (!out) return false;
     out << "mandelgpu-preset 1\n";
     out << "animate " << (p.animate ? 1 : 0) << "\n";
@@ -258,7 +263,11 @@ bool savePreset(const std::string& name, const Preset& pIn) {
 }
 
 bool loadPreset(const std::string& name, Preset& p) {
-    std::ifstream in(fs::path(presetDir()) / (name + ".preset"));
+    return loadPresetFile((fs::path(presetDir()) / (name + ".preset")).string(), p);
+}
+
+bool loadPresetFile(const std::string& path, Preset& p) {
+    std::ifstream in(path);
     if (!in) return false;
     std::string header;
     std::getline(in, header);

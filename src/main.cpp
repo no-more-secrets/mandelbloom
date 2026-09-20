@@ -360,6 +360,8 @@ void applyPresetTo(App& app, const Preset& p) {
 
 void applyPreset(App& app, int which) { applyPresetTo(app, builtinPreset(which)); }
 
+Preset currentLook(const App& app);
+
 // Screenshot file stem: Pictures/mandelgpu/mandel_<stamp>_<zoom>.
 std::string screenshotStem(App& app, int w) {
     const char* picsC = SDL_GetUserFolder(SDL_FOLDER_PICTURES);  // owned by SDL
@@ -399,10 +401,14 @@ void linearToSdrPng(const float* lin, int w, int h, std::vector<uint32_t>& px) {
 }
 
 void writeLocationFile(App& app, const std::string& stem) {
-    std::ofstream loc(stem + ".txt");
     const int dg = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
+    std::ofstream loc(stem + ".txt");
+    // A complete command line for this exact picture.
     loc << app.render.cx.toString(dg) << " " << app.render.cy.toString(dg) << " "
-        << app.render.scale << " " << app.view.maxIter << "\n";
+        << app.render.scale * app.ss << " " << app.view.maxIter << " --ss " << app.ss << " --aa "
+        << app.aa.pattern << "," << app.aa.filter << "," << app.aa.radius << " --loadfile \""
+        << stem << ".preset\"\n";
+    savePresetFile(stem + ".preset", currentLook(app));
 }
 
 // Ctrl+F2: the presented frame including the UI, read back from the D3D12
@@ -467,6 +473,41 @@ void takeScreenshot(App& app, bool alsoExr) {
                    : "screenshot failed";
     app.toastUntil = nowSeconds() + 4.0;
     std::printf("screenshot %s ok=%d\n", stem.c_str(), ok ? 1 : 0);
+}
+
+// Freeze the animation where it is: fold the accumulated phase into the
+// visible parameters so the UI (and saved presets) describe the picture.
+void setAnimate(App& app, bool on) {
+    if (app.animate && !on) {
+        ShadeParams& sp = app.shade;
+        const float t = app.animTime;
+        sp.offset = sp.offset + sp.cycleSpeed * t;
+        sp.offset -= std::floor(sp.offset);
+        sp.slopeAngle = std::fmod(sp.slopeAngle + sp.lightSpeed * t + 360.f * 1000.f, 360.f);
+        sp.wavePhase = sp.wavePhase + sp.waveSpeed * t;
+        sp.wavePhase -= std::floor(sp.wavePhase);
+        app.animTime = 0.f;
+    }
+    app.animate = on;
+}
+
+// Sidecar preset describing the current look exactly.
+Preset currentLook(const App& app) {
+    Preset cur;
+    cur.shade = app.shade;
+    cur.post = app.post;
+    cur.animate = app.animate;
+    if (app.animate) {
+        // Bake the phase at the moment of capture.
+        const float t = app.animTime;
+        cur.shade.offset -= std::floor(cur.shade.offset + cur.shade.cycleSpeed * t);
+        cur.shade.offset += cur.shade.cycleSpeed * t;
+        cur.shade.slopeAngle = std::fmod(cur.shade.slopeAngle + cur.shade.lightSpeed * t + 360.f * 1000.f, 360.f);
+        cur.shade.wavePhase += cur.shade.waveSpeed * t;
+        cur.shade.wavePhase -= std::floor(cur.shade.wavePhase);
+        cur.animate = false;
+    }
+    return cur;
 }
 
 void setFullscreen(App& app, bool on) {
@@ -660,6 +701,8 @@ void drawUi(App& app) {
                 cur.animate = app.animate;
                 if (savePreset(app.presetName, cur)) app.savedPresetsValid = false;
             }
+            ImGui::SameLine();
+            ImGui::TextDisabled("(F2 also writes a .preset beside the shot)");
             for (size_t i = 0; i < app.savedPresets.size(); ++i) {
                 ImGui::PushID((int)i);
                 if (ImGui::SmallButton(app.savedPresets[i].c_str())) {
@@ -763,7 +806,10 @@ void drawUi(App& app) {
             ImGui::SliderFloat("exposure", &sp.exposure, 0.f, 4.f);
 
             ImGui::SeparatorText("animation");
-            ImGui::Checkbox("animate", &app.animate);
+            {
+                bool an = app.animate;
+                if (ImGui::Checkbox("animate", &an)) setAnimate(app, an);
+            }
             ImGui::SliderFloat("palette cyc/s", &sp.cycleSpeed, -1.f, 1.f, "%.3f");
             ImGui::SliderFloat("light deg/s", &sp.lightSpeed, -90.f, 90.f, "%.1f");
             ImGui::SliderFloat("wave cyc/s", &sp.waveSpeed, -2.f, 2.f, "%.2f");
@@ -812,7 +858,9 @@ int main(int argc, char** argv) {
     bool argNoBla = false;
     bool argDouble = false;
     std::string argPost;
+    std::string argShade;  // "offset=0.329,density=107.8,animate=0,cycle=-0.42" 
     std::string argLoad;  // saved preset name
+    std::string argLoadFile;  // preset file path (screenshot sidecar)
     std::string argSave;  // save the starting parameters under this name
     std::string argAa;    // "pattern,filter,radius" 
     bool argFullscreen = false;
@@ -831,10 +879,14 @@ int main(int argc, char** argv) {
             argDouble = true;
         } else if (std::strcmp(argv[i], "--post") == 0 && i + 1 < argc) {
             argPost = argv[++i];
+        } else if (std::strcmp(argv[i], "--shade") == 0 && i + 1 < argc) {
+            argShade = argv[++i];
         } else if (std::strcmp(argv[i], "--fullscreen") == 0) {
             argFullscreen = true;
         } else if (std::strcmp(argv[i], "--load") == 0 && i + 1 < argc) {
             argLoad = argv[++i];
+        } else if (std::strcmp(argv[i], "--loadfile") == 0 && i + 1 < argc) {
+            argLoadFile = argv[++i];
         } else if (std::strcmp(argv[i], "--save") == 0 && i + 1 < argc) {
             argSave = argv[++i];
         } else if (std::strcmp(argv[i], "--aa") == 0 && i + 1 < argc) {
@@ -895,6 +947,11 @@ int main(int argc, char** argv) {
         if (loadPreset(argLoad, pr)) applyPresetTo(app, pr);
         else std::fprintf(stderr, "preset not found: %s\n", argLoad.c_str());
     }
+    if (!argLoadFile.empty()) {
+        Preset pr;
+        if (loadPresetFile(argLoadFile, pr)) applyPresetTo(app, pr);
+        else std::fprintf(stderr, "preset file not found: %s\n", argLoadFile.c_str());
+    }
     if (!argAa.empty()) {
         int pat = 0, fil = 0;
         float rad = 0.75f;
@@ -915,6 +972,31 @@ int main(int argc, char** argv) {
     app.ss = std::min(3, std::max(1, argSs));
     if (argNoBla) app.view.useBla = false;
     if (argDouble) app.view.useFloat = false;
+    if (!argShade.empty()) {
+        size_t start = 0;
+        while (start < argShade.size()) {
+            size_t end = argShade.find(',', start);
+            if (end == std::string::npos) end = argShade.size();
+            const std::string kv = argShade.substr(start, end - start);
+            const size_t eq = kv.find('=');
+            if (eq != std::string::npos) {
+                const std::string k = kv.substr(0, eq);
+                const float v = (float)std::atof(kv.substr(eq + 1).c_str());
+                ShadeParams& sp = app.shade;
+                if (k == "offset") sp.offset = v;
+                else if (k == "density") sp.density = v;
+                else if (k == "animate") app.animate = v != 0.f;
+                else if (k == "cycle") sp.cycleSpeed = v;
+                else if (k == "light") sp.lightSpeed = v;
+                else if (k == "wave") sp.waveSpeed = v;
+                else if (k == "exposure") sp.exposure = v;
+                else if (k == "edge") sp.deStrength = v;
+                else if (k == "mode") sp.mode = (int)v;
+                else if (k == "special") sp.special = v;
+            }
+            start = end + 1;
+        }
+    }
     if (!argPost.empty()) {
         // Comma-separated key=value pairs.
         size_t start = 0;
@@ -1143,7 +1225,7 @@ int main(int argc, char** argv) {
                 int pdx, pdy;
                 if (script.takePan(pdx, pdy)) panPixels(app, pdx, pdy);
                 const int an = script.takeAnimate();
-                if (an >= 0) app.animate = an != 0;
+                if (an >= 0) setAnimate(app, an != 0);
                 const int sr = script.takeScreenshot();
                 if (sr) app.screenshotRequest = sr;
             }

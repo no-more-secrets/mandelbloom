@@ -87,6 +87,7 @@ struct ShadeParams {
     float lineColor[3] = {0.f, 0.f, 0.f};
 
     // Animation, driven by the time the shader receives (seconds).
+    float wavePhase = 0.f;      // wave/panel phase offset in cycles
     float cycleSpeed = 0.05f;   // palette cycles per second
     float lightSpeed = 0.f;     // light angle, degrees per second
     float waveSpeed = 0.f;      // wave/panel phase, cycles per second

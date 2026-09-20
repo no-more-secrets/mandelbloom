@@ -20,3 +20,6 @@ std::vector<std::string> listSavedPresets();
 bool savePreset(const std::string& name, const Preset& p);
 bool loadPreset(const std::string& name, Preset& p);
 bool deletePreset(const std::string& name);
+// Same format, explicit path (screenshot sidecars, --loadfile).
+bool savePresetFile(const std::string& path, const Preset& p);
+bool loadPresetFile(const std::string& path, Preset& p);

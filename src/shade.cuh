@@ -217,18 +217,18 @@ __device__ __forceinline__ float3 colourInput(const ShadeInput& in, const ShadeP
 
     switch (p.mode) {
         case SHADE_LOGSTEPS: {
-            const float f = fracf(tt * p.special + p.waveSpeed * timeSec);
+            const float f = fracf(tt * p.special + p.wavePhase + p.waveSpeed * timeSec);
             const float k = 0.25f + 0.75f * logf(1.f + f * 1.7182818f);
             col.x *= k; col.y *= k; col.z *= k;
             break;
         }
         case SHADE_WAVE: {
-            const float w = 0.5f + 0.5f * sinf(6.2831853f * (tt * p.special + p.waveSpeed * timeSec));
+            const float w = 0.5f + 0.5f * sinf(6.2831853f * (tt * p.special + p.wavePhase + p.waveSpeed * timeSec));
             col.x *= w; col.y *= w; col.z *= w;
             break;
         }
         case SHADE_PANELS: {
-            const float f = fracf(tt * p.special + p.waveSpeed * timeSec);
+            const float f = fracf(tt * p.special + p.wavePhase + p.waveSpeed * timeSec);
             const float gap = 0.15f;
             const float k = smoothstepf(0.f, gap, f) * smoothstepf(1.f, 1.f - gap, f);
             const float m = 0.1f + 0.9f * k;

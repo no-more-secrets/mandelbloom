@@ -2,6 +2,11 @@
 
 ![mandelbloom cover: a minibrot at 3.6e16 zoom in the solar preset with bloom](docs/cover.jpg)
 
+Cover location: `-0.67032685353483673009225 0.4581119683700364283828 2.29e-20 19552`,
+solar preset with bloom. Every F2 capture writes a `.txt` beside it holding
+the full command line and a `.preset` with the exact look, so any shot can be
+reproduced with `--loadfile`.
+
 GPU Mandelbrot viewer for Windows, built for 4K HDR and smooth deep zooms. CUDA does the iteration, SDL3 and Dear ImGui
 do the window and UI, Direct3D 12 presents an FP16 scRGB swapchain (HDR on
 HDR displays) that CUDA writes into directly through a shared buffer.
@@ -47,6 +52,11 @@ Toolkit 13.4, and an NVIDIA GPU. Dependencies come from the vcpkg bundled with V
 | F2 | Screenshot to Pictures\mandelgpu (SDR PNG, HDR highlights rolled off) |
 | Shift+F2 | Screenshot PNG plus linear EXR (1.0 = SDR white) |
 | Ctrl+F2 | Screenshot of the presented frame including the UI |
+
+Each screenshot comes with a `.txt` (command line to reproduce it) and a
+`.preset` (the exact look, animation phase baked in). Turning animation off
+folds the current phase into the palette offset, light angle and wave phase,
+so the sliders always describe what is on screen.
 | Esc | Quit |
 
 ## Presets
@@ -73,7 +83,7 @@ statistics on stdout. `--preset N` picks a shading preset, `--ss N`
 supersampling, `--aa pattern,filter,radius` antialiasing (0 grid/1 rotated/2
 stochastic; 0 box/1 tent/2 gaussian/3 blackman), `--hidden` keeps the window
 off screen, `--post "bloom=1.5,vignette=0.4,tonemap=2"` sets post
-parameters, `--nobla` and `--double` select the slow paths for comparison.
+parameters, `--shade "offset=0.329,density=107.8,animate=0"` shading ones, `--nobla` and `--double` select the slow paths for comparison.
 Run it minimised. `build/shots/cmp.py a.png b.png` reports differing pixels.
 
 ## Plan
