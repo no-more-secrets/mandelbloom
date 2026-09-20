@@ -41,10 +41,10 @@ struct App {
     View shown;
     struct Gen {
         View view;
-        float id = 0.f;
+        int id = 0;
     };
     std::vector<Gen> gens;
-    float nextGen = 1.f;
+    int nextGen = 1;
     int ss = 1;          // supersampling factor per axis (field = display * ss)
     int ssApplied = 0;   // what the renderer is currently bound with
     bool tweening = false;
@@ -744,7 +744,8 @@ int main(int argc, char** argv) {
             // pending pan is folded into the new view (the field did not move).
             App::Gen g;
             g.view = app.render;
-            g.id = app.nextGen++;
+            g.id = app.nextGen;
+            app.nextGen = app.nextGen % 65535 + 1;  // 16-bit ids, never 0
             app.gens.insert(app.gens.begin(), g);
             if (app.gens.size() > MAX_GENS) app.gens.resize(MAX_GENS);
             rebuildReference(app);
@@ -830,7 +831,7 @@ int main(int argc, char** argv) {
                 for (const auto& g : app.gens) {
                     double ox, oy, ratio;
                     mapOnto(app, g.view, app.ss, app.view.width, app.view.height, ox, oy, ratio);
-                    std::printf("  gen %.0f ox=%.1f oy=%.1f ratio=%.4f\n", g.id, ox, oy, ratio);
+                    std::printf("  gen %d ox=%.1f oy=%.1f ratio=%.4f\n", g.id, ox, oy, ratio);
                 }
                 std::fflush(stdout);
             }

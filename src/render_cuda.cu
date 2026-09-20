@@ -80,7 +80,7 @@ __global__ void shiftKernel(const PixelState* __restrict__ srcS,
 
 __device__ __forceinline__ void writeSample(FieldSample* __restrict__ field, size_t idx,
                                             const PixelState& st, double zr, double zi,
-                                            double scale, bool escaped, float gen) {
+                                            double scale, bool escaped, int gen) {
     FieldSample s{};
     if (!escaped) {
         s.iter = -1.f;
@@ -91,20 +91,20 @@ __device__ __forceinline__ void writeSample(FieldSample* __restrict__ field, siz
         const double dmag2 = st.dr * st.dr + st.di * st.di;
         const double dmag = sqrt(dmag2);
         // Derivative was scaled by pixel size, so this DE is in pixels.
-        s.de = dmag > 0.0 ? (float)(sqrt(mag2) * logMag / dmag) : 0.f;
-        s.angle = (float)atan2(zi, zr);
+        s.de = f2h(dmag > 0.0 ? (float)(sqrt(mag2) * logMag / dmag) : 0.f);
+        s.angle = f2h((float)atan2(zi, zr));
         // Milnor normal u = z / dz, normalised.
         if (dmag2 > 0.0) {
             const double ur = (zr * st.dr + zi * st.di) / dmag2;
             const double ui = (zi * st.dr - zr * st.di) / dmag2;
             const double um = sqrt(ur * ur + ui * ui);
             if (um > 0.0) {
-                s.nx = (float)(ur / um);
-                s.ny = (float)(ui / um);
+                s.nx = f2h((float)(ur / um));
+                s.ny = f2h((float)(ui / um));
             }
         }
     }
-    s.gen = gen;
+    s.gen = (uint16_t)gen;
     field[idx] = s;
 }
 
@@ -148,7 +148,7 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
                              double scale, double refOffX, double refOffY, int maxIter,
                              int sliceIters, const unsigned long long* __restrict__ startNs,
                              unsigned long long budgetNs, DeviceReference ref, DeviceBla bla,
-                             float gen, int* __restrict__ activeCount) {
+                             int gen, int* __restrict__ activeCount) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
     int x, y;
     bool inBounds;
@@ -266,16 +266,16 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
 // the nearest coarse-level anchor (stride 2, 4, 8) if the pixel itself was
 // not produced by that generation. level receives 1, 2, 4, 8 (0 = none).
 __device__ __forceinline__ FieldSample fetchGen(const FieldSample* __restrict__ field, int fw,
-                                                int x, int y, float g, int& level) {
+                                                int x, int y, int g, int& level) {
     FieldSample s = field[(size_t)y * fw + x];
-    if (s.gen == g) {
+    if ((int)s.gen == g) {
         level = 1;
         return s;
     }
     for (int k = 2; k <= 8; k *= 2) {
         const int bx = x - (x % k), by = y - (y % k);
         const FieldSample a = field[(size_t)by * fw + bx];
-        if (a.gen == g) {
+        if ((int)a.gen == g) {
             level = k;
             return a;
         }
@@ -574,7 +574,7 @@ void CudaRenderer::resetPass(const ViewParams& view) {
     passMs_ = 0.f;
 }
 
-bool CudaRenderer::beginIterate(const ViewParams& view, float gen) {
+bool CudaRenderer::beginIterate(const ViewParams& view, int gen) {
     if (!field_ || !state_ || view.width != viewW_ || view.height != viewH_) return false;
     if (ref_.length < 2) return false;
     cudaStream_t stream = (cudaStream_t)stream_;
@@ -691,7 +691,7 @@ bool CudaRenderer::stepIterate() {
     return true;
 }
 
-bool CudaRenderer::debugStats(float gen, DebugStats& out) {
+bool CudaRenderer::debugStats(int gen, DebugStats& out) {
     out = DebugStats{};
     if (!field_ || !state_) return false;
     syncAll();
@@ -704,10 +704,10 @@ bool CudaRenderer::debugStats(float gen, DebugStats& out) {
         for (int x = marginX_; x < marginX_ + viewW_; ++x) {
             const size_t i = (size_t)y * fieldW_ + x;
             ++out.total;
-            if (f[i].gen == gen) {
+            if ((int)f[i].gen == gen) {
                 ++out.genMatch;
                 if (f[i].iter < 0.f) ++out.genMatchInside;
-            } else if (f[i].gen == 0.f) {
+            } else if (f[i].gen == 0) {
                 ++out.genZero;
             } else {
                 ++out.genOther;

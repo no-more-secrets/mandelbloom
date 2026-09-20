@@ -1,7 +1,11 @@
 #pragma once
 // Device-side coloring. Included by render_cuda.cu only.
 #include <cstdint>
+#include <cuda_fp16.h>
 #include "field.h"
+
+__device__ __forceinline__ float h2f(uint16_t h) { return __half2float(__ushort_as_half(h)); }
+__device__ __forceinline__ uint16_t f2h(float f) { return __half_as_ushort(__float2half(f)); }
 
 __device__ __forceinline__ float smoothstepf(float e0, float e1, float x) {
     const float t = fminf(fmaxf((x - e0) / (e1 - e0), 0.f), 1.f);
@@ -77,7 +81,8 @@ struct IterGradient {
 __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeParams& p,
                                               float timeSec, float pixelScale,
                                               const IterGradient& g) {
-    if (s.iter < 0.f || s.gen < 0.5f) return make_float3(p.inside[0], p.inside[1], p.inside[2]);
+    if (s.iter < 0.f || s.gen == 0) return make_float3(p.inside[0], p.inside[1], p.inside[2]);
+    const float de = h2f(s.de), nx = h2f(s.nx), ny = h2f(s.ny);
 
     // Palette position in cycles.
     float t;
@@ -119,13 +124,13 @@ __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeP
         }
         case SHADE_ANGLE: {
             // Escape angle over the palette; `special` cycles per turn.
-            const float ang = s.angle * 0.15915494f;  // turns
+            const float ang = h2f(s.angle) * 0.15915494f;  // turns
             col = palette(p, ang * p.special + p.offset + p.cycleSpeed * timeSec);
             break;
         }
         case SHADE_DISTANCE: {
             // Log distance from the set, in pixels; `special` decades per cycle.
-            const float dpx = fmaxf(s.de, 1e-6f);
+            const float dpx = fmaxf(de, 1e-6f);
             const float v = log10f(dpx) / fmaxf(p.special, 0.01f);
             col = palette(p, v + p.offset + p.cycleSpeed * timeSec);
             break;
@@ -138,7 +143,7 @@ __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeP
     if (p.slopes) {
         const float ang = (p.slopeAngle + p.lightSpeed * timeSec) * 0.017453292f;
         const float lx = cosf(ang), ly = sinf(ang);
-        float light = (s.nx * lx + s.ny * ly + p.slopeHeight) / (1.f + p.slopeHeight);
+        float light = (nx * lx + ny * ly + p.slopeHeight) / (1.f + p.slopeHeight);
         light = fminf(fmaxf(light, 0.f), 1.f);
         const float shade = 1.f - p.slopeStrength * (1.f - light);
         col.x *= shade;
@@ -164,7 +169,7 @@ __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeP
     }
 
     if (p.deStrength > 0.f) {
-        float edge = s.de;
+        float edge = de;
         edge = fminf(fmaxf(edge, 0.f), 1.f);
         edge = powf(edge, 0.5f * p.deStrength);
         col.x *= edge;

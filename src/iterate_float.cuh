@@ -12,7 +12,8 @@
 #include "bla.h"
 #include "field.h"
 
-// Same size as PixelState (48 bytes) so the shared reset/shift kernels work.
+// Same size as PixelState (48 bytes): the shared reset and shift kernels
+// move 48-byte records, so the two layouts must have the same stride.
 struct PixelStateF {
     float wzr, wzi;  // dz mantissa
     int ez;
@@ -24,6 +25,7 @@ struct PixelStateF {
     int hint;    // BLA level used last time (search starts one above it)
     int pad[2];
 };
+static_assert(sizeof(PixelStateF) == 48, "PixelStateF must match PixelState's stride");
 
 struct DeviceReferenceF {
     const float2* z = nullptr;
@@ -104,7 +106,7 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                               float mP, int eP, double refOffPx, double refOffPy, int maxIter,
                               int sliceIters, const unsigned long long* __restrict__ startNs,
                               unsigned long long budgetNs, DeviceReferenceF ref, DeviceBlaF bla,
-                              float gen, int* __restrict__ activeCount) {
+                              int gen, int* __restrict__ activeCount) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
     int x, y;
     bool inBounds;
@@ -242,18 +244,18 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                 const float wdmag = sqrtf(wdr * wdr + wdi * wdi);
                 // DE in pixels: |z| log|z| / |D| / P
                 if (wdmag > 0.f) {
-                    s.de = ldexpf(sqrtf(mag2) * logMag / (wdmag * mP), -ed - eP);
+                    s.de = f2h(ldexpf(sqrtf(mag2) * logMag / (wdmag * mP), -ed - eP));
                     // Milnor normal: direction of z / D = z * conj(D)
                     const float ur = zr * wdr + zi * wdi, ui = zi * wdr - zr * wdi;
                     const float um = sqrtf(ur * ur + ui * ui);
                     if (um > 0.f) {
-                        s.nx = ur / um;
-                        s.ny = ui / um;
+                        s.nx = f2h(ur / um);
+                        s.ny = f2h(ui / um);
                     }
                 }
-                s.angle = atan2f(zi, zr);
+                s.angle = f2h(atan2f(zi, zr));
             }
-            s.gen = gen;
+            s.gen = (uint16_t)gen;
             field[idx] = s;
         }
         state[idx] = st;

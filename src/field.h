@@ -1,20 +1,26 @@
 #pragma once
 // Shared between host C++ and CUDA. Plain structs only.
 
+#include <cstdint>
+
 // One sample of the iteration field. Written by the iteration kernel when a
 // pixel finishes, read by the shading kernel. Coloring never touches
-// iteration state. 24 bytes.
+// iteration state. 16 bytes: everything the shader needs beyond the
+// iteration count is stored as IEEE half (three decimal digits is well
+// below what a shaded pixel can show, and none of it feeds back into
+// iteration).
 //
 // gen is the render generation that produced the sample (0 = never
 // computed). The field is not cleared when the view changes: samples from
 // older generations stay until overwritten, and the display maps them
 // through the view they were rendered with.
 struct FieldSample {
-    float iter;   // smooth escape iteration; < 0 means inside the set
-    float de;     // distance estimate in pixels of the render field (0 if inside)
-    float angle;  // arg(z_final) in [-pi, pi]
-    float nx, ny; // exterior surface normal (Milnor: z / dz, normalised), 0 inside
-    float gen;    // generation id, 0 = none
+    float iter;      // smooth escape iteration; < 0 means inside the set
+    uint16_t de;     // half: distance estimate in pixels of the render field (0 if inside)
+    uint16_t angle;  // half: arg(z_final) in [-pi, pi]
+    uint16_t nx, ny; // half: exterior surface normal (Milnor: z / dz, normalised), 0 inside
+    uint16_t gen;    // generation id, 0 = none (wraps; only the last 8 are ever looked up)
+    uint16_t pad;
 };
 
 #define MAX_STOPS 8

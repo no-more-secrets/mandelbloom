@@ -43,7 +43,7 @@ struct DeviceReference {
 struct GenMap {
     double ox = 0, oy = 0, ratio = 1;
     float pixelScale = 1.f;  // complex units per field pixel for this generation
-    float gen = 0.f;         // generation id as stored in FieldSample::gen
+    int gen = 0;             // generation id as stored in FieldSample::gen
 };
 
 #define MAX_GENS 8
@@ -80,7 +80,7 @@ public:
     // enough to trip the Windows GPU watchdog. beginIterate resets state;
     // call stepIterate whenever !iterateBusy() until iterateDone().
     // gen: the id written into samples this pass produces (> 0, increasing).
-    bool beginIterate(const ViewParams& view, float gen);
+    bool beginIterate(const ViewParams& view, int gen);
     // Pan: shift field and state by (dx, dy) pixels (content moves by
     // -dx, -dy), keep finished pixels, mark exposed strips pending, and
     // continue the pass coarse-to-fine on what is pending. Same reference.
@@ -109,7 +109,7 @@ public:
         int stActive = 0, stEscaped = 0, stInside = 0;
         int genMatchInside = 0;  // gen matches and iter < 0
     };
-    bool debugStats(float gen, DebugStats& out);
+    bool debugStats(int gen, DebugStats& out);
 
     float lastIterateMs() const { return iterateMs_; }  // total for the last full pass
     float lastSliceMs() const { return sliceMs_; }
@@ -147,7 +147,7 @@ private:
     void* dispStream_ = nullptr;  // composite
     void* evSlice_ = nullptr;
     ViewParams iterView_;
-    float gen_ = 0.f;
+    int gen_ = 0;
     int sliceStart_ = 0;
     int sliceIters_ = 512;
     int stride_ = 1;
