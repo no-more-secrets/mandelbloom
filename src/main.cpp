@@ -48,6 +48,7 @@ struct App {
     struct Gen {
         View view;
         int id = 0;
+        float minIter = -1.f;  // smallest escape iteration seen, -1 unknown
     };
     std::vector<Gen> gens;
     int nextGen = 1;
@@ -323,7 +324,8 @@ bool paletteEqual(const ShadeParams& a, const ShadeParams& b) {
 // Everything prepareSample() reads.
 bool staticEqual(const ShadeParams& a, const ShadeParams& b) {
     return a.mode == b.mode && a.density == b.density && a.offset == b.offset &&
-           a.logScale == b.logScale && a.special == b.special && a.deStrength == b.deStrength &&
+           a.transfer == b.transfer && a.anchor == b.anchor && a.iterBase == b.iterBase &&
+           a.special == b.special && a.deStrength == b.deStrength &&
            a.lines == b.lines && a.lineDensity == b.lineDensity && a.lineWidth == b.lineWidth;
 }
 
@@ -730,11 +732,18 @@ void drawUi(App& app) {
             } else if (sp.mode == SHADE_DISTANCE) {
                 ImGui::SliderFloat("decades per cycle", &sp.special, 0.5f, 8.f, "%.1f");
             }
-            ImGui::SliderFloat("density", &sp.density, 4.f, 1024.f, "%.1f",
+            ImGui::Combo("transfer", &sp.transfer, "linear\0sqrt\0log\0");
+            ImGui::SliderFloat("density", &sp.density, 4.f, 16384.f, "%.1f",
                                ImGuiSliderFlags_Logarithmic);
             ImGui::SliderFloat("offset", &sp.offset, 0.f, 1.f);
-            bool logScale = sp.logScale != 0;
-            if (ImGui::Checkbox("log scale", &logScale)) sp.logScale = logScale;
+            {
+                bool anchor = sp.anchor != 0;
+                if (ImGui::Checkbox("anchor to view minimum", &anchor)) sp.anchor = anchor;
+                if (sp.anchor) {
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(%.0f iters)", sp.iterBase);
+                }
+            }
 
             ImGui::SeparatorText("palette");
             ImGui::RadioButton("gradient", &sp.paletteType, 0);
@@ -941,7 +950,7 @@ int main(int argc, char** argv) {
     readHdrState(app);
     std::printf("HDR: %s, SDR white %.2f, headroom %.2f\n", app.hdrEnabled ? "on" : "off",
                 app.sdrWhite, app.hdrHeadroom);
-    if (argPreset > 0) applyPreset(app, argPreset);
+    applyPreset(app, argPreset);  // classic (0) sets the linear anchored transfer
     if (!argLoad.empty()) {
         Preset pr;
         if (loadPreset(argLoad, pr)) {
@@ -1011,6 +1020,8 @@ int main(int argc, char** argv) {
                 ShadeParams& sp = app.shade;
                 if (k == "offset") sp.offset = v;
                 else if (k == "density") sp.density = v;
+                else if (k == "transfer") sp.transfer = (int)v;
+                else if (k == "anchor") sp.anchor = (int)v;
                 else if (k == "animate") app.animate = v != 0.f;
                 else if (k == "cycle") sp.cycleSpeed = v;
                 else if (k == "light") sp.lightSpeed = v;
@@ -1177,6 +1188,18 @@ int main(int argc, char** argv) {
                 gm.pixelScale = (float)(g.view.scale / app.ss);
                 gm.gen = g.id;
             }
+            // Palette anchor: the smallest escape iteration of the newest
+            // generation that has one.
+            {
+                const float cur = app.renderer.minIter();
+                if (cur >= 0.f)
+                    for (auto& g : app.gens)
+                        if (g.id == app.renderer.currentGen()) g.minIter = cur;
+                float base = 0.f;
+                for (const auto& g : app.gens)
+                    if (g.minIter >= 0.f) { base = std::floor(g.minIter); break; }
+                app.shade.iterBase = app.shade.anchor ? base : 0.f;
+            }
             const bool paletteChanged = !app.lastShadeValid || !paletteEqual(app.shade, app.lastShade);
             const bool staticChanged = !app.lastShadeValid || !staticEqual(app.shade, app.lastShade);
             const bool dynamicChanged = !app.lastShadeValid || !dynamicEqual(app.shade, app.lastShade);
@@ -1278,8 +1301,9 @@ int main(int argc, char** argv) {
                             app.cachedShown ? 1 : 0, app.fps, app.renderer.progress(),
                             app.renderer.etaMs(), app.render.cx.toString(dg).c_str(),
                             app.render.cy.toString(dg).c_str());
-                std::printf("  ref iters=%d escaped=%d rerefs=%d\n", app.ref.length,
-                            app.ref.escaped ? 1 : 0, app.rerefRounds);
+                std::printf("  ref iters=%d escaped=%d rerefs=%d base=%.0f transfer=%d anchor=%d\n", app.ref.length,
+                            app.ref.escaped ? 1 : 0, app.rerefRounds,
+                            app.shade.iterBase, app.shade.transfer, app.shade.anchor);
                 std::printf("  shown scale=%.6g render scale=%.6g gens=%zu\n", app.shown.scale,
                             app.render.scale, app.gens.size());
                 if (!app.gens.empty()) {

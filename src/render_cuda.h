@@ -113,6 +113,10 @@ public:
     bool stepIterate();
     bool iterateBusy();
     bool iterateDone() const { return iterDone_; }
+    // Generation being iterated and the smallest escape iteration seen in it
+    // so far (-1 until a slice has completed with escaped pixels).
+    int currentGen() const { return gen_; }
+    float minIter() const { return minIterGen_; }
     int iterateProgress() const { return sliceStart_; }  // iterations issued so far
     // Coarse-to-fine: the pass runs at stride 8, 4, 2, 1. completedStride is
     // the finest stride whose pixels are all finished (0 = none yet).
@@ -205,6 +209,9 @@ private:
     int* activeCount_ = nullptr;      // device
     unsigned long long* sliceStart_ns_ = nullptr;  // device, GPU clock at slice start
     int* activeCountHost_ = nullptr;  // pinned
+    int* minIter_ = nullptr;          // device: float bits of the smallest escape iteration
+    int* minIterHost_ = nullptr;      // pinned
+    float minIterGen_ = -1.f;
     void* stream_ = nullptr;      // iteration
     void* dispStream_ = nullptr;  // composite
     void* evSlice_ = nullptr;

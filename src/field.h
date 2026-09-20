@@ -46,15 +46,25 @@ enum ShadeMode {
     SHADE_MODE_COUNT
 };
 
+enum { TRANSFER_LINEAR = 0, TRANSFER_SQRT, TRANSFER_LOG, TRANSFER_COUNT };
+
 // Everything the shading pass needs. Changing these never re-iterates.
 struct ShadeParams {
     int mode = SHADE_SMOOTH;
 
     // Palette position t (in cycles) comes from the iteration count:
-    //   logScale: t = log2(iter) * density / 64,  else t = iter / density
+    //   linear: t = iter / density            (density = iterations per cycle)
+    //   sqrt:   t = sqrt(iter) * 8 / density
+    //   log:    t = log2(iter) * density / 64
+    // With anchor set, iter is first reduced by iterBase, the smallest
+    // iteration count in the view, so bands tighten as the zoom deepens
+    // instead of the whole view drifting into one colour.
     float density = 64.f;
     float offset = 0.f;      // phase offset in cycles
-    int logScale = 1;
+    int logScale = 1;        // legacy: presets without "transfer" map this
+    int transfer = TRANSFER_LOG;
+    int anchor = 0;
+    float iterBase = 0.f;    // set by the app every frame when anchor is on
     float special = 4.f;     // per-mode parameter (steps/waves/panels per cycle, DE falloff)
 
     // Palette: gradient stops blended in OKLab, or a cosine palette.

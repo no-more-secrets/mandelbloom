@@ -42,6 +42,9 @@ std::vector<Field> fields(Preset& p) {
         {"density", Field::F, &s.density, 1},
         {"offset", Field::F, &s.offset, 1},
         {"logScale", Field::I, &s.logScale, 1},
+        {"transfer", Field::I, &s.transfer, 1},
+        {"anchor", Field::I, &s.anchor, 1},
+        {"iterBase", Field::F, &s.iterBase, 1},
         {"special", Field::F, &s.special, 1},
         {"paletteType", Field::I, &s.paletteType, 1},
         {"stopCount", Field::I, &s.stopCount, 1},
@@ -99,6 +102,10 @@ Preset builtinPreset(int which) {
     Preset p;
     ShadeParams& sp = p.shade;
     switch (which) {
+        case 0:  // Classic: bands tighten with depth, like KF / Maths Town
+            sp.transfer = TRANSFER_LINEAR;
+            sp.anchor = 1;
+            break;
         case 1: {  // Pastel lines
             const float pos[5] = {0.f, 0.25f, 0.5f, 0.75f, 1.f};
             const float rgb[5][3] = {{0.98f, 0.80f, 0.86f}, {0.72f, 0.86f, 0.98f},
@@ -273,6 +280,7 @@ bool loadPresetFile(const std::string& path, Preset& p) {
     std::getline(in, header);
     if (header.rfind("mandelgpu-preset", 0) != 0) return false;
     p = Preset();
+    p.shade.transfer = -1;  // absent in old files: derive from logScale below
     std::map<std::string, Field> byName;
     for (const Field& f : fields(p)) byName.emplace(f.name, f);
     std::string line;
@@ -299,6 +307,7 @@ bool loadPresetFile(const std::string& path, Preset& p) {
             }
         }
     }
+    if (p.shade.transfer < 0) p.shade.transfer = p.shade.logScale ? TRANSFER_LOG : TRANSFER_LINEAR;
     return true;
 }
 

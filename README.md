@@ -76,6 +76,14 @@ cosine palette, slope lighting from the exterior normal, antialiased lines on
 iteration band boundaries, distance-estimate edge darkening, palette
 animation.
 
+The palette position comes from the iteration count through a transfer:
+linear (density = iterations per cycle), sqrt, or log. "Anchor to view
+minimum" subtracts the smallest escape iteration in the view first, so a
+linear transfer keeps its bands tightening as the zoom deepens (the KF /
+Maths Town look) instead of the whole view drifting into one colour. The log
+transfer without the anchor is the older behaviour and what the built-in
+presets other than classic use.
+
 ## Testing without touching the desktop
 
 `--script "wait:1500;wheel:5;drag:300,120,12;pan:8,0;shot:out.png;quit"`

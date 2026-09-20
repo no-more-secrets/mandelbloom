@@ -120,8 +120,9 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                               int sliceIters, const unsigned long long* __restrict__ startNs,
                               unsigned long long budgetNs, DeviceReferenceF ref, DeviceBlaF bla,
                               int gen, int ss, int aaPattern, int jox, int joy,
-                              int* __restrict__ activeCount) {
+                              int* __restrict__ activeCount, int* __restrict__ minIter) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
+    float myMin = 3.0e38f;  // smallest iteration count this thread escaped at
     int x, y;
     bool inBounds;
     if (stride == 1) {
@@ -261,6 +262,7 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                 const float mag2 = zr * zr + zi * zi;
                 const float logMag = 0.5f * logf(mag2);
                 s.iter = (float)n + 1.f - log2f(logMag / 0.69314718f);
+                if (s.iter >= 0.f) myMin = fminf(myMin, s.iter);
                 const float wdmag = sqrtf(wdr * wdr + wdi * wdi);
                 // DE in pixels: |z| log|z| / |D| / P
                 if (wdmag > 0.f) {
@@ -284,4 +286,7 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
 
     const unsigned mask = __ballot_sync(0xffffffffu, active);
     if ((threadIdx.x & 31) == 0 && mask) atomicAdd(activeCount, __popc(mask));
+    // Warp-reduced minimum escape iteration (non-negative floats order as ints).
+    for (int o = 16; o > 0; o >>= 1) myMin = fminf(myMin, __shfl_xor_sync(0xffffffffu, myMin, o));
+    if ((threadIdx.x & 31) == 0 && myMin < 3.0e38f) atomicMin(minIter, __float_as_int(myMin));
 }

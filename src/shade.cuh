@@ -163,11 +163,19 @@ __device__ __forceinline__ ShadeInput prepareSample(const FieldSample& s, const 
     in.flags = 1;
     const float de = h2f(s.de);
 
+    float it = s.iter;
+    if (p.anchor) it = fmaxf(it - p.iterBase, 0.f);
     float t;
-    if (p.logScale) {
-        t = log2f(fmaxf(s.iter, 1.f)) * (p.density / 64.f);
-    } else {
-        t = s.iter / p.density;
+    switch (p.transfer) {
+        case TRANSFER_LINEAR:
+            t = it / p.density;
+            break;
+        case TRANSFER_SQRT:
+            t = sqrtf(fmaxf(it, 0.f)) * (8.f / p.density);
+            break;
+        default:
+            t = log2f(fmaxf(it, 1.f)) * (p.density / 64.f);
+            break;
     }
     switch (p.mode) {
         case SHADE_ANGLE:

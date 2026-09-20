@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <cmath>
 #include <utility>
 #include <vector>
@@ -113,9 +114,10 @@ __global__ void shiftKernel(const PixelState* __restrict__ srcS,
     }
 }
 
-__device__ __forceinline__ void writeSample(FieldSample* __restrict__ field, size_t idx,
-                                            const PixelState& st, double zr, double zi,
-                                            double scale, bool escaped, int gen) {
+// Returns the escape iteration (negative when the pixel is inside).
+__device__ __forceinline__ float writeSample(FieldSample* __restrict__ field, size_t idx,
+                                             const PixelState& st, double zr, double zi,
+                                             double scale, bool escaped, int gen) {
     FieldSample s{};
     if (!escaped) {
         s.iter = -1.f;
@@ -141,6 +143,7 @@ __device__ __forceinline__ void writeSample(FieldSample* __restrict__ field, siz
     }
     s.gen = (uint16_t)gen;
     field[idx] = s;
+    return s.iter;
 }
 
 __device__ __forceinline__ unsigned long long globalTimerNs() {
@@ -184,8 +187,9 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
                              int sliceIters, const unsigned long long* __restrict__ startNs,
                              unsigned long long budgetNs, DeviceReference ref, DeviceBla bla,
                              int gen, int ss, int aaPattern, int jox, int joy,
-                             int* __restrict__ activeCount) {
+                             int* __restrict__ activeCount, int* __restrict__ minIter) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
+    float myMin = 3.0e38f;  // smallest iteration count this thread escaped at
     int x, y;
     bool inBounds;
     if (stride == 1) {
@@ -295,7 +299,10 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
         else if (n >= maxIter) st.status = 2;
         const bool pending = st.status == 0;
         // In-progress pixels keep whatever older sample sits there.
-        if (!pending) writeSample(field, idx, st, zr, zi, scale, escaped, gen);
+        if (!pending) {
+            const float it = writeSample(field, idx, st, zr, zi, scale, escaped, gen);
+            if (it >= 0.f) myMin = fminf(myMin, it);
+        }
         state[idx] = st;
         active = pending;
     }
@@ -303,6 +310,9 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
     // Warp-aggregated count of pixels still active.
     const unsigned mask = __ballot_sync(0xffffffffu, active);
     if ((threadIdx.x & 31) == 0 && mask) atomicAdd(activeCount, __popc(mask));
+    // Warp-reduced minimum escape iteration (non-negative floats order as ints).
+    for (int o = 16; o > 0; o >>= 1) myMin = fminf(myMin, __shfl_xor_sync(0xffffffffu, myMin, o));
+    if ((threadIdx.x & 31) == 0 && myMin < 3.0e38f) atomicMin(minIter, __float_as_int(myMin));
 }
 
 // Best sample of generation g at field pixel (x, y): the pixel itself, or
@@ -606,11 +616,15 @@ CudaRenderer::~CudaRenderer() {
     if (evShadeA_) cudaEventDestroy((cudaEvent_t)evShadeA_);
     if (evShadeB_) cudaEventDestroy((cudaEvent_t)evShadeB_);
     if (activeCount_) cudaFree(activeCount_);
+    if (minIter_) cudaFree(minIter_);
+    minIter_ = nullptr;
     if (levelCount_) cudaFree(levelCount_);
     if (levelCountHost_) cudaFreeHost(levelCountHost_);
     if (paletteLut_) cudaFree(paletteLut_);
     if (sliceStart_ns_) cudaFree(sliceStart_ns_);
     if (activeCountHost_) cudaFreeHost(activeCountHost_);
+    if (minIterHost_) cudaFreeHost(minIterHost_);
+    minIterHost_ = nullptr;
     if (stream_) cudaStreamDestroy((cudaStream_t)stream_);
     if (dispStream_) cudaStreamDestroy((cudaStream_t)dispStream_);
 }
@@ -639,12 +653,17 @@ bool CudaRenderer::init() {
     stream_ = st;
     dispStream_ = ds;
     CUDA_CHECK(cudaMalloc(&activeCount_, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&minIter_, sizeof(int)));
+    CUDA_CHECK(cudaMemset(minIter_, 0x7f, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&levelCount_, sizeof(int)));
     CUDA_CHECK(cudaMallocHost(&levelCountHost_, sizeof(int)));
     *levelCountHost_ = 0;
     CUDA_CHECK(cudaMalloc(&sliceStart_ns_, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMallocHost(&activeCountHost_, sizeof(int)));
     *activeCountHost_ = 0;
+    CUDA_CHECK(cudaMallocHost(&minIterHost_, sizeof(int)));
+    *minIterHost_ = 0x7f7f7f7f;
+    minIterGen_ = -1.f;
     return true;
 }
 
@@ -953,6 +972,8 @@ bool CudaRenderer::beginIterate(const ViewParams& view, int gen) {
     CUDA_CHECK(cudaStreamSynchronize(stream));  // cancel the slice in flight
     resetPass(view);
     gen_ = gen;
+    minIterGen_ = -1.f;
+    CUDA_CHECK(cudaMemsetAsync(minIter_, 0x7f, sizeof(int), stream));  // "none yet"
     const int count = fieldW_ * fieldH_;
     resetState<<<(count + 255) / 256, 256, 0, stream>>>(state_, count);
     CUDA_CHECK(cudaGetLastError());
@@ -1014,6 +1035,11 @@ bool CudaRenderer::iterateBusy() {
             levelCountPending_ = false;
         }
         lastActive_ = *activeCountHost_;
+        if (*minIterHost_ != 0x7f7f7f7f) {
+            float m;
+            std::memcpy(&m, minIterHost_, sizeof m);
+            minIterGen_ = m;
+        }
     }
     if (*activeCountHost_ == 0) {
         completedStride_ = stride_;
@@ -1071,18 +1097,20 @@ bool CudaRenderer::stepIterate() {
             stride_, (float)mP, eP, iterView_.refOffX / iterView_.scale,
             iterView_.refOffY / iterView_.scale, iterView_.maxIter, sliceIters_, sliceStart_ns_,
             kSliceBudgetNs, rf, bf, gen_, ss_, iterView_.aaPattern, jitterOx_, jitterOy_,
-            activeCount_);
+            activeCount_, minIter_);
     } else {
         iterateSlice<<<grid, block, 0, stream>>>(
             state_, field_, fieldW_, fieldH_, marginX_, marginY_, viewW_, viewH_, stride_,
             iterView_.scale, iterView_.refOffX, iterView_.refOffY, iterView_.maxIter, sliceIters_,
             sliceStart_ns_, kSliceBudgetNs, ref_, bla_, gen_, ss_, iterView_.aaPattern, jitterOx_,
-            jitterOy_, activeCount_);
+            jitterOy_, activeCount_, minIter_);
     }
     CUDA_CHECK(cudaGetLastError());
     cudaEventRecord((cudaEvent_t)evStop_, stream);
     CUDA_CHECK(cudaMemcpyAsync(activeCountHost_, activeCount_, sizeof(int),
                                cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(minIterHost_, minIter_, sizeof(int), cudaMemcpyDeviceToHost,
+                               stream));
     cudaEventRecord((cudaEvent_t)evSlice_, stream);
     sliceStart_ = iterView_.maxIter;
     sliceInFlight_ = true;
