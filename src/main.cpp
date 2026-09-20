@@ -22,7 +22,22 @@ struct App {
     bool dragging = false;
     bool showUi = true;
     double fps = 0.0;
+    float uiScale = 1.f;
 };
+
+// Match ImGui's fonts and metrics to the monitor's content scale so the
+// overlay obeys Windows display scaling.
+void applyUiScale(App& app) {
+    float s = SDL_GetWindowDisplayScale(app.window);
+    if (s <= 0.f) s = 1.f;
+    if (s == app.uiScale) return;
+    app.uiScale = s;
+    ImGuiStyle& style = ImGui::GetStyle();
+    style = ImGuiStyle();
+    ImGui::StyleColorsDark();
+    style.ScaleAllSizes(s);
+    style.FontScaleDpi = s;
+}
 
 void zoomAt(App& app, float mx, float my, double factor) {
     // Keep the complex point under the cursor fixed while scaling.
@@ -48,6 +63,10 @@ bool handleEvent(App& app, const SDL_Event& e) {
     switch (e.type) {
         case SDL_EVENT_QUIT:
             return false;
+        case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
+            app.uiScale = 0.f;  // force re-apply
+            applyUiScale(app);
+            break;
         case SDL_EVENT_KEY_DOWN:
             if (io.WantCaptureKeyboard) break;
             if (e.key.key == SDLK_ESCAPE) return false;
@@ -84,7 +103,7 @@ bool handleEvent(App& app, const SDL_Event& e) {
 
 void drawUi(App& app) {
     if (!app.showUi) return;
-    ImGui::SetNextWindowPos(ImVec2(10, 10), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(10 * app.uiScale, 10 * app.uiScale), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.75f);
     if (ImGui::Begin("mandelgpu", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted(app.renderer.deviceName());
@@ -120,7 +139,10 @@ int main(int, char**) {
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
     App app;
-    app.window = SDL_CreateWindow("mandelgpu", 1280, 800,
+    float initialScale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+    if (initialScale <= 0.f) initialScale = 1.f;
+    app.window = SDL_CreateWindow("mandelgpu", (int)(1280 * initialScale),
+                                  (int)(800 * initialScale),
                                   SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
     if (!app.window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -144,6 +166,7 @@ int main(int, char**) {
     ImGui::StyleColorsDark();
     ImGui_ImplSDL3_InitForOpenGL(app.window, app.gl);
     ImGui_ImplOpenGL3_Init("#version 460");
+    applyUiScale(app);
 
     if (!app.renderer.init()) return 1;
     std::printf("CUDA: %s\n", app.renderer.deviceName());
