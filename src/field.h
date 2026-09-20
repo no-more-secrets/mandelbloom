@@ -25,6 +25,17 @@ struct FieldSample {
 
 #define MAX_STOPS 8
 
+// Antialiasing: where the subsamples sit (decided at iteration time) and
+// how they are reconstructed into pixels (display time, settled path).
+enum AaPattern { AA_GRID = 0, AA_ROTATED, AA_STOCHASTIC, AA_PATTERN_COUNT };
+enum AaFilter { FILTER_BOX = 0, FILTER_TENT, FILTER_GAUSSIAN, FILTER_BLACKMAN, FILTER_COUNT };
+
+struct AaParams {
+    int pattern = AA_GRID;
+    int filter = FILTER_BOX;
+    float radius = 0.75f;  // display pixels; box ignores it (always the pixel)
+};
+
 enum ShadeMode {
     SHADE_SMOOTH = 0,   // palette over the smooth iteration count
     SHADE_LOGSTEPS,     // brightness ramps up within each band (KF "log steps")

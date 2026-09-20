@@ -26,7 +26,7 @@ struct PixelState {
     int m;            // reference index
     int n;            // pixel iteration
     int status;       // 0 active, 1 escaped, 2 inside
-    int pad;
+    int flags;        // bit 0: ran past the end of an escaped reference (unreliable)
 };
 
 namespace {
@@ -51,12 +51,47 @@ __global__ void clearField(FieldSample* __restrict__ field, int count) {
     field[i] = emptySample();
 }
 
+// Count pixels still to compute at a stride level (same grid rule as the
+// slice kernel), for the progress model.
+__global__ void countLevelKernel(const PixelState* __restrict__ state, int fw, int fh, int mx,
+                                 int my, int w, int h, int stride, int statusOffsetInts,
+                                 int* __restrict__ out) {
+    int x, y;
+    bool inBounds;
+    if (stride == 1) {
+        x = mx + blockIdx.x * blockDim.x + threadIdx.x;
+        y = my + blockIdx.y * blockDim.y + threadIdx.y;
+        inBounds = x < mx + w && y < my + h;
+    } else {
+        x = (blockIdx.x * blockDim.x + threadIdx.x) * stride;
+        y = (blockIdx.y * blockDim.y + threadIdx.y) * stride;
+        inBounds = x < fw && y < fh;
+    }
+    // The two state layouts keep status at different offsets.
+    const bool active =
+        inBounds &&
+        reinterpret_cast<const int*>(state + ((size_t)y * fw + x))[statusOffsetInts] == 0;
+    const unsigned mask = __ballot_sync(0xffffffffu, active);
+    if ((threadIdx.x & 31) == 0 && mask) atomicAdd(out, __popc(mask));
+}
+
 // Reset only pixels that have not finished (their dz referred to an old
 // reference orbit).
-__global__ void resetPendingState(PixelState* __restrict__ st, int count) {
+__global__ void resetPendingState(PixelState* __restrict__ st, int count, int statusOffsetInts) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= count) return;
-    if (st[i].status == 0) st[i] = PixelState{};
+    int* w = reinterpret_cast<int*>(st + i);
+    // flags is the last int in both layouts (offset 44).
+    if (w[statusOffsetInts] == 0 || (w[11] & 1)) st[i] = PixelState{};
+}
+
+// Find one pixel flagged unreliable (lowest index). out = -1 if none.
+__global__ void findUnreliableKernel(const PixelState* __restrict__ st, int count,
+                                     int* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    const int* w = reinterpret_cast<const int*>(st + i);
+    if (w[11] & 1) atomicMin(out, i);
 }
 
 // dst(x, y) = src(x + dx, y + dy), pending where the source is off-image.
@@ -148,7 +183,8 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
                              double scale, double refOffX, double refOffY, int maxIter,
                              int sliceIters, const unsigned long long* __restrict__ startNs,
                              unsigned long long budgetNs, DeviceReference ref, DeviceBla bla,
-                             int gen, int* __restrict__ activeCount) {
+                             int gen, int ss, int aaPattern, int jox, int joy,
+                             int* __restrict__ activeCount) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
     int x, y;
     bool inBounds;
@@ -168,13 +204,17 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
     bool active = inBounds && st.status == 0;
 
     if (active) {
-        const double dcr = refOffX + ((double)(x - mx) - 0.5 * w) * scale;
-        const double dci = refOffY - ((double)(y - my) - 0.5 * h) * scale;
+        const float2 jit = sampleJitter(aaPattern, ss, x, y, ((x - mx) % ss + ss) % ss,
+                                        ((y - my) % ss + ss) % ss, jox, joy);
+        const double dcr = refOffX + ((double)(x - mx) + jit.x - 0.5 * w) * scale;
+        const double dci = refOffY - ((double)(y - my) + jit.y - 0.5 * h) * scale;
         double dzr = st.dzr, dzi = st.dzi, dr = st.dr, di = st.di;
         int m = st.m, n = st.n;
         double zr = 0.0, zi = 0.0;
         const double bailout = 65536.0;
         const int refLast = ref.length - 1;
+        const bool refShort = refLast < maxIter;  // reference escaped early
+        bool unreliable = false;
         const int stop = min(maxIter, n + sliceIters);
         bool escaped = false;
         double dzmag2 = dzr * dzr + dzi * dzi;
@@ -205,6 +245,7 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
                     }
                     dzmag2 = dzr * dzr + dzi * dzi;
                     if (zmag2 < dzmag2 || m >= refLast) {
+                        if (m >= refLast && refShort) unreliable = true;
                         dzr = zr;
                         dzi = zi;
                         dzmag2 = zmag2;
@@ -236,12 +277,14 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
             }
             dzmag2 = dzr * dzr + dzi * dzi;
             if (zmag2 < dzmag2 || m >= refLast) {
+                if (m >= refLast && refShort) unreliable = true;
                 dzr = zr;
                 dzi = zi;
                 dzmag2 = zmag2;
                 m = 0;
             }
         }
+        if (unreliable) st.flags |= 1;
         st.dzr = dzr;
         st.dzi = dzi;
         st.dr = dr;
@@ -465,6 +508,70 @@ __global__ void shadeCachedKernel(const ShadeInput* __restrict__ cache, uint16_t
     storeOut(out, pitchPx, x, y, make_float3(acc.x * inv, acc.y * inv, acc.z * inv), outScale);
 }
 
+// Settled path with a reconstruction filter, step 2a: colour every
+// subsample into a field-resolution buffer.
+__global__ void shadeSubKernel(const ShadeInput* __restrict__ cache, uint16_t* __restrict__ sub,
+                               int w, int h, int ss, ShadeParams p, float timeSec,
+                               const float4* __restrict__ lut) {
+    const int fx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int fy = blockIdx.y * blockDim.y + threadIdx.y;
+    const int vw = w * ss, vh = h * ss;
+    if (fx >= vw || fy >= vh) return;
+    const int X = fx / ss, Y = fy / ss, i = fx - X * ss, j = fy - Y * ss;
+    const ShadeInput in = cache[((size_t)Y * w + X) * (size_t)(ss * ss) + j * ss + i];
+    const float3 c = colourInput(in, p, timeSec, lut);
+    ushort4 v;
+    v.x = f2h(c.x);
+    v.y = f2h(c.y);
+    v.z = f2h(c.z);
+    v.w = f2h(1.f);
+    *reinterpret_cast<ushort4*>(sub + ((size_t)fy * vw + fx) * 4) = v;
+}
+
+// Step 2b: gather subsamples within the filter radius of each pixel centre,
+// using their true (jittered) positions.
+__global__ void filterKernel(const uint16_t* __restrict__ sub, uint16_t* __restrict__ out, int w,
+                             int h, int ss, int mx, int my, int pattern, int jox, int joy,
+                             int filter, float radius) {
+    const int X = blockIdx.x * blockDim.x + threadIdx.x;
+    const int Y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (X >= w || Y >= h) return;
+    const int vw = w * ss, vh = h * ss;
+    const int R = (int)ceilf(radius - 0.5f) + 1;  // neighbour pixels to visit
+    float3 acc = make_float3(0.f, 0.f, 0.f);
+    float wsum = 0.f;
+    for (int dy = -R; dy <= R; ++dy) {
+        for (int dx = -R; dx <= R; ++dx) {
+            const int PX = X + dx, PY = Y + dy;
+            if (PX < 0 || PX >= w || PY < 0 || PY >= h) continue;
+            for (int j = 0; j < ss; ++j) {
+                for (int i = 0; i < ss; ++i) {
+                    const int fx = PX * ss + i, fy = PY * ss + j;
+                    const float2 jit = sampleJitter(pattern, ss, mx + fx, my + fy, i, j, jox, joy);
+                    // Position relative to this pixel's centre, in display pixels.
+                    const float px = dx + (i + 0.5f + jit.x) / ss - 0.5f;
+                    const float py = dy + (j + 0.5f + jit.y) / ss - 0.5f;
+                    const float d = sqrtf(px * px + py * py);
+                    const float wgt = filterWeight(filter, d, radius);
+                    if (wgt <= 0.f) continue;
+                    const ushort4 v = *reinterpret_cast<const ushort4*>(sub + ((size_t)fy * vw + fx) * 4);
+                    acc.x += h2f(v.x) * wgt;
+                    acc.y += h2f(v.y) * wgt;
+                    acc.z += h2f(v.z) * wgt;
+                    wsum += wgt;
+                }
+            }
+        }
+    }
+    const float inv = wsum > 0.f ? 1.f / wsum : 0.f;
+    ushort4 o;
+    o.x = f2h(acc.x * inv);
+    o.y = f2h(acc.y * inv);
+    o.z = f2h(acc.z * inv);
+    o.w = f2h(1.f);
+    *reinterpret_cast<ushort4*>(out + ((size_t)Y * w + X) * 4) = o;
+}
+
 __global__ void paletteLutKernel(float4* __restrict__ lut, ShadeParams p) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= PALETTE_LUT_SIZE) return;
@@ -485,6 +592,8 @@ CudaRenderer::~CudaRenderer() {
     if (evShadeA_) cudaEventDestroy((cudaEvent_t)evShadeA_);
     if (evShadeB_) cudaEventDestroy((cudaEvent_t)evShadeB_);
     if (activeCount_) cudaFree(activeCount_);
+    if (levelCount_) cudaFree(levelCount_);
+    if (levelCountHost_) cudaFreeHost(levelCountHost_);
     if (paletteLut_) cudaFree(paletteLut_);
     if (sliceStart_ns_) cudaFree(sliceStart_ns_);
     if (activeCountHost_) cudaFreeHost(activeCountHost_);
@@ -516,6 +625,9 @@ bool CudaRenderer::init() {
     stream_ = st;
     dispStream_ = ds;
     CUDA_CHECK(cudaMalloc(&activeCount_, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&levelCount_, sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&levelCountHost_, sizeof(int)));
+    *levelCountHost_ = 0;
     CUDA_CHECK(cudaMalloc(&sliceStart_ns_, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMallocHost(&activeCountHost_, sizeof(int)));
     *activeCountHost_ = 0;
@@ -585,6 +697,8 @@ void CudaRenderer::freeField() {
     if (stateAlt_) cudaFree(stateAlt_);
     if (shadeCache_) cudaFree(shadeCache_);
     if (hdr_) cudaFree(hdr_);
+    if (subColour_) cudaFree(subColour_);
+    subColour_ = nullptr;
     if (bloomA_) cudaFree(bloomA_);
     if (bloomT_) cudaFree(bloomT_);
     if (bloomB_) cudaFree(bloomB_);
@@ -709,6 +823,8 @@ bool CudaRenderer::bindOutput(void* sharedHandle, size_t sharedSize, int rowPitc
     CUDA_CHECK(cudaMalloc(&stateAlt_, sizeof(PixelState) * fn));
     CUDA_CHECK(cudaMalloc(&shadeCache_, sizeof(ShadeInput) * n * (size_t)(ss_ * ss_)));
     CUDA_CHECK(cudaMalloc(&hdr_, sizeof(uint16_t) * 4 * n));
+    CUDA_CHECK(cudaMalloc(&subColour_, sizeof(uint16_t) * 4 * (size_t)viewW_ * viewH_));
+    jitterOx_ = jitterOy_ = 0;
     {
         const size_t aw = (width + 3) / 4, ah = (height + 3) / 4;
         const size_t bw = (aw + 1) / 2, bh = (ah + 1) / 2;
@@ -734,6 +850,58 @@ void CudaRenderer::resetPass(const ViewParams& view) {
     completedStride_ = 0;
     iterDone_ = false;
     passMs_ = 0.f;
+    for (int i = 0; i < kLevels; ++i) {
+        levelPixels_[i] = -1;
+        levelMs_[i] = 0.f;
+        levelDone_[i] = false;
+    }
+    levelCountPending_ = false;
+    lastActive_ = 0;
+}
+
+int CudaRenderer::progress_levelIndex() const {
+    return stride_ >= 8 ? 0 : stride_ >= 4 ? 1 : stride_ >= 2 ? 2 : 3;
+}
+
+float CudaRenderer::progress() const {
+    if (iterDone_) return 1.f;
+    double doneMs = 0.0, donePx = 0.0;
+    for (int i = 0; i < kLevels; ++i) {
+        if (levelDone_[i] && levelPixels_[i] > 0) {
+            doneMs += levelMs_[i];
+            donePx += levelPixels_[i];
+        }
+    }
+    const int cur = progress_levelIndex();
+    // Pixels of the current and future levels. Unknown counts are estimated
+    // from geometry (a full pass) as a fallback.
+    double futurePx = 0.0;
+    for (int i = cur; i < kLevels; ++i) {
+        double n = levelPixels_[i];
+        if (n < 0) {
+            const int st = 8 >> i;
+            if (st == 1) n = (double)viewW_ * viewH_ * 0.75;
+            else n = ((double)fieldW_ / st) * ((double)fieldH_ / st) * 0.75;
+        }
+        futurePx += n;
+    }
+    if (donePx > 0.0) {
+        const double c = doneMs / donePx;  // ms per pixel, from completed levels
+        const double total = doneMs + c * futurePx;
+        return (float)std::min(passMs_ / std::max(total, 1e-3), 0.995);
+    }
+    // Nothing completed yet: count-based fraction of the first level, scaled
+    // to that level's share of the pass.
+    const double n0 = levelPixels_[cur] > 0 ? levelPixels_[cur] : 1.0;
+    const double frac = std::max(0.0, 1.0 - (double)lastActive_ / n0);
+    return (float)std::min(frac * n0 / std::max(futurePx, 1.0), 0.995);
+}
+
+float CudaRenderer::etaMs() const {
+    if (iterDone_) return 0.f;
+    const float p = progress();
+    if (p <= 0.001f) return -1.f;  // unknown
+    return std::max(passMs_ / p - passMs_, 0.f);
 }
 
 bool CudaRenderer::beginIterate(const ViewParams& view, int gen) {
@@ -762,6 +930,9 @@ bool CudaRenderer::shiftAndResume(const ViewParams& view, int dx, int dy) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         std::swap(state_, stateAlt_);
         std::swap(field_, fieldAlt_);
+        // A sample at index x + dx now sits at x: keep its jitter key.
+        jitterOx_ += dx;
+        jitterOy_ += dy;
     }
     const float keepPass = passMs_;
     resetPass(view);
@@ -774,7 +945,8 @@ bool CudaRenderer::restartPending(const ViewParams& view) {
     cudaStream_t stream = (cudaStream_t)stream_;
     CUDA_CHECK(cudaStreamSynchronize(stream));
     const int count = fieldW_ * fieldH_;
-    resetPendingState<<<(count + 255) / 256, 256, 0, stream>>>(state_, count);
+    resetPendingState<<<(count + 255) / 256, 256, 0, stream>>>(state_, count,
+                                                               iterView_.useFloat ? 8 : 10);
     CUDA_CHECK(cudaGetLastError());
     const float keepPass = passMs_;
     resetPass(view);
@@ -792,8 +964,18 @@ bool CudaRenderer::iterateBusy() {
     cudaEventElapsedTime(&sliceMs_, (cudaEvent_t)evStart_, (cudaEvent_t)evStop_);
     passMs_ += sliceMs_;
     iterateMs_ = passMs_;
+    {
+        const int li = progress_levelIndex();
+        levelMs_[li] += sliceMs_;
+        if (levelCountPending_) {
+            levelPixels_[li] = *levelCountHost_;
+            levelCountPending_ = false;
+        }
+        lastActive_ = *activeCountHost_;
+    }
     if (*activeCountHost_ == 0) {
         completedStride_ = stride_;
+        levelDone_[progress_levelIndex()] = true;
         if (stride_ <= 1) {
             iterDone_ = true;
         } else {
@@ -818,6 +1000,16 @@ bool CudaRenderer::stepIterate() {
     }
     const dim3 grid((sw + block.x - 1) / block.x, (sh + block.y - 1) / block.y);
     CUDA_CHECK(cudaMemsetAsync(activeCount_, 0, sizeof(int), stream));
+    if (levelPixels_[progress_levelIndex()] < 0 && !levelCountPending_) {
+        // First slice of this level: count what it has to do.
+        CUDA_CHECK(cudaMemsetAsync(levelCount_, 0, sizeof(int), stream));
+        countLevelKernel<<<grid, block, 0, stream>>>(state_, fieldW_, fieldH_, marginX_, marginY_,
+                                                     viewW_, viewH_, stride_,
+                                                     iterView_.useFloat ? 8 : 10, levelCount_);
+        CUDA_CHECK(cudaMemcpyAsync(levelCountHost_, levelCount_, sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream));
+        levelCountPending_ = true;
+    }
     cudaEventRecord((cudaEvent_t)evStart_, stream);
     stampTimer<<<1, 1, 0, stream>>>(sliceStart_ns_);
     if (iterView_.useFloat) {
@@ -836,12 +1028,14 @@ bool CudaRenderer::stepIterate() {
             (PixelStateF*)state_, field_, fieldW_, fieldH_, marginX_, marginY_, viewW_, viewH_,
             stride_, (float)mP, eP, iterView_.refOffX / iterView_.scale,
             iterView_.refOffY / iterView_.scale, iterView_.maxIter, sliceIters_, sliceStart_ns_,
-            kSliceBudgetNs, rf, bf, gen_, activeCount_);
+            kSliceBudgetNs, rf, bf, gen_, ss_, iterView_.aaPattern, jitterOx_, jitterOy_,
+            activeCount_);
     } else {
         iterateSlice<<<grid, block, 0, stream>>>(
             state_, field_, fieldW_, fieldH_, marginX_, marginY_, viewW_, viewH_, stride_,
             iterView_.scale, iterView_.refOffX, iterView_.refOffY, iterView_.maxIter, sliceIters_,
-            sliceStart_ns_, kSliceBudgetNs, ref_, bla_, gen_, activeCount_);
+            sliceStart_ns_, kSliceBudgetNs, ref_, bla_, gen_, ss_, iterView_.aaPattern, jitterOx_,
+            jitterOy_, activeCount_);
     }
     CUDA_CHECK(cudaGetLastError());
     cudaEventRecord((cudaEvent_t)evStop_, stream);
@@ -930,7 +1124,7 @@ bool CudaRenderer::buildShadeCache(const ShadeParams& params, const CompositeMap
     return true;
 }
 
-bool CudaRenderer::shadeCached(const ShadeParams& params, float timeSec) {
+bool CudaRenderer::shadeCached(const ShadeParams& params, float timeSec, const AaParams& aa) {
     if (!hdr_ || !shadeCache_) return false;
     cudaStream_t stream = (cudaStream_t)dispStream_;
     const dim3 block(16, 16);
@@ -940,8 +1134,17 @@ bool CudaRenderer::shadeCached(const ShadeParams& params, float timeSec) {
         shadePending_ = false;
     }
     if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
-    shadeCachedKernel<<<grid, block, 0, stream>>>(shadeCache_, hdr_, width_, 1.f, width_, height_,
-                                                  ss_, params, timeSec, paletteLut_);
+    if (aa.filter == FILTER_BOX) {
+        shadeCachedKernel<<<grid, block, 0, stream>>>(shadeCache_, hdr_, width_, 1.f, width_,
+                                                      height_, ss_, params, timeSec, paletteLut_);
+    } else {
+        const dim3 gsub((viewW_ + block.x - 1) / block.x, (viewH_ + block.y - 1) / block.y);
+        shadeSubKernel<<<gsub, block, 0, stream>>>(shadeCache_, subColour_, width_, height_, ss_,
+                                                   params, timeSec, paletteLut_);
+        filterKernel<<<grid, block, 0, stream>>>(subColour_, hdr_, width_, height_, ss_, marginX_,
+                                                 marginY_, aa.pattern, jitterOx_, jitterOy_,
+                                                 aa.filter, fmaxf(aa.radius, 0.3f));
+    }
     const cudaError_t err = cudaGetLastError();
     if (!shadePending_) {
         cudaEventRecord((cudaEvent_t)evShadeB_, stream);
@@ -987,5 +1190,22 @@ bool CudaRenderer::postProcess(const PostParams& params, uint32_t frame) {
         std::fprintf(stderr, "post kernel failed: %s\n", cudaGetErrorString(err));
         return false;
     }
+    return true;
+}
+
+bool CudaRenderer::findUnreliable(int& fx, int& fy) {
+    if (!state_ || !levelCount_) return false;
+    cudaStream_t stream = (cudaStream_t)stream_;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int count = fieldW_ * fieldH_;
+    const int init = 0x7fffffff;
+    CUDA_CHECK(cudaMemcpy(levelCount_, &init, sizeof(int), cudaMemcpyHostToDevice));
+    findUnreliableKernel<<<(count + 255) / 256, 256, 0, stream>>>(state_, count, levelCount_);
+    CUDA_CHECK(cudaGetLastError());
+    int idx = init;
+    CUDA_CHECK(cudaMemcpy(&idx, levelCount_, sizeof(int), cudaMemcpyDeviceToHost));
+    if (idx == init) return false;
+    fx = idx % fieldW_;
+    fy = idx / fieldW_;
     return true;
 }

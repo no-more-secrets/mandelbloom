@@ -49,6 +49,7 @@ struct App {
     std::vector<Gen> gens;
     int nextGen = 1;
     int ss = 1;          // supersampling factor per axis (field = display * ss)
+    AaParams aa;
     int ssApplied = 0;   // what the renderer is currently bound with
     bool tweening = false;
     float tweenTau = 0.08f;  // seconds to close ~63% of the gap
@@ -62,6 +63,8 @@ struct App {
     int panDx = 0, panDy = 0;       // accumulated pan this frame, field pixels
     bool panDirty = false;
     ReferenceOrbit ref;
+    int rerefRounds = 0;        // re-references done for the current generation
+    int rerefCheckedStride = 0; // last completed stride checked for unreliable pixels
     BlaTable bla;
     std::vector<BlaNodeF> blaF;
     float blaEpsLog2 = -24.f;
@@ -265,9 +268,31 @@ void rebuildBla(App& app) {
                            app.bla.levelOffset.data(), app.bla.levels, app.bla.steps);
 }
 
+// Move the reference to a point in the view (field pixel coordinates) that
+// survives longer than the current one, and restart the affected pixels.
+void rereferenceAt(App& app, int fx, int fy) {
+    const double sc = app.view.scale;
+    const double offX = ((double)(fx - app.renderer.marginX()) - 0.5 * app.view.width) * sc;
+    const double offY = -(((double)(fy - app.renderer.marginY()) - 0.5 * app.view.height) * sc);
+    app.refCx = fieldView(app).cx;
+    app.refCy = fieldView(app).cy;
+    app.refCx.addDouble(offX);
+    app.refCy.addDouble(offY);
+    updateRefOffset(app);
+    computeReference(app.refCx, app.refCy, app.view.maxIter, 65536.0, app.ref);
+    app.renderer.uploadReference(app.ref.zr.data(), app.ref.zi.data(), app.ref.length,
+                                 app.ref.escaped);
+    rebuildBla(app);
+    app.renderer.restartPending(app.view);
+    ++app.rerefRounds;
+    app.rerefCheckedStride = 0;
+}
+
 void rebuildReference(App& app) {
     app.refCx = app.render.cx;
     app.refCy = app.render.cy;
+    app.rerefRounds = 0;
+    app.rerefCheckedStride = 0;
     updateRefOffset(app);
     computeReference(app.refCx, app.refCy, app.view.maxIter, 65536.0, app.ref);
     app.renderer.uploadReference(app.ref.zr.data(), app.ref.zi.data(), app.ref.length,
@@ -421,14 +446,27 @@ void drawUi(App& app) {
             int sel = app.ss - 1;
             ImGui::SetNextItemWidth(80 * app.uiScale);
             if (ImGui::Combo("supersample", &sel, items, 3)) app.ss = sel + 1;
+            const char* pats[] = {"grid", "rotated", "stochastic"};
+            ImGui::SetNextItemWidth(100 * app.uiScale);
+            if (ImGui::Combo("samples", &app.aa.pattern, pats, AA_PATTERN_COUNT)) {
+                app.view.aaPattern = app.aa.pattern;
+                app.dirty = true;
+            }
+            const char* filts[] = {"box", "tent", "gaussian", "blackman"};
+            ImGui::SetNextItemWidth(100 * app.uiScale);
+            if (ImGui::Combo("filter", &app.aa.filter, filts, FILTER_COUNT)) app.cachedShown = false;
+            if (app.aa.filter != FILTER_BOX) {
+                ImGui::SetNextItemWidth(100 * app.uiScale);
+                if (ImGui::SliderFloat("radius px", &app.aa.radius, 0.5f, 1.5f)) app.cachedShown = false;
+            }
         }
         if (ImGui::SliderInt("max iter", &app.view.maxIter, 64, 65536, "%d",
                              ImGuiSliderFlags_Logarithmic)) {
             app.dirty = true;
         }
         ImGui::Separator();
-        ImGui::Text("ref     %.2f ms  (%d iters%s)", app.ref.computeMs, app.ref.length,
-                    app.ref.escaped ? ", escaped" : "");
+        ImGui::Text("ref     %.2f ms  (%d iters%s, %d re-refs)", app.ref.computeMs, app.ref.length,
+                    app.ref.escaped ? ", escaped" : "", app.rerefRounds);
         ImGui::Text("bla     %.2f ms  (%d levels, %zu nodes)", app.bla.buildMs, app.bla.levels,
                     app.bla.nodes.size());
         if (ImGui::Checkbox("use BLA", &app.view.useBla)) app.dirty = true;
@@ -440,10 +478,14 @@ void drawUi(App& app) {
         if (app.renderer.iterateDone()) {
             ImGui::Text("iterate %.0f ms", app.renderer.lastIterateMs());
         } else {
-            ImGui::Text("iterate %.0f ms  (stride %d, %d / %d, slice %.1f ms)",
-                        app.renderer.lastIterateMs(), app.renderer.currentStride(),
-                        std::min(app.renderer.iterateProgress(), app.view.maxIter),
-                        app.view.maxIter, app.renderer.lastSliceMs());
+            const float pr = app.renderer.progress();
+            const float eta = app.renderer.etaMs();
+            char label[64];
+            if (eta >= 0.f) std::snprintf(label, sizeof label, "%.0f%%  %.1f s left", pr * 100.f, eta / 1000.f);
+            else std::snprintf(label, sizeof label, "%.0f%%", pr * 100.f);
+            ImGui::ProgressBar(pr, ImVec2(-1.f, 0.f), label);
+            ImGui::Text("iterate %.0f ms  (stride %d, slice %.1f ms)", app.renderer.lastIterateMs(),
+                        app.renderer.currentStride(), app.renderer.lastSliceMs());
         }
         ImGui::Text("display %.2f ms%s", app.renderer.lastShadeMs(),
                     app.cachedShown ? "  (cached)" : "");
@@ -641,7 +683,9 @@ int main(int argc, char** argv) {
     std::string argPost;
     std::string argLoad;  // saved preset name
     std::string argSave;  // save the starting parameters under this name
-    bool argFullscreen = false;  // "bloom=1.2,vignette=0.4,tonemap=2,..." 
+    std::string argAa;    // "pattern,filter,radius" 
+    bool argFullscreen = false;
+    bool argHidden = false;  // scripted runs: never show or focus the window  // "bloom=1.2,vignette=0.4,tonemap=2,..." 
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
@@ -662,6 +706,10 @@ int main(int argc, char** argv) {
             argLoad = argv[++i];
         } else if (std::strcmp(argv[i], "--save") == 0 && i + 1 < argc) {
             argSave = argv[++i];
+        } else if (std::strcmp(argv[i], "--aa") == 0 && i + 1 < argc) {
+            argAa = argv[++i];
+        } else if (std::strcmp(argv[i], "--hidden") == 0) {
+            argHidden = true;
         } else {
             positional.push_back(argv[i]);
         }
@@ -683,7 +731,9 @@ int main(int argc, char** argv) {
     if (initialScale <= 0.f) initialScale = 1.f;
     app.window = SDL_CreateWindow("mandelgpu", (int)(1280 * initialScale),
                                   (int)(800 * initialScale),
-                                  SDL_WINDOW_RESIZABLE);
+                                  SDL_WINDOW_RESIZABLE |
+                                      (argHidden ? (SDL_WINDOW_HIDDEN | SDL_WINDOW_NOT_FOCUSABLE)
+                                                 : 0));
     if (!app.window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
@@ -713,6 +763,15 @@ int main(int argc, char** argv) {
         Preset pr;
         if (loadPreset(argLoad, pr)) applyPresetTo(app, pr);
         else std::fprintf(stderr, "preset not found: %s\n", argLoad.c_str());
+    }
+    if (!argAa.empty()) {
+        int pat = 0, fil = 0;
+        float rad = 0.75f;
+        std::sscanf(argAa.c_str(), "%d,%d,%f", &pat, &fil, &rad);
+        app.aa.pattern = std::min(std::max(pat, 0), AA_PATTERN_COUNT - 1);
+        app.aa.filter = std::min(std::max(fil, 0), FILTER_COUNT - 1);
+        app.aa.radius = rad;
+        app.view.aaPattern = app.aa.pattern;
     }
     if (!argSave.empty()) {
         Preset cur;
@@ -850,9 +909,17 @@ int main(int argc, char** argv) {
         }
         tweenShown(app, dt);
 
-        // Keep one slice in flight.
+        // Keep one slice in flight. When a level completes under a reference
+        // that escaped early, re-reference at a pixel that outlived it.
         if (!app.renderer.iterateBusy()) {
-            app.renderer.takeSliceFinished();
+            const bool sliceDone = app.renderer.takeSliceFinished();
+            const int done = app.renderer.completedStride();
+            if (sliceDone && app.ref.escaped && done > 0 && done != app.rerefCheckedStride &&
+                app.rerefRounds < 12) {
+                app.rerefCheckedStride = done;
+                int fx, fy;
+                if (app.renderer.findUnreliable(fx, fy)) rereferenceAt(app, fx, fy);
+            }
             if (!app.renderer.iterateDone()) app.renderer.stepIterate();
         }
 
@@ -897,7 +964,7 @@ int main(int argc, char** argv) {
                     if (app.bgFps <= 0.f || now - app.lastShadeSec >= 1.0 / app.bgFps) need = true;
                 }
                 if (need) {
-                    if (app.renderer.shadeCached(app.shade, app.animTime)) {
+                    if (app.renderer.shadeCached(app.shade, app.animTime, app.aa)) {
                         app.cachedShown = true;
                         app.lastShadeSec = nowSeconds();
                         app.imageDirty = true;
@@ -952,13 +1019,16 @@ int main(int argc, char** argv) {
                 const double zoom = 3.2 / (app.render.scale * (app.view.width / app.ss));
                 const int dg = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
                 std::printf("shot %s zoom=%.3g iterate=%.0fms done=%d stride=%d/%d tween=%d "
-                            "inertia=%d display=%.3fms cached=%d fps=%.0f centre=%s %s\n",
+                            "inertia=%d display=%.3fms cached=%d fps=%.0f progress=%.2f eta=%.0f centre=%s %s\n",
                             shot.c_str(), zoom, app.renderer.lastIterateMs(),
                             app.renderer.iterateDone() ? 1 : 0, app.renderer.currentStride(),
                             app.renderer.completedStride(), app.tweening ? 1 : 0,
                             app.inertia ? 1 : 0, app.renderer.lastShadeMs(),
-                            app.cachedShown ? 1 : 0, app.fps, app.render.cx.toString(dg).c_str(),
+                            app.cachedShown ? 1 : 0, app.fps, app.renderer.progress(),
+                            app.renderer.etaMs(), app.render.cx.toString(dg).c_str(),
                             app.render.cy.toString(dg).c_str());
+                std::printf("  ref iters=%d escaped=%d rerefs=%d\n", app.ref.length,
+                            app.ref.escaped ? 1 : 0, app.rerefRounds);
                 std::printf("  shown scale=%.6g render scale=%.6g gens=%zu\n", app.shown.scale,
                             app.render.scale, app.gens.size());
                 if (!app.gens.empty()) {

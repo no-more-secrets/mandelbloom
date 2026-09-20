@@ -87,6 +87,58 @@ __device__ __forceinline__ float3 paletteLut(const float4* __restrict__ lut, flo
     return make_float3(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f);
 }
 
+__device__ __forceinline__ float hash01(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return (float)(x & 0xFFFFFFu) / 16777216.f;
+}
+
+// Subsample offset in field pixels (each within +-0.5) for field pixel
+// (fx, fy) whose subsample index inside its display pixel is (si, sj).
+// origin keeps stochastic offsets attached to their samples across field
+// shifts (a sample's key is fx + ox, fy + oy).
+__device__ __forceinline__ float2 sampleJitter(int pattern, int ss, int fx, int fy, int si,
+                                               int sj, int ox, int oy) {
+    if (pattern == AA_ROTATED && ss == 2) {
+        // Rotated grid: four distinct x and y coverage levels per pixel.
+        const float jx[4] = {0.25f, 0.25f, -0.25f, -0.25f};
+        const float jy[4] = {-0.25f, 0.25f, -0.25f, 0.25f};
+        const int k = sj * 2 + si;
+        return make_float2(jx[k], jy[k]);
+    }
+    if (pattern == AA_STOCHASTIC || (pattern == AA_ROTATED && ss != 2)) {
+        const uint32_t key = (uint32_t)(fx + ox) * 73856093u ^ (uint32_t)(fy + oy) * 19349663u;
+        return make_float2(hash01(key) - 0.5f, hash01(key ^ 0x9E3779B9u) - 0.5f);
+    }
+    return make_float2(0.f, 0.f);
+}
+
+// Reconstruction filter weight for a sample at distance d (display pixels)
+// from the pixel centre; r is the filter radius.
+__device__ __forceinline__ float filterWeight(int filter, float d, float r) {
+    const float t = d / r;
+    if (t >= 1.f) return 0.f;
+    switch (filter) {
+        case FILTER_TENT:
+            return 1.f - t;
+        case FILTER_GAUSSIAN: {
+            // sigma = r/2, truncated at r and shifted to zero there
+            const float g = expf(-2.f * t * t), g1 = expf(-2.f);
+            return (g - g1) / (1.f - g1);
+        }
+        case FILTER_BLACKMAN: {
+            const float a = 3.14159265f * (t + 1.f);  // window over [-r, r]
+            return 0.35875f - 0.48829f * cosf(a) + 0.14128f * cosf(2.f * a) -
+                   0.01168f * cosf(3.f * a);
+        }
+        default:
+            return 1.f;
+    }
+}
+
 // Screen-space rate of change of the iteration count, per display pixel,
 // used to draw lines at constant width. Zero when unknown.
 struct IterGradient {

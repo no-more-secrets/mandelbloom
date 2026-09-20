@@ -23,7 +23,8 @@ struct PixelStateF {
     int n;
     int status;  // 0 active, 1 escaped, 2 inside
     int hint;    // BLA level used last time (search starts one above it)
-    int pad[2];
+    int pad;
+    int flags;   // bit 0: ran past the end of an escaped reference (unreliable)
 };
 static_assert(sizeof(PixelStateF) == 48, "PixelStateF must match PixelState's stride");
 
@@ -55,9 +56,21 @@ __device__ __forceinline__ void renorm(float& r, float& i, int& e) {
     }
 }
 
-// (r, i) * 2^e  +  (ar, ai) * 2^ea, result exponent max(e, ea): neither term
-// is shifted up, so nothing can overflow.
+// (r, i) * 2^e  +  (ar, ai) * 2^ea. The result takes the exponent of the
+// larger operand, so the smaller one is shifted down and may underflow to
+// zero, which is the correct negligible result. A zero operand carries no
+// magnitude, so it must not decide the exponent: with a fresh pixel at
+// dz = 0 * 2^0, adding dc = m * 2^-150 would otherwise vanish.
 __device__ __forceinline__ void addFx(float& r, float& i, int& e, float ar, float ai, int ea) {
+    const bool zeroA = r == 0.f && i == 0.f;
+    const bool zeroB = ar == 0.f && ai == 0.f;
+    if (zeroA) {
+        r = ar;
+        i = ai;
+        e = ea;
+        return;
+    }
+    if (zeroB) return;
     const int m = max(e, ea);
     r = ldexpf(r, e - m) + ldexpf(ar, ea - m);
     i = ldexpf(i, e - m) + ldexpf(ai, ea - m);
@@ -106,7 +119,8 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                               float mP, int eP, double refOffPx, double refOffPy, int maxIter,
                               int sliceIters, const unsigned long long* __restrict__ startNs,
                               unsigned long long budgetNs, DeviceReferenceF ref, DeviceBlaF bla,
-                              int gen, int* __restrict__ activeCount) {
+                              int gen, int ss, int aaPattern, int jox, int joy,
+                              int* __restrict__ activeCount) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
     int x, y;
     bool inBounds;
@@ -126,8 +140,10 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
 
     if (active) {
         // dc = (mP * poff) * 2^eP, poff in pixels (exact in float).
-        const float poffx = (float)(refOffPx + (double)(x - mx) - 0.5 * w);
-        const float poffy = (float)(refOffPy - ((double)(y - my) - 0.5 * h));
+        const float2 jit = sampleJitter(aaPattern, ss, x, y, ((x - mx) % ss + ss) % ss,
+                                        ((y - my) % ss + ss) % ss, jox, joy);
+        const float poffx = (float)(refOffPx + (double)(x - mx) + jit.x - 0.5 * w);
+        const float poffy = (float)(refOffPy - ((double)(y - my) + jit.y - 0.5 * h));
         const float dcr = mP * poffx, dci = mP * poffy;
         float wzr = st.wzr, wzi = st.wzi, wdr = st.wdr, wdi = st.wdi;
         int ez = st.ez, ed = st.ed;
@@ -136,6 +152,8 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
         float zr = 0.f, zi = 0.f;
         const float bailout = 65536.f;
         const int refLast = ref.length - 1;
+        const bool refShort = refLast < maxIter;  // reference escaped early
+        bool unreliable = false;
         const int stop = min(maxIter, n + sliceIters);
         bool escaped = false;
         int budgetCheck = 0;
@@ -214,6 +232,7 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
             }
             const float dzmag2 = ldexpf(wzr * wzr + wzi * wzi, 2 * ez);
             if (zmag2 < dzmag2 || m >= refLast) {
+                if (m >= refLast && refShort) unreliable = true;
                 wzr = zr;
                 wzi = zi;
                 ez = 0;
@@ -221,6 +240,7 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                 m = 0;
             }
         }
+        if (unreliable) st.flags |= 1;
         st.wzr = wzr;
         st.wzi = wzi;
         st.ez = ez;

@@ -18,6 +18,7 @@ struct ViewParams {
     int maxIter = 512;
     bool useBla = true;
     bool useFloat = true;  // float kernel with per-value exponents (default); else double
+    int aaPattern = AA_GRID;  // subsample placement (needs a re-iterate to change)
 };
 
 // BLA table as uploaded to the device (see bla.h for the layout).
@@ -99,8 +100,13 @@ public:
     // -dx, -dy), keep finished pixels, mark exposed strips pending, and
     // continue the pass coarse-to-fine on what is pending. Same reference.
     bool shiftAndResume(const ViewParams& view, int dx, int dy);
-    // Reference changed: restart only the pixels that are not finished.
+    // Reference changed: restart the pixels that are not finished and those
+    // flagged unreliable (they ran past the end of an escaped reference).
     bool restartPending(const ViewParams& view);
+    // Field coordinates of one unreliable pixel, if any.
+    bool findUnreliable(int& fx, int& fy);
+    int marginX() const { return marginX_; }
+    int marginY() const { return marginY_; }
     bool stepIterate();
     bool iterateBusy();
     bool iterateDone() const { return iterDone_; }
@@ -123,7 +129,13 @@ public:
     // cache for a given time: a streaming pass with no field access.
     bool buildPaletteLut(const ShadeParams& params);
     bool buildShadeCache(const ShadeParams& params, const CompositeMap& map);
-    bool shadeCached(const ShadeParams& params, float timeSec);
+    bool shadeCached(const ShadeParams& params, float timeSec, const AaParams& aa);
+
+    // Time-linear progress estimate of the running pass (0..1) and the
+    // predicted remaining time. Coarse levels sample the same image, so
+    // their cost per pixel predicts the rest.
+    float progress() const;
+    float etaMs() const;
 
     // Debug: read the view region back and count pixels by state. Slow.
     struct DebugStats {
@@ -146,6 +158,7 @@ private:
     void freeBla();
     void syncAll();
     void resetPass(const ViewParams& view);
+    int progress_levelIndex() const;
 
     cudaExternalMemory_t extMem_ = nullptr;
     uint16_t* out_ = nullptr;   // mapped shared buffer, RGBA16F
@@ -162,6 +175,17 @@ private:
     struct PixelState* state_ = nullptr;
     FieldSample* fieldAlt_ = nullptr;
     struct ShadeInput* shadeCache_ = nullptr;  // w*h*ss*ss entries
+    uint16_t* subColour_ = nullptr;             // viewW*viewH RGBA16F, settled filter path
+    int jitterOx_ = 0, jitterOy_ = 0;           // stochastic jitter origin, follows field shifts
+    // Progress model: pixels and GPU time per coarse level of the current pass.
+    static constexpr int kLevels = 4;           // strides 8, 4, 2, 1
+    int levelPixels_[kLevels] = {};
+    float levelMs_[kLevels] = {};
+    bool levelDone_[kLevels] = {};
+    int* levelCount_ = nullptr;                 // device scratch
+    int* levelCountHost_ = nullptr;             // pinned
+    bool levelCountPending_ = false;
+    int lastActive_ = 0;
     float4* paletteLut_ = nullptr;
     struct PixelState* stateAlt_ = nullptr;
     double* refZr_ = nullptr;
