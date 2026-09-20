@@ -64,8 +64,7 @@ struct App {
     ShadeParams shade;
     bool dirty = true;  // render view changed: restart the pass
     bool animate = false;
-    float animSpeed = 0.05f;  // palette cycles per second
-    float animTime = 0.f;
+    float animTime = 0.f;  // seconds of animation elapsed (advances only while animating)
     bool dragging = false;
     // Pan inertia: velocity in pixels per second, carried after release.
     double velX = 0, velY = 0;
@@ -253,13 +252,30 @@ void mapOnto(const App& app, const View& src, int sub, int srcW, int srcH, doubl
 }
 
 // Shading presets. Each fully replaces the shading parameters.
+void setStops(ShadeParams& sp, int n, const float* pos, const float (*rgb)[3]) {
+    sp.paletteType = 0;
+    sp.stopCount = n;
+    for (int i = 0; i < n; ++i) {
+        sp.stopPos[i] = pos[i];
+        for (int k = 0; k < 3; ++k) sp.stopColor[i][k] = rgb[i][k];
+    }
+}
+
+// Shading presets. Each fully replaces the shading parameters.
+enum { PRESET_COUNT = 8 };
+const char* const kPresetNames[PRESET_COUNT] = {"classic",  "pastel lines", "relief",
+                                                "mono lines", "ocean wave", "ember panels",
+                                                "angle",    "distance"};
+
 void applyPreset(ShadeParams& sp, int which) {
     sp = ShadeParams();
     switch (which) {
-        case 1: {  // Pastel lines: pale palette, relief lighting, thin dark lines
-            const float a[3] = {0.86f, 0.84f, 0.88f}, b[3] = {0.14f, 0.16f, 0.12f};
-            const float d[3] = {0.00f, 0.25f, 0.55f};
-            for (int i = 0; i < 3; ++i) { sp.a[i] = a[i]; sp.b[i] = b[i]; sp.d[i] = d[i]; }
+        case 1: {  // Pastel lines: pale gradient, relief lighting, thin dark lines
+            const float pos[5] = {0.f, 0.25f, 0.5f, 0.75f, 1.f};
+            const float rgb[5][3] = {{0.98f, 0.80f, 0.86f}, {0.72f, 0.86f, 0.98f},
+                                     {0.99f, 0.96f, 0.72f}, {0.86f, 0.74f, 0.96f},
+                                     {0.98f, 0.80f, 0.86f}};
+            setStops(sp, 5, pos, rgb);
             sp.density = 24.f;
             sp.slopes = 1;
             sp.slopeAngle = 60.f;
@@ -274,6 +290,7 @@ void applyPreset(ShadeParams& sp, int which) {
             break;
         }
         case 2: {  // Relief: classic colours with strong slope lighting
+            sp.paletteType = 1;
             sp.slopes = 1;
             sp.slopeAngle = 30.f;
             sp.slopeHeight = 1.0f;
@@ -282,13 +299,59 @@ void applyPreset(ShadeParams& sp, int which) {
             break;
         }
         case 3: {  // Mono lines: white paper, ink lines, soft relief
-            for (int i = 0; i < 3; ++i) { sp.a[i] = 0.93f; sp.b[i] = 0.05f; }
+            const float pos[2] = {0.f, 1.f};
+            const float rgb[2][3] = {{0.96f, 0.96f, 0.96f}, {0.90f, 0.90f, 0.90f}};
+            setStops(sp, 2, pos, rgb);
             sp.slopes = 1;
             sp.slopeStrength = 0.35f;
             sp.lines = 1;
             sp.lineWidth = 1.0f;
             sp.lineStrength = 0.9f;
             sp.deStrength = 0.4f;
+            break;
+        }
+        case 4: {  // Ocean wave: blue-teal gradient with a travelling brightness wave
+            const float pos[4] = {0.f, 0.35f, 0.7f, 1.f};
+            const float rgb[4][3] = {{0.02f, 0.05f, 0.20f}, {0.05f, 0.45f, 0.75f},
+                                     {0.75f, 0.95f, 0.95f}, {0.02f, 0.05f, 0.20f}};
+            setStops(sp, 4, pos, rgb);
+            sp.mode = SHADE_WAVE;
+            sp.special = 3.f;
+            sp.waveSpeed = 0.15f;
+            sp.slopes = 1;
+            sp.slopeStrength = 0.4f;
+            break;
+        }
+        case 5: {  // Ember panels: fire gradient in flat panels with dark gaps
+            const float pos[5] = {0.f, 0.3f, 0.55f, 0.8f, 1.f};
+            const float rgb[5][3] = {{0.05f, 0.0f, 0.0f}, {0.6f, 0.05f, 0.0f},
+                                     {1.0f, 0.55f, 0.05f}, {1.0f, 0.95f, 0.6f},
+                                     {0.05f, 0.0f, 0.0f}};
+            setStops(sp, 5, pos, rgb);
+            sp.mode = SHADE_PANELS;
+            sp.special = 4.f;
+            sp.density = 48.f;
+            sp.deStrength = 0.5f;
+            break;
+        }
+        case 6: {  // Angle: escape angle over a rainbow, lit
+            sp.paletteType = 1;
+            sp.mode = SHADE_ANGLE;
+            sp.special = 1.f;
+            sp.slopes = 1;
+            sp.slopeStrength = 0.5f;
+            sp.deStrength = 0.8f;
+            break;
+        }
+        case 7: {  // Distance: greys by distance from the set, one decade per cycle
+            const float pos[3] = {0.f, 0.5f, 1.f};
+            const float rgb[3][3] = {{0.05f, 0.05f, 0.08f}, {0.55f, 0.55f, 0.6f},
+                                     {0.98f, 0.98f, 1.0f}};
+            setStops(sp, 3, pos, rgb);
+            sp.mode = SHADE_DISTANCE;
+            sp.special = 3.f;
+            sp.deStrength = 0.f;
+            sp.cycleSpeed = 0.f;
             break;
         }
         default:
@@ -416,14 +479,75 @@ void drawUi(App& app) {
         if (ImGui::CollapsingHeader("Shading")) {
             ShadeParams& sp = app.shade;
             ImGui::TextDisabled("presets");
+            for (int i = 0; i < PRESET_COUNT; ++i) {
+                if (i % 4 != 0) ImGui::SameLine();
+                if (ImGui::SmallButton(kPresetNames[i])) applyPreset(sp, i);
+            }
+            const char* modes[] = {"smooth", "log steps", "wave", "panels", "angle", "distance"};
+            ImGui::Combo("mode", &sp.mode, modes, SHADE_MODE_COUNT);
+            if (sp.mode == SHADE_LOGSTEPS || sp.mode == SHADE_WAVE || sp.mode == SHADE_PANELS) {
+                ImGui::SliderFloat("per cycle", &sp.special, 1.f, 16.f, "%.1f");
+            } else if (sp.mode == SHADE_ANGLE) {
+                ImGui::SliderFloat("cycles per turn", &sp.special, 0.25f, 8.f, "%.2f");
+            } else if (sp.mode == SHADE_DISTANCE) {
+                ImGui::SliderFloat("decades per cycle", &sp.special, 0.5f, 8.f, "%.1f");
+            }
+            ImGui::SliderFloat("density", &sp.density, 4.f, 1024.f, "%.1f",
+                               ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("offset", &sp.offset, 0.f, 1.f);
+            bool logScale = sp.logScale != 0;
+            if (ImGui::Checkbox("log scale", &logScale)) sp.logScale = logScale;
+
+            ImGui::SeparatorText("palette");
+            ImGui::RadioButton("gradient", &sp.paletteType, 0);
             ImGui::SameLine();
-            if (ImGui::SmallButton("classic")) applyPreset(sp, 0);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("pastel lines")) applyPreset(sp, 1);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("relief")) applyPreset(sp, 2);
-            ImGui::SameLine();
-            if (ImGui::SmallButton("mono lines")) applyPreset(sp, 3);
+            ImGui::RadioButton("cosine", &sp.paletteType, 1);
+            if (sp.paletteType == 0) {
+                for (int i = 0; i < sp.stopCount; ++i) {
+                    ImGui::PushID(i);
+                    ImGui::ColorEdit3("##c", sp.stopColor[i],
+                                      ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_Float);
+                    ImGui::SameLine();
+                    ImGui::SetNextItemWidth(140 * app.uiScale);
+                    const float lo = i == 0 ? 0.f : sp.stopPos[i - 1];
+                    const float hi = i == sp.stopCount - 1 ? 1.f : sp.stopPos[i + 1];
+                    if (i == 0 || i == sp.stopCount - 1) {
+                        ImGui::TextDisabled(i == 0 ? "start" : "end");
+                    } else {
+                        ImGui::SliderFloat("##p", &sp.stopPos[i], lo, hi, "%.2f");
+                    }
+                    if (sp.stopCount > 2 && i > 0 && i < sp.stopCount - 1) {
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton("x")) {
+                            for (int k = i; k + 1 < sp.stopCount; ++k) {
+                                sp.stopPos[k] = sp.stopPos[k + 1];
+                                for (int c = 0; c < 3; ++c) sp.stopColor[k][c] = sp.stopColor[k + 1][c];
+                            }
+                            --sp.stopCount;
+                        }
+                    }
+                    ImGui::PopID();
+                }
+                if (sp.stopCount < MAX_STOPS && ImGui::SmallButton("add stop")) {
+                    // Insert halfway between the last two stops, averaging their colours.
+                    const int n = sp.stopCount;
+                    sp.stopPos[n] = sp.stopPos[n - 1];
+                    for (int c = 0; c < 3; ++c) sp.stopColor[n][c] = sp.stopColor[n - 1][c];
+                    sp.stopPos[n - 1] = 0.5f * (sp.stopPos[n - 2] + sp.stopPos[n]);
+                    for (int c = 0; c < 3; ++c)
+                        sp.stopColor[n - 1][c] = 0.5f * (sp.stopColor[n - 2][c] + sp.stopColor[n][c]);
+                    ++sp.stopCount;
+                }
+            } else {
+                ImGui::TextDisabled("a + b cos(2pi(c t + d))");
+                ImGui::DragFloat3("a", sp.a, 0.01f, -1.f, 2.f);
+                ImGui::DragFloat3("b", sp.b, 0.01f, -1.f, 2.f);
+                ImGui::DragFloat3("c", sp.c, 0.01f, -4.f, 4.f);
+                ImGui::DragFloat3("d", sp.d, 0.01f, -1.f, 1.f);
+            }
+            ImGui::ColorEdit3("inside", sp.inside, ImGuiColorEditFlags_Float);
+
+            ImGui::SeparatorText("effects");
             bool slopes = sp.slopes != 0;
             if (ImGui::Checkbox("slope light", &slopes)) sp.slopes = slopes;
             if (slopes) {
@@ -440,23 +564,14 @@ void drawUi(App& app) {
                 ImGui::SliderFloat("opacity", &sp.lineStrength, 0.f, 1.f);
                 ImGui::ColorEdit3("line colour", sp.lineColor, ImGuiColorEditFlags_Float);
             }
-            ImGui::Checkbox("animate", &app.animate);
-            ImGui::SameLine();
-            ImGui::SliderFloat("speed", &app.animSpeed, -1.f, 1.f, "%.3f cyc/s");
-            ImGui::SliderFloat("density", &sp.density, 4.f, 1024.f, "%.1f",
-                               ImGuiSliderFlags_Logarithmic);
-            ImGui::SliderFloat("offset", &sp.offset, 0.f, 1.f);
-            bool logScale = sp.logScale != 0;
-            if (ImGui::Checkbox("log scale", &logScale)) sp.logScale = logScale;
             ImGui::SliderFloat("edge (DE)", &sp.deStrength, 0.f, 4.f);
             ImGui::SliderFloat("exposure", &sp.exposure, 0.f, 4.f);
-            ImGui::ColorEdit3("inside", sp.inside, ImGuiColorEditFlags_Float);
-            ImGui::TextDisabled("palette a + b cos(2pi(c t + d))");
-            ImGui::DragFloat3("a", sp.a, 0.01f, -1.f, 2.f);
-            ImGui::DragFloat3("b", sp.b, 0.01f, -1.f, 2.f);
-            ImGui::DragFloat3("c", sp.c, 0.01f, -4.f, 4.f);
-            ImGui::DragFloat3("d", sp.d, 0.01f, -1.f, 1.f);
-            if (ImGui::Button("reset palette")) sp = ShadeParams();
+
+            ImGui::SeparatorText("animation");
+            ImGui::Checkbox("animate", &app.animate);
+            ImGui::SliderFloat("palette cyc/s", &sp.cycleSpeed, -1.f, 1.f, "%.3f");
+            ImGui::SliderFloat("light deg/s", &sp.lightSpeed, -90.f, 90.f, "%.1f");
+            ImGui::SliderFloat("wave cyc/s", &sp.waveSpeed, -2.f, 2.f, "%.2f");
         }
     }
     ImGui::End();
@@ -550,7 +665,7 @@ int main(int argc, char** argv) {
         const double dt = (double)(now - lastTick) / (double)SDL_GetPerformanceFrequency();
         lastTick = now;
         if (dt > 0) app.fps = 0.9 * app.fps + 0.1 * (1.0 / dt);
-        if (app.animate) app.animTime += (float)dt * app.animSpeed;
+        if (app.animate) app.animTime += (float)dt;
         applyInertia(app, dt);
 
         int pw = 0, ph = 0;
