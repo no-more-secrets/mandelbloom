@@ -10,6 +10,7 @@
 //   drag:DX,DY,STEPS   left-drag by DX,DY pixels over STEPS frames
 //   pan:DX,DY          pan by DX,DY pixels directly (no drag, no inertia)
 //   animate:0|1        turn shading animation off/on
+//   screenshot:1|2     as F2 (1) or Shift+F2 (2)
 //   shot:PATH          save the current frame as PNG
 //   quit               exit the app
 // Wheel and drag events are posted through SDL so the normal handlers run.
@@ -26,6 +27,7 @@ public:
     // to capture this frame (empty if none) and sets quit when done.
     std::string tick(double nowSec, int winW, int winH, bool& quit);
     // Set when the last tick issued a direct pan; consumed by the caller.
+    int takeScreenshot() { const int a = shotReq_; shotReq_ = 0; return a; }  // 0 none, 1 png, 2 png+exr
     int takeAnimate() { const int a = animate_; animate_ = -1; return a; }  // -1 = no change
     bool takePan(int& dx, int& dy) {
         if (!panPending_) return false;
@@ -45,5 +47,6 @@ private:
     bool started_ = false;
     bool panPending_ = false;
     int animate_ = -1;
+    int shotReq_ = 0;
     int panDx_ = 0, panDy_ = 0;
 };

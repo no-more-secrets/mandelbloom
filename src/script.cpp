@@ -123,6 +123,10 @@ std::string Script::tick(double now, int winW, int winH, bool& quit) {
             panPending_ = true;
             waitUntil_ = now + 0.016;
             return "";
+        } else if (s.cmd == "screenshot") {
+            shotReq_ = std::atoi(s.arg.c_str()) >= 2 ? 2 : 1;
+            waitUntil_ = now + 0.016;
+            return "";
         } else if (s.cmd == "animate") {
             animate_ = std::atoi(s.arg.c_str()) ? 1 : 0;
             waitUntil_ = now + 0.016;

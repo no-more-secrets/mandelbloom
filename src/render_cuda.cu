@@ -671,6 +671,34 @@ bool CudaRenderer::syncDisplay() {
     return true;
 }
 
+bool CudaRenderer::readOutputLinear(std::vector<float>& rgb) {
+    if (!out_) return false;
+    CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)dispStream_));
+    const size_t n = (size_t)outPitchPx_ * height_ * 4;
+    std::vector<uint16_t> h(n);
+    CUDA_CHECK(cudaMemcpy(h.data(), out_, n * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    rgb.resize((size_t)width_ * height_ * 3);
+    auto halfToFloat = [](uint16_t v) {
+        const uint32_t sgn = (v >> 15) & 1u, exp = (v >> 10) & 0x1Fu, man = v & 0x3FFu;
+        float f;
+        if (exp == 0) f = std::ldexp((float)man, -24);
+        else if (exp == 31) f = man ? 0.f : 1e30f;
+        else f = std::ldexp((float)(man | 0x400u), (int)exp - 25);
+        return sgn ? -f : f;
+    };
+    const float inv = outScale_ > 0.f ? 1.f / outScale_ : 1.f;
+    for (int y = 0; y < height_; ++y) {
+        for (int x = 0; x < width_; ++x) {
+            const uint16_t* px = h.data() + ((size_t)y * outPitchPx_ + x) * 4;
+            float* o = rgb.data() + ((size_t)y * width_ + x) * 3;
+            o[0] = halfToFloat(px[0]) * inv;
+            o[1] = halfToFloat(px[1]) * inv;
+            o[2] = halfToFloat(px[2]) * inv;
+        }
+    }
+    return true;
+}
+
 bool CudaRenderer::readOutput(std::vector<uint32_t>& rgba8) {
     if (!out_) return false;
     CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)dispStream_));

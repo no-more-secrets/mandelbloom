@@ -7,6 +7,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 #include "bigfloat.h"
@@ -96,6 +99,10 @@ struct App {
     float inertiaTau = 0.25f;  // seconds for the velocity to fall to 37%
     bool showUi = true;
     bool fullscreen = false;
+    int screenshotRequest = 0;   // 1 = PNG, 2 = PNG + EXR; handled after present
+    std::string toast;
+    double toastUntil = 0.0;
+    std::string lastShotPath;
     char presetName[64] = "my preset";
     std::vector<std::string> savedPresets;
     bool savedPresetsValid = false;
@@ -353,6 +360,64 @@ void applyPresetTo(App& app, const Preset& p) {
 
 void applyPreset(App& app, int which) { applyPresetTo(app, builtinPreset(which)); }
 
+// Save the current output. PNG: SDR, sRGB, highlights above SDR white
+// rolled off softly. EXR: linear, 1.0 = SDR white, headroom preserved.
+void takeScreenshot(App& app, bool alsoExr) {
+    std::vector<float> lin;
+    if (!app.renderer.readOutputLinear(lin)) {
+        app.toast = "screenshot failed";
+        app.toastUntil = nowSeconds() + 3.0;
+        return;
+    }
+    const int w = app.view.width / app.ss, h = app.view.height / app.ss;
+    const char* picsC = SDL_GetUserFolder(SDL_FOLDER_PICTURES);  // owned by SDL
+    std::string dir = picsC ? picsC : "";
+    dir += "mandelgpu";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::time_t t = std::time(nullptr);
+    char stamp[32];
+    std::tm tmv{};
+    localtime_s(&tmv, &t);
+    std::strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", &tmv);
+    const double zoom = 3.2 / (app.render.scale * w);
+    char base[128];
+    std::snprintf(base, sizeof base, "mandel_%s_%.2e", stamp, zoom);
+    const std::string stem = dir + "/" + base;
+
+    // Soft roll-off: linear below the knee, asymptotic to 1 above it.
+    const float knee = 0.8f;
+    auto roll = [&](float v) {
+        if (v <= knee) return v;
+        const float x = (v - knee) / (1.f - knee);
+        return knee + (1.f - knee) * (x / (1.f + x));
+    };
+    auto enc = [](float v) {
+        v = std::min(std::max(v, 0.f), 1.f);
+        v = v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
+        return (uint32_t)(v * 255.f + 0.5f);
+    };
+    std::vector<uint32_t> px((size_t)w * h);
+    for (size_t i = 0; i < px.size(); ++i) {
+        const float* c = lin.data() + i * 3;
+        px[i] = enc(roll(c[0])) | (enc(roll(c[1])) << 8) | (enc(roll(c[2])) << 16) | 0xFF000000u;
+    }
+    bool ok = writePng((stem + ".png").c_str(), px.data(), w, h);
+    if (alsoExr) ok = writeExr((stem + ".exr").c_str(), lin.data(), w, h) && ok;
+    {
+        // Location file so the shot can be revisited from the command line.
+        std::ofstream loc(stem + ".txt");
+        const int dg = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
+        loc << app.render.cx.toString(dg) << " " << app.render.cy.toString(dg) << " "
+            << app.render.scale << " " << app.view.maxIter << "\n";
+    }
+    app.lastShotPath = stem;
+    app.toast = ok ? std::string("saved ") + base + (alsoExr ? ".png + .exr" : ".png")
+                   : "screenshot failed";
+    app.toastUntil = nowSeconds() + 4.0;
+    std::printf("screenshot %s ok=%d\n", stem.c_str(), ok ? 1 : 0);
+}
+
 void setFullscreen(App& app, bool on) {
     app.fullscreen = on;
     SDL_SetWindowFullscreen(app.window, on);
@@ -378,6 +443,7 @@ bool handleEvent(App& app, const SDL_Event& e) {
             if (e.key.key == SDLK_R) resetView(app);
             if (e.key.key == SDLK_TAB) app.showUi = !app.showUi;
             if (e.key.key == SDLK_F11) setFullscreen(app, !app.fullscreen);
+            if (e.key.key == SDLK_F2) app.screenshotRequest = (e.key.mod & SDL_KMOD_SHIFT) ? 2 : 1;
             break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
             if (io.WantCaptureMouse) break;
@@ -518,6 +584,7 @@ void drawUi(App& app) {
         ImGui::SetNextItemWidth(100 * app.uiScale);
         ImGui::SliderFloat("##itau", &app.inertiaTau, 0.05f, 1.0f, "%.2f s");
         ImGui::TextDisabled("drag: pan  wheel: zoom  R: reset  Tab: hide  F11: fullscreen");
+        ImGui::TextDisabled("F2: screenshot PNG   Shift+F2: PNG + EXR");
 
         if (ImGui::CollapsingHeader("Shading")) {
             ShadeParams& sp = app.shade;
@@ -1002,6 +1069,16 @@ int main(int argc, char** argv) {
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
         drawUi(app);
+        if (!app.toast.empty() && nowSeconds() < app.toastUntil) {
+            ImGui::SetNextWindowPos(ImVec2(pw * 0.5f, ph - 40 * app.uiScale), ImGuiCond_Always,
+                                    ImVec2(0.5f, 1.f));
+            ImGui::SetNextWindowBgAlpha(0.8f);
+            ImGui::Begin("##toast", nullptr,
+                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                             ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoSavedSettings);
+            ImGui::TextUnformatted(app.toast.c_str());
+            ImGui::End();
+        }
         ImGui::Render();
 
         // CUDA must be done writing the output before D3D12 copies it.
@@ -1014,6 +1091,8 @@ int main(int argc, char** argv) {
                 if (script.takePan(pdx, pdy)) panPixels(app, pdx, pdy);
                 const int an = script.takeAnimate();
                 if (an >= 0) app.animate = an != 0;
+                const int sr = script.takeScreenshot();
+                if (sr) app.screenshotRequest = sr;
             }
             const std::string shot = script.tick(
                 (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency(), pw,
@@ -1060,6 +1139,10 @@ int main(int argc, char** argv) {
             if (quit) running = false;
         }
         app.display.present(ImGui::GetDrawData(), app.vsync, app.sdrWhite);
+        if (app.screenshotRequest) {
+            takeScreenshot(app, app.screenshotRequest == 2);
+            app.screenshotRequest = 0;
+        }
     }
 
     app.display.imguiShutdown();

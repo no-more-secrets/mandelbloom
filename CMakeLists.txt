@@ -12,6 +12,7 @@ find_package(SDL3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_package(Stb REQUIRED)
+find_package(tinyexr CONFIG REQUIRED)
 find_path(MPFR_INCLUDE_DIR mpfr.h REQUIRED)
 find_library(MPFR_LIBRARY NAMES mpfr REQUIRED)
 find_library(GMP_LIBRARY NAMES gmp REQUIRED)
@@ -36,6 +37,7 @@ target_link_libraries(mandelgpu PRIVATE
   d3dcompiler
   CUDA::cudart
   ${MPFR_LIBRARY}
+  unofficial::tinyexr::tinyexr
   ${GMP_LIBRARY}
 )
 target_compile_definitions(mandelgpu PRIVATE SDL_MAIN_HANDLED NOMINMAX WIN32_LEAN_AND_MEAN)

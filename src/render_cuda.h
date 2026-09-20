@@ -85,6 +85,9 @@ public:
     bool syncDisplay();
     // Read the output back as 8-bit sRGB (divided by the output scale).
     bool readOutput(std::vector<uint32_t>& rgba8);
+    // Read the output back as linear RGB floats relative to SDR white
+    // (1.0 = SDR white; values above 1 are HDR headroom).
+    bool readOutputLinear(std::vector<float>& rgb);
     // Upload a new reference orbit (host arrays of `length` doubles).
     bool uploadReference(const double* zr, const double* zi, int length, bool escaped);
     // Upload a BLA table built for the current reference and view.
