@@ -38,4 +38,6 @@ if(MSVC)
 endif()
 target_compile_options(mandelgpu PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo --expt-relaxed-constexpr>)
-set_target_properties(mandelgpu PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+set(MANDELGPU_OUTPUT_NAME "mandelgpu" CACHE STRING "Executable name (lets a test build coexist with a running one)")
+set_target_properties(mandelgpu PROPERTIES CUDA_SEPARABLE_COMPILATION OFF
+                                           OUTPUT_NAME "${MANDELGPU_OUTPUT_NAME}")

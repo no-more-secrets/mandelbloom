@@ -3,6 +3,7 @@
 #include <cuda_gl_interop.h>
 #include <cstdio>
 #include <cmath>
+#include <utility>
 #include "render_cuda.h"
 #include "bla.h"
 #include "shade.cuh"
@@ -38,6 +39,35 @@ __global__ void resetState(PixelState* __restrict__ st, FieldSample* __restrict_
     s.iter = 0.f;
     s.pad = 1.f;  // pending
     field[i] = s;
+}
+
+// Reset only pixels that have not finished (their dz referred to an old
+// reference orbit).
+__global__ void resetPendingState(PixelState* __restrict__ st, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    if (st[i].status == 0) st[i] = PixelState{};
+}
+
+// dst(x, y) = src(x + dx, y + dy), pending where the source is off-image.
+__global__ void shiftKernel(const PixelState* __restrict__ srcS, const FieldSample* __restrict__ srcF,
+                            PixelState* __restrict__ dstS, FieldSample* __restrict__ dstF, int w,
+                            int h, int dx, int dy) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const int sx = x + dx, sy = y + dy;
+    const size_t di = (size_t)y * w + x;
+    if (sx >= 0 && sx < w && sy >= 0 && sy < h) {
+        const size_t si = (size_t)sy * w + sx;
+        dstS[di] = srcS[si];
+        dstF[di] = srcF[si];
+    } else {
+        dstS[di] = PixelState{};
+        FieldSample s{};
+        s.pad = 1.f;
+        dstF[di] = s;
+    }
 }
 
 __device__ __forceinline__ void writeSample(FieldSample* __restrict__ field, size_t idx,
@@ -90,7 +120,8 @@ __device__ __forceinline__ unsigned long long globalTimerNs() {
 __global__ void stampTimer(unsigned long long* __restrict__ out) { *out = globalTimerNs(); }
 
 __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __restrict__ field,
-                             int w, int h, int stride, double scale, int maxIter, int sliceIters,
+                             int w, int h, int stride, double scale, double refOffX,
+                             double refOffY, int maxIter, int sliceIters,
                              const unsigned long long* __restrict__ startNs,
                              unsigned long long budgetNs, DeviceReference ref, DeviceBla bla,
                              int* __restrict__ activeCount) {
@@ -104,8 +135,8 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
     bool active = inBounds && st.status == 0;
 
     if (active) {
-        const double dcr = ((double)x - 0.5 * w) * scale;
-        const double dci = -((double)y - 0.5 * h) * scale;
+        const double dcr = refOffX + ((double)x - 0.5 * w) * scale;
+        const double dci = refOffY - ((double)y - 0.5 * h) * scale;
         double dzr = st.dzr, dzi = st.dzi, dr = st.dr, di = st.di;
         int m = st.m, n = st.n;
         double zr = 0.0, zi = 0.0;
@@ -198,12 +229,8 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
     if ((threadIdx.x & 31) == 0 && mask) atomicAdd(activeCount, __popc(mask));
 }
 
-__global__ void shadeKernel(const FieldSample* __restrict__ field, uint32_t* __restrict__ out,
-                            int w, int h, ShadeParams p, float timeSec, float pixelScale,
-                            int fillStride) {
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= w || y >= h) return;
+__device__ __forceinline__ FieldSample fetchFilled(const FieldSample* __restrict__ field, int w,
+                                                   int x, int y, int fillStride) {
     const size_t idx = (size_t)y * w + x;
     FieldSample s = field[idx];
     if (s.pad > 0.5f && fillStride > 1) {
@@ -211,7 +238,55 @@ __global__ void shadeKernel(const FieldSample* __restrict__ field, uint32_t* __r
         const int bx = x - (x % fillStride), by = y - (y % fillStride);
         s = field[(size_t)by * w + bx];
     }
-    out[idx] = packSRGB8(shadeSample(s, p, timeSec, pixelScale));
+    return s;
+}
+
+__global__ void shadeKernel(const FieldSample* __restrict__ field, uint32_t* __restrict__ out,
+                            int w, int h, ShadeParams p, float timeSec, float pixelScale,
+                            int fillStride) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const FieldSample s = fetchFilled(field, w, x, y, fillStride);
+    out[(size_t)y * w + x] = packSRGB8(shadeSample(s, p, timeSec, pixelScale));
+}
+
+__device__ __forceinline__ float4 unpack(uint32_t c) {
+    return make_float4((float)(c & 255u), (float)((c >> 8) & 255u), (float)((c >> 16) & 255u), 1.f);
+}
+
+__global__ void reprojectKernel(const FieldSample* __restrict__ field,
+                                const uint32_t* __restrict__ old, uint32_t* __restrict__ out, int w,
+                                int h, ShadeParams p, float timeSec, float pixelScale,
+                                int fillStride, double ox, double oy, double ratio) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t idx = (size_t)y * w + x;
+    const FieldSample s = fetchFilled(field, w, x, y, fillStride);
+    const bool haveNew = s.pad < 0.5f;
+    const double u = ox + ((double)x - 0.5 * w) * ratio;
+    const double v = oy + ((double)y - 0.5 * h) * ratio;
+    const bool haveOld = u >= 0.0 && v >= 0.0 && u <= (double)(w - 1) && v <= (double)(h - 1);
+    if (haveOld) {
+        // Bilinear sample of the old frame.
+        const int x0 = (int)u, y0 = (int)v;
+        const int x1 = min(x0 + 1, w - 1), y1 = min(y0 + 1, h - 1);
+        const float fx = (float)(u - x0), fy = (float)(v - y0);
+        const float4 a = unpack(old[(size_t)y0 * w + x0]), b = unpack(old[(size_t)y0 * w + x1]);
+        const float4 c = unpack(old[(size_t)y1 * w + x0]), d = unpack(old[(size_t)y1 * w + x1]);
+        const float r = (a.x * (1 - fx) + b.x * fx) * (1 - fy) + (c.x * (1 - fx) + d.x * fx) * fy;
+        const float g = (a.y * (1 - fx) + b.y * fx) * (1 - fy) + (c.y * (1 - fx) + d.y * fx) * fy;
+        const float bl = (a.z * (1 - fx) + b.z * fx) * (1 - fy) + (c.z * (1 - fx) + d.z * fx) * fy;
+        out[idx] = (uint32_t)(r + 0.5f) | ((uint32_t)(g + 0.5f) << 8) |
+                   ((uint32_t)(bl + 0.5f) << 16) | 0xFF000000u;
+        return;
+    }
+    if (haveNew) {
+        out[idx] = packSRGB8(shadeSample(s, p, timeSec, pixelScale));
+        return;
+    }
+    out[idx] = 0xFF000000u;
 }
 
 }  // namespace
@@ -271,8 +346,12 @@ void CudaRenderer::freeField() {
     if (stream_) cudaStreamSynchronize((cudaStream_t)stream_);
     if (field_) cudaFree(field_);
     if (state_) cudaFree(state_);
-    field_ = nullptr;
-    state_ = nullptr;
+    if (fieldAlt_) cudaFree(fieldAlt_);
+    if (stateAlt_) cudaFree(stateAlt_);
+    if (lastImage_) cudaFree(lastImage_);
+    field_ = fieldAlt_ = nullptr;
+    state_ = stateAlt_ = nullptr;
+    lastImage_ = nullptr;
     iterDone_ = true;
     sliceInFlight_ = false;
 }
@@ -348,6 +427,10 @@ bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height) {
                                             cudaGraphicsRegisterFlagsWriteDiscard));
     CUDA_CHECK(cudaMalloc(&field_, sizeof(FieldSample) * (size_t)width * height));
     CUDA_CHECK(cudaMalloc(&state_, sizeof(PixelState) * (size_t)width * height));
+    CUDA_CHECK(cudaMalloc(&fieldAlt_, sizeof(FieldSample) * (size_t)width * height));
+    CUDA_CHECK(cudaMalloc(&stateAlt_, sizeof(PixelState) * (size_t)width * height));
+    CUDA_CHECK(cudaMalloc(&lastImage_, sizeof(uint32_t) * (size_t)width * height));
+    CUDA_CHECK(cudaMemset(lastImage_, 0, sizeof(uint32_t) * (size_t)width * height));
     return true;
 }
 
@@ -369,6 +452,46 @@ bool CudaRenderer::beginIterate(const ViewParams& view) {
     const int count = width_ * height_;
     resetState<<<(count + 255) / 256, 256, 0, stream>>>(state_, field_, count);
     CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool CudaRenderer::shiftAndResume(const ViewParams& view, int dx, int dy) {
+    if (!field_ || !state_ || view.width != width_ || view.height != height_) return false;
+    cudaStream_t stream = (cudaStream_t)stream_;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (dx != 0 || dy != 0) {
+        const dim3 block(32, 8);
+        const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
+        shiftKernel<<<grid, block, 0, stream>>>(state_, field_, stateAlt_, fieldAlt_, width_,
+                                                height_, dx, dy);
+        CUDA_CHECK(cudaGetLastError());
+        std::swap(state_, stateAlt_);
+        std::swap(field_, fieldAlt_);
+    }
+    iterView_ = view;
+    bla_.enabled = view.useBla ? 1 : 0;
+    sliceStart_ = 0;
+    sliceInFlight_ = false;
+    stride_ = firstStride_;
+    completedStride_ = 0;
+    iterDone_ = false;
+    return true;
+}
+
+bool CudaRenderer::restartPending(const ViewParams& view) {
+    if (!field_ || !state_) return false;
+    cudaStream_t stream = (cudaStream_t)stream_;
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int count = width_ * height_;
+    resetPendingState<<<(count + 255) / 256, 256, 0, stream>>>(state_, count);
+    CUDA_CHECK(cudaGetLastError());
+    iterView_ = view;
+    bla_.enabled = view.useBla ? 1 : 0;
+    sliceStart_ = 0;
+    sliceInFlight_ = false;
+    stride_ = firstStride_;
+    completedStride_ = 0;
+    iterDone_ = false;
     return true;
 }
 
@@ -410,7 +533,8 @@ bool CudaRenderer::stepIterate() {
     cudaEventRecord((cudaEvent_t)evStart_, stream);
     stampTimer<<<1, 1, 0, stream>>>(sliceStart_ns_);
     iterateSlice<<<grid, block, 0, stream>>>(state_, field_, width_, height_, stride_,
-                                             iterView_.scale, iterView_.maxIter, sliceIters_,
+                                             iterView_.scale, iterView_.refOffX, iterView_.refOffY,
+                                             iterView_.maxIter, sliceIters_,
                                              sliceStart_ns_,
                                              50ull * 1000000ull, ref_, bla_, activeCount_);
     CUDA_CHECK(cudaGetLastError());
@@ -447,6 +571,8 @@ bool CudaRenderer::shade(const ShadeParams& params, float timeSec, double pixelS
     shadeKernel<<<grid, block, 0, stream>>>(field_, devPtr, width_, height_, params, timeSec,
                                             (float)pixelScale, fillStride);
     err = cudaGetLastError();
+    cudaMemcpyAsync(lastImage_, devPtr, sizeof(uint32_t) * (size_t)width_ * height_,
+                    cudaMemcpyDeviceToDevice, stream);
     if (!shadePending_) {
         cudaEventRecord((cudaEvent_t)evShadeB_, stream);
         shadePending_ = true;
@@ -455,6 +581,44 @@ bool CudaRenderer::shade(const ShadeParams& params, float timeSec, double pixelS
     CUDA_CHECK(cudaGraphicsUnmapResources(1, &pboResource_, stream));
     if (err != cudaSuccess) {
         std::fprintf(stderr, "shade kernel failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool CudaRenderer::reproject(const ShadeParams& params, float timeSec, double pixelScale,
+                             int fillStride, double ox, double oy, double ratio) {
+    if (!pboResource_ || !field_) return false;
+    cudaStream_t stream = (cudaStream_t)stream_;
+    CUDA_CHECK(cudaGraphicsMapResources(1, &pboResource_, stream));
+    uint32_t* devPtr = nullptr;
+    size_t bytes = 0;
+    cudaError_t err = cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &bytes, pboResource_);
+    if (err != cudaSuccess) {
+        cudaGraphicsUnmapResources(1, &pboResource_, stream);
+        std::fprintf(stderr, "map failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    const dim3 block(16, 16);
+    const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
+    // Timing of the previous shade, harvested without blocking.
+    if (shadePending_ && cudaEventQuery((cudaEvent_t)evShadeB_) == cudaSuccess) {
+        cudaEventElapsedTime(&shadeMs_, (cudaEvent_t)evShadeA_, (cudaEvent_t)evShadeB_);
+        shadePending_ = false;
+    }
+    if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
+    reprojectKernel<<<grid, block, 0, stream>>>(field_, lastImage_, devPtr, width_, height_,
+                                                params, timeSec, (float)pixelScale, fillStride,
+                                                ox, oy, ratio);
+    err = cudaGetLastError();
+    if (!shadePending_) {
+        cudaEventRecord((cudaEvent_t)evShadeB_, stream);
+        shadePending_ = true;
+    }
+    // Unmap is stream-ordered; later GL calls wait for it without a host sync.
+    CUDA_CHECK(cudaGraphicsUnmapResources(1, &pboResource_, stream));
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "reproject kernel failed: %s\n", cudaGetErrorString(err));
         return false;
     }
     return true;

@@ -23,7 +23,10 @@ struct App {
     GlDisplay display;
     CudaRenderer renderer;
     ViewParams view;
-    BigFloat cx{64}, cy{64};   // view centre = reference parameter
+    BigFloat cx{64}, cy{64};   // view centre
+    BigFloat refCx{64}, refCy{64};  // reference orbit centre (kept across pans)
+    int panDx = 0, panDy = 0;  // accumulated pan this frame, field pixels
+    bool panDirty = false;
     ReferenceOrbit ref;
     BlaTable bla;
     float blaEpsLog2 = -24.f;
@@ -96,23 +99,18 @@ void resetView(App& app) {
     app.dirty = true;
 }
 
-// Texture coordinates that place the shown frame under the current view.
-void reprojectUv(const App& app, float& u0, float& v0, float& u1, float& v1) {
+// Where the current view's centre lands in the shown frame (old pixels) and
+// how many old pixels one new pixel spans.
+void reprojectMapping(const App& app, double& ox, double& oy, double& ratio) {
     const auto& sh = app.shown;
-    if (!sh.valid || app.showingNewPass) {
-        u0 = v0 = 0.f;
-        u1 = v1 = 1.f;
+    if (!sh.valid) {
+        ox = oy = -1e9;  // nothing valid: everything off-frame
+        ratio = 1.0;
         return;
     }
-    const double ratio = app.view.scale / sh.scale;  // new pixel in old pixels
-    const double dx = BigFloat::diff(app.cx, sh.cx) / sh.scale;   // centre shift, old px
-    const double dy = -BigFloat::diff(app.cy, sh.cy) / sh.scale;
-    const double ox = 0.5 * sh.width + dx, oy = 0.5 * sh.height + dy;
-    const double hx = 0.5 * app.view.width, hy = 0.5 * app.view.height;
-    u0 = (float)((ox - hx * ratio) / sh.width);
-    v0 = (float)((oy - hy * ratio) / sh.height);
-    u1 = (float)((ox + hx * ratio) / sh.width);
-    v1 = (float)((oy + hy * ratio) / sh.height);
+    ratio = app.view.scale / sh.scale;
+    ox = 0.5 * sh.width + BigFloat::diff(app.cx, sh.cx) / sh.scale;
+    oy = 0.5 * sh.height - BigFloat::diff(app.cy, sh.cy) / sh.scale;
 }
 
 void markShown(App& app) {
@@ -140,15 +138,32 @@ bool newPassWorthShowing(const App& app) {
 
 // Recompute the reference orbit at the current centre, build its BLA
 // table for this view, and hand both to the GPU.
-void rebuildReference(App& app) {
-    computeReference(app.cx, app.cy, app.view.maxIter, 65536.0, app.ref);
-    app.renderer.uploadReference(app.ref.zr.data(), app.ref.zi.data(), app.ref.length,
-                                 app.ref.escaped);
-    const double cMax = 0.5 * std::hypot((double)app.view.width, (double)app.view.height) *
-                        app.view.scale;
+// Half the image diagonal in complex units.
+double halfDiagonal(const App& app) {
+    return 0.5 * std::hypot((double)app.view.width, (double)app.view.height) * app.view.scale;
+}
+
+// View centre relative to the reference centre, into the view params.
+void updateRefOffset(App& app) {
+    app.view.refOffX = BigFloat::diff(app.cx, app.refCx);
+    app.view.refOffY = BigFloat::diff(app.cy, app.refCy);
+}
+
+void rebuildBla(App& app) {
+    const double cMax = halfDiagonal(app) + std::hypot(app.view.refOffX, app.view.refOffY);
     buildBla(app.ref, cMax, std::exp2((double)app.blaEpsLog2), app.bla);
     app.renderer.uploadBla(app.bla.nodes.data(), (int)app.bla.nodes.size(),
                            app.bla.levelOffset.data(), app.bla.levels, app.bla.steps);
+}
+
+void rebuildReference(App& app) {
+    app.refCx = app.cx;
+    app.refCy = app.cy;
+    updateRefOffset(app);
+    computeReference(app.refCx, app.refCy, app.view.maxIter, 65536.0, app.ref);
+    app.renderer.uploadReference(app.ref.zr.data(), app.ref.zi.data(), app.ref.length,
+                                 app.ref.escaped);
+    rebuildBla(app);
 }
 
 bool handleEvent(App& app, const SDL_Event& e) {
@@ -176,9 +191,13 @@ bool handleEvent(App& app, const SDL_Event& e) {
             break;
         case SDL_EVENT_MOUSE_MOTION:
             if (app.dragging && !io.WantCaptureMouse) {
-                app.cx.subDouble(e.motion.xrel * app.view.scale);
-                app.cy.addDouble(e.motion.yrel * app.view.scale);
-                app.dirty = true;
+                const int dx = (int)e.motion.xrel, dy = (int)e.motion.yrel;
+                app.cx.subDouble(dx * app.view.scale);
+                app.cy.addDouble(dy * app.view.scale);
+                // Content moves with the mouse: new pixel x shows old pixel x - dx.
+                app.panDx -= dx;
+                app.panDy -= dy;
+                app.panDirty = true;
             }
             break;
         case SDL_EVENT_MOUSE_WHEEL: {
@@ -345,10 +364,28 @@ int main(int argc, char** argv) {
             app.dirty = true;
         }
 
+        if (app.panDirty && !app.dirty && pw > 0 && ph > 0) {
+            // Shift what we have, keep the reference unless we drifted more
+            // than a view radius from it, and continue on the exposed strip.
+            updateRefOffset(app);
+            app.renderer.shiftAndResume(app.view, app.panDx, app.panDy);
+            if (std::hypot(app.view.refOffX, app.view.refOffY) > halfDiagonal(app)) {
+                rebuildReference(app);
+                app.renderer.restartPending(app.view);
+            } else {
+                rebuildBla(app);
+            }
+            app.showingNewPass = true;
+            app.shadeDirty = true;
+            app.panDx = app.panDy = 0;
+            app.panDirty = false;
+        }
         if (app.dirty && pw > 0 && ph > 0) {
             rebuildReference(app);
             app.renderer.beginIterate(app.view);
             app.showingNewPass = false;
+            app.panDx = app.panDy = 0;
+            app.panDirty = false;
             app.dirty = false;
         }
         // One slice in flight at a time. Shade only when the stream is idle so
@@ -370,6 +407,16 @@ int main(int argc, char** argv) {
                     }
                     app.shadeDirty = false;
                 }
+            } else if (pw > 0 && ph > 0) {
+                // Old frame reprojected, new coarse data where the old frame
+                // has none. Cheap, so do it every frame.
+                double ox, oy, ratio;
+                reprojectMapping(app, ox, oy, ratio);
+                const int fill = app.renderer.completedStride();
+                if (app.renderer.reproject(app.shade, app.animTime, app.view.scale, fill, ox, oy,
+                                           ratio)) {
+                    app.display.upload();
+                }
             }
             if (!app.renderer.iterateDone()) app.renderer.stepIterate();
         }
@@ -377,11 +424,7 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        {
-            float u0, v0, u1, v1;
-            reprojectUv(app, u0, v0, u1, v1);
-            app.display.draw(u0, v0, u1, v1);
-        }
+        app.display.draw(0.f, 0.f, 1.f, 1.f);
         drawUi(app);
         ImGui::Render();
 

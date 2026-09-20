@@ -7,6 +7,9 @@
 // sees pixel offsets from it. scale is complex units per pixel.
 struct ViewParams {
     double scale = 3.0 / 800.0;
+    // View centre minus reference centre, complex units. Non-zero after pans
+    // that kept the old reference orbit.
+    double refOffX = 0.0, refOffY = 0.0;
     int width = 0;
     int height = 0;
     int maxIter = 512;
@@ -52,6 +55,12 @@ public:
     // enough to trip the Windows GPU watchdog. beginIterate resets state;
     // call stepIterate whenever !iterateBusy() until iterateDone().
     bool beginIterate(const ViewParams& view);
+    // Pan: shift field and state by (dx, dy) pixels (content moves by
+    // -dx, -dy), keep finished pixels, mark exposed strips pending, and
+    // continue the pass coarse-to-fine on what is pending. Same reference.
+    bool shiftAndResume(const ViewParams& view, int dx, int dy);
+    // Reference changed: restart only the pixels that are not finished.
+    bool restartPending(const ViewParams& view);
     bool stepIterate();
     bool iterateBusy();
     bool iterateDone() const { return iterDone_; }
@@ -66,6 +75,12 @@ public:
     // fillStride: pixels not yet computed take the value of the nearest
     // pixel aligned to this stride (block fill of the coarse level).
     bool shade(const ShadeParams& params, float timeSec, double pixelScale, int fillStride);
+    // Composite for the display while a pass runs: the last shaded frame,
+    // reprojected (old pixel = (ox, oy) + (pixel - centre) * ratio), where it
+    // has data; otherwise the running pass's field with block fill; black
+    // where neither has anything yet.
+    bool reproject(const ShadeParams& params, float timeSec, double pixelScale, int fillStride,
+                   double ox, double oy, double ratio);
 
     float lastIterateMs() const { return iterateMs_; }  // total for the last full pass
     float lastSliceMs() const { return sliceMs_; }
@@ -80,6 +95,9 @@ private:
     struct cudaGraphicsResource* pboResource_ = nullptr;
     FieldSample* field_ = nullptr;
     struct PixelState* state_ = nullptr;
+    FieldSample* fieldAlt_ = nullptr;
+    uint32_t* lastImage_ = nullptr;  // copy of the last shaded frame
+    struct PixelState* stateAlt_ = nullptr;
     int* activeCount_ = nullptr;      // device
     unsigned long long* sliceStart_ns_ = nullptr;  // device, GPU clock at slice start
     int* activeCountHost_ = nullptr;  // pinned

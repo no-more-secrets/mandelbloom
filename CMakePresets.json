@@ -12,8 +12,16 @@
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
     }
+    ,
+    {
+      "name": "msvc-test",
+      "inherits": "msvc",
+      "binaryDir": "${sourceDir}/build/test",
+      "cacheVariables": { "MANDELGPU_OUTPUT_NAME": "mandelgpu-test" }
+    }
   ],
   "buildPresets": [
-    { "name": "msvc", "configurePreset": "msvc" }
+    { "name": "msvc", "configurePreset": "msvc" },
+    { "name": "msvc-test", "configurePreset": "msvc-test" }
   ]
 }
