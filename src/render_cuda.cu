@@ -282,8 +282,28 @@ __device__ __forceinline__ uint32_t bilinear(const uint32_t* __restrict__ img, i
            0xFF000000u;
 }
 
+// Shade one field sample (with neighbour gradient for lines).
+__device__ __forceinline__ float3 shadeField(const FieldSample* __restrict__ field, int fw, int fh,
+                                             int xi, int yi, const FieldSample& s,
+                                             const ShadeParams& p, float timeSec,
+                                             const CompositeMap& map) {
+    IterGradient g;
+    if (p.lines && xi + 1 < fw && yi + 1 < fh && s.iter >= 0.f) {
+        // Forward differences in field pixels, scaled to display pixels.
+        const FieldSample sx = fetchFilled(field, fw, xi + 1, yi);
+        const FieldSample sy = fetchFilled(field, fw, xi, yi + 1);
+        if (sx.flags < 0.5f && sy.flags < 0.5f && sx.iter >= 0.f && sy.iter >= 0.f) {
+            g.dx = (sx.iter - s.iter) * (float)map.ratioN;
+            g.dy = (sy.iter - s.iter) * (float)map.ratioN;
+            g.valid = true;
+        }
+    }
+    return shadeSample(s, p, timeSec, map.pixelScaleN, g);
+}
+
 // Display composite: per pixel pick the running pass's field or the last
-// finished frame, whichever has more detail for this display pixel.
+// finished frame, whichever has more detail for this display pixel. The
+// field is sampled ss x ss times per display pixel and averaged.
 __global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, int fh, int mx,
                                 int my, const uint32_t* __restrict__ old,
                                 uint32_t* __restrict__ out, int w, int h, ShadeParams p,
@@ -294,34 +314,38 @@ __global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, i
     const size_t idx = (size_t)y * w + x;
     const double px = (double)x - 0.5 * w, py = (double)y - 0.5 * h;
 
-    // Running pass (map is in view pixels; the field adds its margin).
-    const double u = map.nox + px * map.ratioN + mx, v = map.noy + py * map.ratioN + my;
-    const int xi = (int)floor(u + 0.5), yi = (int)floor(v + 0.5);
-    FieldSample s{};
-    bool haveNew = false;
-    if (xi >= 0 && xi < fw && yi >= 0 && yi < fh) {
-        s = fetchFilled(field, fw, xi, yi);
-        haveNew = s.flags < 0.5f;
-    }
-    // Last finished frame.
+    // Last finished frame (already at display resolution).
     const double ou = map.oox + px * map.ratioO, ov = map.ooy + py * map.ratioO;
     const bool haveOld = map.oldDetail > 0.f && ou >= 0.0 && ov >= 0.0 &&
                          ou <= (double)(w - 1) && ov <= (double)(h - 1);
 
-    const bool useNew = haveNew && (!haveOld || map.newDetail >= map.oldDetail);
-    if (useNew || (haveNew && !haveOld)) {
-        IterGradient g;
-        if (p.lines && xi + 1 < fw && yi + 1 < fh && s.iter >= 0.f) {
-            // Forward differences in field pixels, scaled to display pixels.
-            const FieldSample sx = fetchFilled(field, fw, xi + 1, yi);
-            const FieldSample sy = fetchFilled(field, fw, xi, yi + 1);
-            if (sx.flags < 0.5f && sy.flags < 0.5f && sx.iter >= 0.f && sy.iter >= 0.f) {
-                g.dx = (sx.iter - s.iter) * (float)map.ratioN;
-                g.dy = (sy.iter - s.iter) * (float)map.ratioN;
-                g.valid = true;
+    // Running pass: centre of this display pixel in field coordinates, then
+    // ss x ss subsamples spread across the pixel's footprint.
+    const double u0 = map.nox + px * map.ratioN + mx, v0 = map.noy + py * map.ratioN + my;
+    const int ss = map.ss < 1 ? 1 : map.ss;
+    float3 acc = make_float3(0.f, 0.f, 0.f);
+    int have = 0;
+    const bool wantNew = !haveOld || map.newDetail >= map.oldDetail;
+    if (wantNew) {
+        for (int j = 0; j < ss; ++j) {
+            for (int i = 0; i < ss; ++i) {
+                const double u = u0 + ((i + 0.5) / ss - 0.5) * map.ratioN;
+                const double v = v0 + ((j + 0.5) / ss - 0.5) * map.ratioN;
+                const int xi = (int)floor(u + 0.5), yi = (int)floor(v + 0.5);
+                if (xi < 0 || xi >= fw || yi < 0 || yi >= fh) continue;
+                const FieldSample s = fetchFilled(field, fw, xi, yi);
+                if (s.flags > 0.5f) continue;
+                const float3 c = shadeField(field, fw, fh, xi, yi, s, p, timeSec, map);
+                acc.x += c.x;
+                acc.y += c.y;
+                acc.z += c.z;
+                ++have;
             }
         }
-        out[idx] = packSRGB8(shadeSample(s, p, timeSec, map.pixelScaleN, g));
+    }
+    if (have > 0) {
+        const float inv = 1.f / have;
+        out[idx] = packSRGB8(make_float3(acc.x * inv, acc.y * inv, acc.z * inv));
     } else if (haveOld) {
         out[idx] = bilinear(old, w, h, ou, ov);
     } else {
@@ -464,16 +488,19 @@ bool CudaRenderer::uploadReference(const double* zr, const double* zi, int lengt
     return true;
 }
 
-bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height) {
+bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height, int ss) {
     unregisterPbo();
     freeField();
     width_ = width;
     height_ = height;
+    ss_ = ss < 1 ? 1 : ss;
     if (!glPbo || width <= 0 || height <= 0) return true;
-    marginX_ = (width + 7) / 8;
-    marginY_ = (height + 7) / 8;
-    fieldW_ = width + 2 * marginX_;
-    fieldH_ = height + 2 * marginY_;
+    viewW_ = width * ss_;
+    viewH_ = height * ss_;
+    marginX_ = (viewW_ + 7) / 8;
+    marginY_ = (viewH_ + 7) / 8;
+    fieldW_ = viewW_ + 2 * marginX_;
+    fieldH_ = viewH_ + 2 * marginY_;
     const size_t n = (size_t)width * height;
     const size_t fn = (size_t)fieldW_ * fieldH_;
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&pboResource_, glPbo,
@@ -500,7 +527,7 @@ void CudaRenderer::resetPass(const ViewParams& view) {
 }
 
 bool CudaRenderer::beginIterate(const ViewParams& view) {
-    if (!field_ || !state_ || view.width != width_ || view.height != height_) return false;
+    if (!field_ || !state_ || view.width != viewW_ || view.height != viewH_) return false;
     if (ref_.length < 2) return false;
     cudaStream_t stream = (cudaStream_t)stream_;
     CUDA_CHECK(cudaStreamSynchronize(stream));  // cancel the slice in flight
@@ -512,7 +539,7 @@ bool CudaRenderer::beginIterate(const ViewParams& view) {
 }
 
 bool CudaRenderer::shiftAndResume(const ViewParams& view, int dx, int dy) {
-    if (!field_ || !state_ || view.width != width_ || view.height != height_) return false;
+    if (!field_ || !state_ || view.width != viewW_ || view.height != viewH_) return false;
     cudaStream_t stream = (cudaStream_t)stream_;
     syncAll();  // the composite may be reading the buffers we are about to swap
     if (dx != 0 || dy != 0) {
@@ -578,8 +605,8 @@ bool CudaRenderer::stepIterate() {
     const dim3 block(32, 8);
     int sw, sh;
     if (stride_ == 1) {
-        sw = width_;
-        sh = height_;
+        sw = viewW_;
+        sh = viewH_;
     } else {
         sw = (fieldW_ + stride_ - 1) / stride_;
         sh = (fieldH_ + stride_ - 1) / stride_;
@@ -589,7 +616,7 @@ bool CudaRenderer::stepIterate() {
     cudaEventRecord((cudaEvent_t)evStart_, stream);
     stampTimer<<<1, 1, 0, stream>>>(sliceStart_ns_);
     iterateSlice<<<grid, block, 0, stream>>>(state_, field_, fieldW_, fieldH_, marginX_, marginY_,
-                                             width_, height_, stride_, iterView_.scale,
+                                             viewW_, viewH_, stride_, iterView_.scale,
                                              iterView_.refOffX, iterView_.refOffY,
                                              iterView_.maxIter, sliceIters_, sliceStart_ns_,
                                              50ull * 1000000ull, ref_, bla_, activeCount_);

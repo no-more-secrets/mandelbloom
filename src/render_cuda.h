@@ -43,6 +43,7 @@ struct CompositeMap {
     float oldDetail = 0.f;
     float pixelScaleN = 1.f;  // field's complex units per field pixel
     int snapshot = 0;         // keep the result as the new "last frame"
+    int ss = 1;               // subsamples per axis averaged per display pixel
 };
 
 // Owns the CUDA side: the iteration field, the interop registration of
@@ -58,7 +59,9 @@ public:
     bool init();
     // (Re)register the GL pixel unpack buffer and size the field to match,
     // plus a margin around the view so pans land on existing coarse data.
-    bool bindPixelBuffer(unsigned glPbo, int width, int height);
+    // ss: supersampling factor; the field's view region is (width*ss) x
+    // (height*ss) and the composite averages ss*ss samples per pixel.
+    bool bindPixelBuffer(unsigned glPbo, int width, int height, int ss);
     // Upload a new reference orbit (host arrays of `length` doubles).
     bool uploadReference(const double* zr, const double* zi, int length, bool escaped);
     // Upload a BLA table built for the current reference and view.
@@ -137,7 +140,9 @@ private:
     void* evShadeA_ = nullptr;
     void* evShadeB_ = nullptr;
     bool shadePending_ = false;
-    int width_ = 0, height_ = 0;    // view (pixel buffer) size
+    int width_ = 0, height_ = 0;    // display (pixel buffer) size
+    int viewW_ = 0, viewH_ = 0;     // view region in field pixels (display * ss)
+    int ss_ = 1;
     int fieldW_ = 0, fieldH_ = 0;   // field size = view + margins
     int marginX_ = 0, marginY_ = 0; // margin each side, computed at stride >= 2 only
     float iterateMs_ = 0.f, shadeMs_ = 0.f;

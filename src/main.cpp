@@ -41,6 +41,8 @@ struct App {
     View shown;
     View last;
     bool lastValid = false;
+    int ss = 1;          // supersampling factor per axis (field = display * ss)
+    int ssApplied = 0;   // what the renderer is currently bound with
     bool tweening = false;
     float tweenTau = 0.08f;  // seconds to close ~63% of the gap
     bool tweenEnabled = true;
@@ -112,14 +114,18 @@ void snapShown(App& app) {
     app.tweening = false;
 }
 
+// Keep the render-pass parameters in step with the display-space view.
+void syncViewScale(App& app) { app.view.scale = app.render.scale / app.ss; }
+
 void zoomAt(App& app, float mx, float my, double factor) {
     // The point under the cursor in the view the user is looking at (the
     // shown view) is the anchor. The target scale accumulates; the target
     // centre is whatever keeps the anchor under the cursor at that scale.
-    const double hx = 0.5 * app.view.width, hy = 0.5 * app.view.height;
+    // Cursor offset from the centre in display pixels (the view is ss times larger).
+    const double hx = 0.5 * app.view.width / app.ss, hy = 0.5 * app.view.height / app.ss;
     const double px = mx - hx, py = my - hy;
     app.render.scale *= factor;
-    app.view.scale = app.render.scale;
+    syncViewScale(app);
     updatePrecision(app);
     app.anchorX = app.shown.cx;
     app.anchorY = app.shown.cy;
@@ -139,8 +145,8 @@ void zoomAt(App& app, float mx, float my, double factor) {
 }
 
 void resetView(App& app) {
-    app.render.scale = 3.2 / std::max(1, app.view.width);
-    app.view.scale = app.render.scale;
+    app.render.scale = 3.2 / std::max(1, app.view.width / app.ss);
+    syncViewScale(app);
     updatePrecision(app);
     app.render.cx.set(-0.5);
     app.render.cy.set(0.0);
@@ -161,8 +167,8 @@ void panPixels(App& app, int dx, int dy) {
     app.shown.cx = app.render.cx;
     app.shown.cy = app.render.cy;
     // Content moves with the mouse: new pixel x shows old pixel x - dx.
-    app.panDx -= dx;
-    app.panDy -= dy;
+    app.panDx -= dx * app.ss;
+    app.panDy -= dy * app.ss;
     app.panDirty = true;
 }
 
@@ -225,10 +231,14 @@ void rebuildReference(App& app) {
 
 // Mapping of a source view onto the shown view: where the shown centre
 // lands in source pixels, and source pixels per shown pixel.
-void mapOnto(const App& app, const View& src, double& ox, double& oy, double& ratio) {
-    ratio = app.shown.scale / src.scale;
-    ox = 0.5 * app.view.width + BigFloat::diff(app.shown.cx, src.cx) / src.scale;
-    oy = 0.5 * app.view.height - BigFloat::diff(app.shown.cy, src.cy) / src.scale;
+// sub: source pixels per display pixel at identity (ss for the render
+// field, 1 for the last frame); srcW/H: source size in its own pixels.
+void mapOnto(const App& app, const View& src, int sub, int srcW, int srcH, double& ox,
+             double& oy, double& ratio) {
+    const double srcScale = src.scale / sub;  // complex units per source pixel
+    ratio = app.shown.scale / srcScale;
+    ox = 0.5 * srcW + BigFloat::diff(app.shown.cx, src.cx) / srcScale;
+    oy = 0.5 * srcH - BigFloat::diff(app.shown.cy, src.cy) / srcScale;
 }
 
 // Shading presets. Each fully replaces the shading parameters.
@@ -349,9 +359,16 @@ void drawUi(App& app) {
         const int digits = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
         ImGui::Text("center  %s", app.render.cx.toString(digits).c_str());
         ImGui::Text("        %s i", app.render.cy.toString(digits).c_str());
-        const double zoom = 3.2 / (app.render.scale * app.view.width);
+        const double zoom = 3.2 / (app.render.scale * (app.view.width / app.ss));
         ImGui::Text("zoom    %.3g x   (%ld bits)", zoom, (long)app.render.cx.prec());
-        ImGui::Text("size    %d x %d", app.view.width, app.view.height);
+        ImGui::Text("size    %d x %d  (field %d x %d)", app.view.width / app.ss,
+                    app.view.height / app.ss, app.view.width, app.view.height);
+        {
+            const char* items[] = {"1x", "2x", "3x"};
+            int sel = app.ss - 1;
+            ImGui::SetNextItemWidth(80 * app.uiScale);
+            if (ImGui::Combo("supersample", &sel, items, 3)) app.ss = sel + 1;
+        }
         if (ImGui::SliderInt("max iter", &app.view.maxIter, 64, 65536, "%d",
                              ImGuiSliderFlags_Logarithmic)) {
             app.dirty = true;
@@ -445,12 +462,15 @@ int main(int argc, char** argv) {
     double argScale = 0.0;
     int argIter = 0;
     int argPreset = 0;
+    int argSs = 1;
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
             scriptText = argv[++i];
         } else if (std::strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
             argPreset = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--ss") == 0 && i + 1 < argc) {
+            argSs = std::atoi(argv[++i]);
         } else {
             positional.push_back(argv[i]);
         }
@@ -505,6 +525,7 @@ int main(int argc, char** argv) {
     if (!app.renderer.init()) return 1;
     std::printf("CUDA: %s\n", app.renderer.deviceName());
     if (argPreset > 0) applyPreset(app.shade, argPreset);
+    app.ss = std::min(3, std::max(1, argSs));
 
     Uint64 lastTick = SDL_GetPerformanceCounter();
     bool running = true;
@@ -523,15 +544,18 @@ int main(int argc, char** argv) {
 
         int pw = 0, ph = 0;
         SDL_GetWindowSizeInPixels(app.window, &pw, &ph);
-        if (app.display.resize(pw, ph)) {
+        const bool resized = app.display.resize(pw, ph);
+        if (resized || app.ssApplied != app.ss) {
             const bool first = app.view.width == 0;
-            app.view.width = pw;
-            app.view.height = ph;
+            app.view.width = pw * app.ss;
+            app.view.height = ph * app.ss;
+            app.ssApplied = app.ss;
+            syncViewScale(app);
             if (first) {
                 resetView(app);
                 if (argScale > 0.0) {
                     app.render.scale = argScale;
-                    app.view.scale = argScale;
+                    syncViewScale(app);
                     updatePrecision(app);
                     app.render.cx.set(argRe);
                     app.render.cy.set(argIm);
@@ -539,7 +563,7 @@ int main(int argc, char** argv) {
                     snapShown(app);
                 }
             }
-            app.renderer.bindPixelBuffer(app.display.pbo(), pw, ph);
+            app.renderer.bindPixelBuffer(app.display.pbo(), pw, ph, app.ss);
             app.lastValid = false;
             app.dirty = true;
         }
@@ -578,16 +602,18 @@ int main(int argc, char** argv) {
         // onto the shown view. Cheap, runs every frame on its own stream.
         {
             CompositeMap m;
-            mapOnto(app, app.render, m.nox, m.noy, m.ratioN);
+            m.ss = app.ss;
+            mapOnto(app, app.render, app.ss, app.view.width, app.view.height, m.nox, m.noy,
+                    m.ratioN);
             const int done = app.renderer.completedStride();
             m.newDetail = app.renderer.iterateDone() ? (float)m.ratioN
                           : done > 0                 ? (float)(m.ratioN / done)
                                                      : 0.f;
             if (app.lastValid) {
-                mapOnto(app, app.last, m.oox, m.ooy, m.ratioO);
+                mapOnto(app, app.last, 1, pw, ph, m.oox, m.ooy, m.ratioO);
                 m.oldDetail = (float)m.ratioO;
             }
-            m.pixelScaleN = (float)app.render.scale;
+            m.pixelScaleN = (float)app.view.scale;
             const bool settled = app.renderer.iterateDone() && !app.tweening;
             m.snapshot = settled ? 1 : 0;
             if (app.renderer.composite(app.shade, app.animTime, m)) {
@@ -625,7 +651,7 @@ int main(int argc, char** argv) {
                 if (app.display.readPixels(px.data(), (int)px.size())) {
                     writePng(shot.c_str(), px.data(), pw, ph);
                 }
-                const double zoom = 3.2 / (app.render.scale * app.view.width);
+                const double zoom = 3.2 / (app.render.scale * (app.view.width / app.ss));
                 const int dg = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
                 std::printf("shot %s zoom=%.3g iterate=%.0fms done=%d stride=%d/%d tween=%d "
                             "inertia=%d centre=%s %s\n",
