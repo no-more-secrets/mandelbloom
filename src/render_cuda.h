@@ -46,6 +46,7 @@ struct GenMap {
     double ox = 0, oy = 0, ratio = 1;
     float pixelScale = 1.f;  // complex units per field pixel for this generation
     int gen = 0;             // generation id as stored in FieldSample::gen
+    int slot = 0;            // field buffer: 0 live, 1.. keyframe slots (video mode)
 };
 
 #define MAX_GENS 8
@@ -138,6 +139,23 @@ public:
     bool buildShadeCache(const ShadeParams& params, const CompositeMap& map);
     bool shadeCached(const ShadeParams& params, float timeSec, const AaParams& aa);
 
+    // Video mode: an owned output of the given size in place of the display
+    // buffer, a field to match, and `slots` extra field buffers that keep
+    // finished keyframes. The display buffer stays mapped for previews.
+    bool bindVideo(int width, int height, int ss, int slots);
+    void endVideo();  // release; the caller re-binds the display afterwards
+    bool videoActive() const { return videoOut_ != nullptr; }
+    // Copy the live field (slot 0) into keyframe slot `slot` (1-based).
+    bool stashField(int slot);
+    // Letterbox the owned output into the display buffer, times `scale`
+    // (the display's SDR white).
+    bool previewToDisplay(float scale);
+    enum VideoFormat { VIDEO_YUV420P8 = 0, VIDEO_P010 = 1 };
+    // Convert the output (linear, 1.0 = SDR white) into a video frame: 8-bit
+    // BT.709 yuv420p, or 10-bit PQ BT.2020 P010 with SDR white at `nits`.
+    // Returns one of two alternating pinned host buffers, or null.
+    const void* convertFrame(VideoFormat fmt, float nits, size_t& bytes);
+
     // Time-linear progress estimate of the running pass (0..1) and the
     // predicted remaining time. Coarse levels sample the same image, so
     // their cost per pixel predicts the rest.
@@ -166,6 +184,7 @@ private:
     void syncAll();
     void resetPass(const ViewParams& view);
     int progress_levelIndex() const;
+    bool allocField(int width, int height, int ss, int slots);
 
     cudaExternalMemory_t extMem_ = nullptr;
     uint16_t* out_ = nullptr;   // mapped shared buffer, RGBA16F
@@ -212,6 +231,15 @@ private:
     int* minIter_ = nullptr;          // device: float bits of the smallest escape iteration
     int* minIterHost_ = nullptr;      // pinned
     float minIterGen_ = -1.f;
+    // Video mode.
+    uint16_t* videoOut_ = nullptr;   // owned RGBA16F output, video size
+    uint16_t* sharedOut_ = nullptr;  // the display buffer while video mode is on
+    int sharedPitchPx_ = 0, sharedW_ = 0, sharedH_ = 0;
+    int fieldSlots_ = 0;             // keyframe slots after the live field (contiguous)
+    uint8_t* videoFrame_ = nullptr;  // device: converted frame
+    size_t videoFrameBytes_ = 0;
+    void* videoHost_[2] = {nullptr, nullptr};  // pinned copies, alternating
+    int videoHostIdx_ = 0;
     void* stream_ = nullptr;      // iteration
     void* dispStream_ = nullptr;  // composite
     void* evSlice_ = nullptr;

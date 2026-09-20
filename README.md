@@ -84,6 +84,26 @@ Maths Town look) instead of the whole view drifting into one colour. The log
 transfer without the anchor is the older behaviour and what the built-in
 presets other than classic use.
 
+## Zoom videos
+
+The Video section of the overlay (or `--video`) renders a zoom from a start
+zoom to the current view and pipes it to the installed `ffmpeg` (NVENC HEVC).
+HDR output is 10-bit PQ BT.2020 with SDR white at the display's level; SDR
+output is 8-bit BT.709 with the same roll-off as an F2 screenshot. Keyframes
+are rendered 2x apart in zoom with the same supersampling as the viewer, and
+every frame is composited from the finer keyframe in the centre and the
+coarser one around it, so per-frame shading, animation and post-processing
+all apply. A 4K60 frame costs a few milliseconds; deep keyframes cost about
+as much as one interactive render each. The output goes to
+`Videos\Mandelbloom\mandel_<stamp>_<zoom>.mp4` with a `.txt` command line and
+a `.preset` beside it.
+
+```
+mandelgpu.exe <re> <im> <scale> <iters> --ss 2 --loadfile look.preset --video out.mp4 ^
+  --video-seconds 60 --video-fps 60 --video-size 3840x2160 --video-from 1 --video-hold 1,2 ^
+  --video-ease 0.3 --video-cq 20 [--video-sdr] [--video-nits 280] [--video-codec libx265]
+```
+
 ## Testing without touching the desktop
 
 `--script "wait:1500;wheel:5;drag:300,120,12;pan:8,0;shot:out.png;quit"`
@@ -107,7 +127,7 @@ Run it minimised. `build/shots/cmp.py a.png b.png` reports differing pixels.
    tent/gaussian/blackman reconstruction filters on the settled image. (done)
 8. Better BLA validity (Imagina-style) for spiral regions.
 9. HDR output (D3D12 swapchain) and post-processing. (done)
-10. 4K image export, zoom video export.
+10. 4K image export, zoom video export. Video export done: keyframes 2x apart, per-frame composite, NVENC HEVC via ffmpeg, HDR10 or SDR.
 11. CPU SIMD path (ISPC) for glitch repair and second references.
 
 Timings on an RTX 4080, 1920x1200, 1x:

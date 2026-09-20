@@ -368,22 +368,26 @@ __device__ __forceinline__ float3 shadeField(const FieldSample* __restrict__ fie
 __device__ __forceinline__ bool resolveBest(const FieldSample* __restrict__ field, int fw, int fh,
                                             int mx, int my, double px, double py,
                                             const CompositeMap& map, FieldSample& out, int& outX,
-                                            int& outY, int& outGen) {
+                                            int& outY, int& outGen,
+                                            const FieldSample*& outField) {
     float bestDetail = 0.f;
     FieldSample best{};
     int bestX = 0, bestY = 0, bestGen = -1;
+    const FieldSample* bestField = field;
     for (int k = 0; k < map.genCount; ++k) {
         const GenMap& gm = map.gens[k];
         const double u = gm.ox + px * gm.ratio + mx, v = gm.oy + py * gm.ratio + my;
         const int xi = (int)floor(u + 0.5), yi = (int)floor(v + 0.5);
         if (xi < 0 || xi >= fw || yi < 0 || yi >= fh) continue;
         int level = 0;
-        const FieldSample s = fetchGen(field, fw, xi, yi, gm.gen, level);
+        const FieldSample* fb = field + (size_t)gm.slot * fw * fh;
+        const FieldSample s = fetchGen(fb, fw, xi, yi, gm.gen, level);
         if (level == 0) continue;
         const float detail = (float)gm.ratio / (float)level;  // field px per display px
         if (detail > bestDetail) {
             bestDetail = detail;
             best = s;
+            bestField = fb;
             bestX = xi;
             bestY = yi;
             bestGen = k;
@@ -399,12 +403,14 @@ __device__ __forceinline__ bool resolveBest(const FieldSample* __restrict__ fiel
             const int xi = min(max((int)floor(u + 0.5), 0), fw - 1);
             const int yi = min(max((int)floor(v + 0.5), 0), fh - 1);
             int level = 0;
-            const FieldSample sm = fetchGen(field, fw, xi, yi, gm.gen, level);
+            const FieldSample* fb = field + (size_t)gm.slot * fw * fh;
+            const FieldSample sm = fetchGen(fb, fw, xi, yi, gm.gen, level);
             if (level == 0) continue;
             out = sm;
             outX = xi;
             outY = yi;
             outGen = k;
+            outField = fb;
             return true;
         }
         return false;
@@ -413,6 +419,7 @@ __device__ __forceinline__ bool resolveBest(const FieldSample* __restrict__ fiel
     outX = bestX;
     outY = bestY;
     outGen = bestGen;
+    outField = bestField;
     return true;
 }
 
@@ -423,8 +430,9 @@ __device__ __forceinline__ bool sampleBest(const FieldSample* __restrict__ field
                                            float3& col) {
     FieldSample s;
     int xi, yi, gi;
-    if (!resolveBest(field, fw, fh, mx, my, px, py, map, s, xi, yi, gi)) return false;
-    col = shadeField(field, fw, fh, xi, yi, s, p, timeSec, map.gens[gi], lut);
+    const FieldSample* fb = field;
+    if (!resolveBest(field, fw, fh, mx, my, px, py, map, s, xi, yi, gi, fb)) return false;
+    col = shadeField(fb, fw, fh, xi, yi, s, p, timeSec, map.gens[gi], lut);
     return true;
 }
 
@@ -490,8 +498,9 @@ __global__ void buildCacheKernel(const FieldSample* __restrict__ field, int fw, 
             FieldSample s;
             int xi, yi, gi;
             ShadeInput in{};
-            if (resolveBest(field, fw, fh, mx, my, sx, sy, map, s, xi, yi, gi)) {
-                in = prepareSample(s, p, gradientAt(field, fw, fh, xi, yi, s, p, map.gens[gi]));
+            const FieldSample* fb = field;
+            if (resolveBest(field, fw, fh, mx, my, sx, sy, map, s, xi, yi, gi, fb)) {
+                in = prepareSample(s, p, gradientAt(fb, fw, fh, xi, yi, s, p, map.gens[gi]));
             }
             dst[j * ss + i] = in;
         }
@@ -766,6 +775,7 @@ void CudaRenderer::freeField() {
     if (bloomT2_) cudaFree(bloomT2_);
     field_ = fieldAlt_ = nullptr;
     state_ = stateAlt_ = nullptr;
+    fieldSlots_ = 0;
     shadeCache_ = nullptr;
     hdr_ = nullptr;
     bloomA_ = bloomT_ = bloomB_ = bloomT2_ = nullptr;
@@ -870,6 +880,14 @@ bool CudaRenderer::bindOutput(void* sharedHandle, size_t sharedSize, int rowPitc
         out_ = (uint16_t*)ptr;
         outPitchPx_ = rowPitchBytes / 8;
     }
+    return allocField(width, height, ss_, 0);
+}
+
+bool CudaRenderer::allocField(int width, int height, int ss, int slots) {
+    width_ = width;
+    height_ = height;
+    ss_ = ss < 1 ? 1 : ss;
+    fieldSlots_ = slots;
     viewW_ = width * ss_;
     viewH_ = height * ss_;
     marginX_ = (viewW_ + 7) / 8;
@@ -878,7 +896,7 @@ bool CudaRenderer::bindOutput(void* sharedHandle, size_t sharedSize, int rowPitc
     fieldH_ = viewH_ + 2 * marginY_;
     const size_t n = (size_t)width * height;
     const size_t fn = (size_t)fieldW_ * fieldH_;
-    CUDA_CHECK(cudaMalloc(&field_, sizeof(FieldSample) * fn));
+    CUDA_CHECK(cudaMalloc(&field_, sizeof(FieldSample) * fn * (size_t)(1 + slots)));
     CUDA_CHECK(cudaMalloc(&state_, sizeof(PixelState) * fn));
     CUDA_CHECK(cudaMalloc(&fieldAlt_, sizeof(FieldSample) * fn));
     CUDA_CHECK(cudaMalloc(&stateAlt_, sizeof(PixelState) * fn));
@@ -895,10 +913,233 @@ bool CudaRenderer::bindOutput(void* sharedHandle, size_t sharedSize, int rowPitc
         CUDA_CHECK(cudaMalloc(&bloomT2_, sizeof(float4) * bw * bh));
     }
     if (!paletteLut_) CUDA_CHECK(cudaMalloc(&paletteLut_, sizeof(float4) * PALETTE_LUT_SIZE));
-    clearField<<<(int)((fn + 255) / 256), 256>>>(field_, (int)fn);
+    const size_t fnAll = fn * (size_t)(1 + slots);
+    clearField<<<(int)((fnAll + 255) / 256), 256>>>(field_, (int)fnAll);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Video mode
+
+namespace {
+
+// Fit the video output into the display buffer with black borders.
+__global__ void previewKernel(const uint16_t* __restrict__ src, int sw, int sh,
+                              uint16_t* __restrict__ dst, int dpitch, int dw, int dh, float scale) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dw || y >= dh) return;
+    const float fit = fminf((float)dw / sw, (float)dh / sh);
+    const float ow = sw * fit, oh = sh * fit;
+    const float ox = 0.5f * (dw - ow), oy = 0.5f * (dh - oh);
+    float3 c = make_float3(0.f, 0.f, 0.f);
+    if (x >= ox && y >= oy && x < ox + ow && y < oy + oh) {
+        // Box over the source pixels this display pixel covers (up to 4x4).
+        const float inv = 1.f / fit;
+        const int x0 = (int)((x - ox) * inv), x1 = max(x0 + 1, min((int)((x + 1 - ox) * inv), x0 + 4));
+        const int y0 = (int)((y - oy) * inv), y1 = max(y0 + 1, min((int)((y + 1 - oy) * inv), y0 + 4));
+        int cnt = 0;
+        for (int yy = y0; yy < y1 && yy < sh; ++yy)
+            for (int xx = x0; xx < x1 && xx < sw; ++xx) {
+                const ushort4 v = *reinterpret_cast<const ushort4*>(src + ((size_t)yy * sw + xx) * 4);
+                c.x += h2f(v.x);
+                c.y += h2f(v.y);
+                c.z += h2f(v.z);
+                ++cnt;
+            }
+        if (cnt > 0) {
+            const float k = scale / cnt;
+            c.x *= k;
+            c.y *= k;
+            c.z *= k;
+        }
+    }
+    ushort4 o;
+    o.x = f2h(c.x);
+    o.y = f2h(c.y);
+    o.z = f2h(c.z);
+    o.w = f2h(1.f);
+    *reinterpret_cast<ushort4*>(dst + ((size_t)y * dpitch + x) * 4) = o;
+}
+
+__device__ __forceinline__ float3 loadLinear(const uint16_t* __restrict__ src, int pitchPx, int x,
+                                             int y) {
+    const ushort4 v = *reinterpret_cast<const ushort4*>(src + ((size_t)y * pitchPx + x) * 4);
+    return make_float3(h2f(v.x), h2f(v.y), h2f(v.z));
+}
+
+// SMPTE ST 2084 (PQ) encode of absolute luminance / 10000.
+__device__ __forceinline__ float pqEncode(float y) {
+    const float m1 = 0.1593017578125f, m2 = 78.84375f;
+    const float c1 = 0.8359375f, c2 = 18.8515625f, c3 = 18.6875f;
+    y = fminf(fmaxf(y, 0.f), 1.f);
+    const float ym = powf(y, m1);
+    return powf((c1 + c2 * ym) / (1.f + c3 * ym), m2);
+}
+
+// SDR encode as takeScreenshot() does it: soft roll-off above the knee for
+// the HDR headroom, then sRGB. Players treat BT.709-tagged video the same
+// way a PNG is shown, so the video matches the F2 screenshot.
+__device__ __forceinline__ float encodeSdr(float v) {
+    const float knee = 0.8f;
+    if (v > knee) {
+        const float x = (v - knee) / (1.f - knee);
+        v = knee + (1.f - knee) * (x / (1.f + x));
+    }
+    v = fminf(fmaxf(v, 0.f), 1.f);
+    return v <= 0.0031308f ? 12.92f * v : 1.055f * powf(v, 1.f / 2.4f) - 0.055f;
+}
+
+// 10-bit PQ BT.2020 limited range, P010 (Y plane, then interleaved UV at
+// half resolution). One thread per 2x2 block. nitsScale: nits of 1.0 / 10000.
+__global__ void toP010Kernel(const uint16_t* __restrict__ src, int pitchPx, int w, int h,
+                             float nitsScale, uint16_t* __restrict__ yPlane,
+                             uint16_t* __restrict__ uvPlane) {
+    const int bx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int by = blockIdx.y * blockDim.y + threadIdx.y;
+    if (bx * 2 >= w || by * 2 >= h) return;
+    float cb = 0.f, cr = 0.f;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            const int x = bx * 2 + i, y = by * 2 + j;
+            const float3 c = loadLinear(src, pitchPx, x, y);
+            // BT.709 -> BT.2020 primaries, in linear light.
+            const float r = 0.6274f * c.x + 0.3293f * c.y + 0.0433f * c.z;
+            const float g = 0.0691f * c.x + 0.9195f * c.y + 0.0114f * c.z;
+            const float b = 0.0164f * c.x + 0.0880f * c.y + 0.8956f * c.z;
+            const float R = pqEncode(r * nitsScale), G = pqEncode(g * nitsScale),
+                        B = pqEncode(b * nitsScale);
+            const float Y = 0.2627f * R + 0.6780f * G + 0.0593f * B;
+            cb += (B - Y) / 1.8814f;
+            cr += (R - Y) / 1.4746f;
+            const int yv = (int)(64.f + 876.f * Y + 0.5f);
+            yPlane[(size_t)y * w + x] = (uint16_t)(min(max(yv, 0), 1023) << 6);
+        }
+    }
+    const int u = (int)(512.f + 896.f * 0.25f * cb + 0.5f);
+    const int v = (int)(512.f + 896.f * 0.25f * cr + 0.5f);
+    uint16_t* uv = uvPlane + ((size_t)by * (w / 2) + bx) * 2;
+    uv[0] = (uint16_t)(min(max(u, 0), 1023) << 6);
+    uv[1] = (uint16_t)(min(max(v, 0), 1023) << 6);
+}
+
+// 8-bit BT.709 limited range, planar yuv420p.
+__global__ void toYuv420Kernel(const uint16_t* __restrict__ src, int pitchPx, int w, int h,
+                               uint8_t* __restrict__ yPlane, uint8_t* __restrict__ uPlane,
+                               uint8_t* __restrict__ vPlane) {
+    const int bx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int by = blockIdx.y * blockDim.y + threadIdx.y;
+    if (bx * 2 >= w || by * 2 >= h) return;
+    float cb = 0.f, cr = 0.f;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            const int x = bx * 2 + i, y = by * 2 + j;
+            const float3 c = loadLinear(src, pitchPx, x, y);
+            const float R = encodeSdr(c.x), G = encodeSdr(c.y), B = encodeSdr(c.z);
+            const float Y = 0.2126f * R + 0.7152f * G + 0.0722f * B;
+            cb += (B - Y) / 1.8556f;
+            cr += (R - Y) / 1.5748f;
+            const int yv = (int)(16.f + 219.f * Y + 0.5f);
+            yPlane[(size_t)y * w + x] = (uint8_t)min(max(yv, 0), 255);
+        }
+    }
+    const int u = (int)(128.f + 224.f * 0.25f * cb + 0.5f);
+    const int v = (int)(128.f + 224.f * 0.25f * cr + 0.5f);
+    const size_t ci = (size_t)by * (w / 2) + bx;
+    uPlane[ci] = (uint8_t)min(max(u, 0), 255);
+    vPlane[ci] = (uint8_t)min(max(v, 0), 255);
+}
+
+}  // namespace
+
+bool CudaRenderer::bindVideo(int width, int height, int ss, int slots) {
+    if (videoOut_) endVideo();
+    syncAll();
+    sharedOut_ = out_;
+    sharedPitchPx_ = outPitchPx_;
+    sharedW_ = width_;
+    sharedH_ = height_;
+    freeField();
+    if (!allocField(width, height, ss, slots)) return false;
+    const size_t n = (size_t)width * height;
+    CUDA_CHECK(cudaMalloc(&videoOut_, sizeof(uint16_t) * 4 * n));
+    CUDA_CHECK(cudaMemset(videoOut_, 0, sizeof(uint16_t) * 4 * n));
+    out_ = videoOut_;
+    outPitchPx_ = width;
+    videoFrameBytes_ = n * 3;  // P010 is the larger format
+    CUDA_CHECK(cudaMalloc(&videoFrame_, videoFrameBytes_));
+    for (int i = 0; i < 2; ++i) CUDA_CHECK(cudaMallocHost(&videoHost_[i], videoFrameBytes_));
+    videoHostIdx_ = 0;
+    return true;
+}
+
+void CudaRenderer::endVideo() {
+    if (!videoOut_) return;
+    syncAll();
+    cudaFree(videoOut_);
+    videoOut_ = nullptr;
+    if (videoFrame_) cudaFree(videoFrame_);
+    videoFrame_ = nullptr;
+    for (auto& hbuf : videoHost_) {
+        if (hbuf) cudaFreeHost(hbuf);
+        hbuf = nullptr;
+    }
+    out_ = sharedOut_;
+    outPitchPx_ = sharedPitchPx_;
+    freeField();  // the caller re-binds the display size
+    width_ = sharedW_;
+    height_ = sharedH_;
+}
+
+bool CudaRenderer::stashField(int slot) {
+    if (!field_ || slot < 1 || slot > fieldSlots_) return false;
+    const size_t fn = (size_t)fieldW_ * fieldH_;
+    cudaStream_t stream = (cudaStream_t)stream_;
+    CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)dispStream_));  // no composite reads the slot
+    CUDA_CHECK(cudaMemcpyAsync(field_ + fn * (size_t)slot, field_, sizeof(FieldSample) * fn,
+                               cudaMemcpyDeviceToDevice, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return true;
+}
+
+bool CudaRenderer::previewToDisplay(float scale) {
+    if (!videoOut_ || !sharedOut_ || sharedW_ <= 0 || sharedH_ <= 0) return false;
+    cudaStream_t stream = (cudaStream_t)dispStream_;
+    const dim3 block(16, 16);
+    const dim3 grid((sharedW_ + block.x - 1) / block.x, (sharedH_ + block.y - 1) / block.y);
+    previewKernel<<<grid, block, 0, stream>>>(videoOut_, width_, height_, sharedOut_,
+                                              sharedPitchPx_, sharedW_, sharedH_, scale);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+const void* CudaRenderer::convertFrame(VideoFormat fmt, float nits, size_t& bytes) {
+    if (!videoOut_ || !videoFrame_) return nullptr;
+    cudaStream_t stream = (cudaStream_t)dispStream_;
+    const int w = width_ & ~1, h = height_ & ~1;
+    const dim3 block(16, 16);
+    const dim3 grid((w / 2 + block.x - 1) / block.x, (h / 2 + block.y - 1) / block.y);
+    const size_t n = (size_t)w * h;
+    if (fmt == VIDEO_P010) {
+        uint16_t* yp = (uint16_t*)videoFrame_;
+        toP010Kernel<<<grid, block, 0, stream>>>(videoOut_, outPitchPx_, w, h, nits / 10000.f, yp,
+                                                 yp + n);
+        bytes = n * 3;
+    } else {
+        uint8_t* yp = videoFrame_;
+        toYuv420Kernel<<<grid, block, 0, stream>>>(videoOut_, outPitchPx_, w, h, yp, yp + n,
+                                                   yp + n + n / 4);
+        bytes = n * 3 / 2;
+    }
+    if (cudaGetLastError() != cudaSuccess) return nullptr;
+    void* host = videoHost_[videoHostIdx_];
+    videoHostIdx_ ^= 1;
+    if (cudaMemcpyAsync(host, videoFrame_, bytes, cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+        return nullptr;
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return nullptr;
+    return host;
 }
 
 void CudaRenderer::resetPass(const ViewParams& view) {

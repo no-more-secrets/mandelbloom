@@ -25,6 +25,7 @@ add_executable(mandelgpu
   src/bla.cpp
   src/script.cpp
   src/image_io.cpp
+  src/video_encoder.cpp
   src/render_cuda.cu
 )
 target_include_directories(mandelgpu PRIVATE src ${MPFR_INCLUDE_DIR} ${Stb_INCLUDE_DIR})

@@ -3,6 +3,7 @@
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <algorithm>
+#include <cfloat>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +21,7 @@
 #include "presets.h"
 #include "reference.h"
 #include "render_cuda.h"
+#include "video_encoder.h"
 
 namespace {
 
@@ -27,6 +29,53 @@ namespace {
 struct View {
     BigFloat cx{64}, cy{64};
     double scale = 1.0;
+};
+
+// Zoom video export settings (UI and --video-* flags).
+struct VideoParams {
+    int width = 0, height = 0;   // 0: the window's pixel size
+    double fps = 60.0;
+    double seconds = 30.0;       // zooming time, between the holds
+    double zoomFrom = 1.0;       // starting zoom (1 = the whole set)
+    double holdStart = 1.0, holdEnd = 2.0;  // seconds held on the first / last frame
+    float ease = 0.3f;           // 0: constant doublings per second, 1: smooth start and stop
+    bool hdr = true;             // 10-bit PQ BT.2020 HEVC; else 8-bit BT.709 HEVC
+    float nits = 0.f;            // SDR white in nits for HDR output; 0: the display's
+    float headroom = 0.f;        // peak / SDR white for the tone map; 0: the display's
+    int cq = 20;                 // NVENC constant quality
+    int subsamples = 3;          // composite samples per axis per output pixel
+    bool debug = false;          // print field statistics per keyframe
+    std::string codec;           // ffmpeg encoder; empty: hevc_nvenc
+    std::string outPath;         // empty: Videos\Mandelbloom\mandel_<stamp>_<zoom>.mp4
+};
+
+// A running export. Keyframes are rendered 2x apart in zoom into two field
+// slots; every output frame is composited from the finer keyframe in the
+// centre and the coarser one around it.
+struct VideoJob {
+    bool active = false;
+    bool cancel = false;
+    bool quitAfter = false;
+    bool previewOk = true;
+    VideoParams p;
+    VideoEncoder enc;
+    std::string outPath, error;
+    int w = 0, h = 0;
+    float nits = 203.f, headroom = 1.f;
+    View target;                        // centre and end scale (per output pixel)
+    double startScale = 0, endScale = 0;
+    int keyCount = 0, keysDone = 0;
+    struct Key {
+        int slot = 0, gen = 0;
+        float minIter = -1.f;
+        bool ready = false;
+    };
+    std::vector<Key> keys;
+    int iterating = -1, nextKey = 0;    // keyframe in the live field, next to start
+    int totalFrames = 0, frame = 0;
+    double t0 = 0, keyMs = 0;
+    View savedRender, savedShown;
+    ViewParams savedView;
 };
 
 struct App {
@@ -109,6 +158,12 @@ struct App {
     bool savedPresetsValid = false;
     double fps = 0.0;
     float uiScale = 1.f;
+    // Video export.
+    VideoParams videoParams;
+    int videoSizeChoice = 0;   // 0 window, 1 1080p, 2 1440p, 3 2160p
+    bool autoVideo = false;    // --video: start once the window is bound
+    VideoJob video;
+    std::string lastVideoPath;
 };
 
 // Match ImGui's fonts and metrics to the monitor's content scale so the
@@ -533,7 +588,13 @@ bool handleEvent(App& app, const SDL_Event& e) {
             break;
         case SDL_EVENT_KEY_DOWN:
             if (io.WantCaptureKeyboard) break;
-            if (e.key.key == SDLK_ESCAPE) return false;
+            if (e.key.key == SDLK_ESCAPE) {
+                if (app.video.active) {
+                    app.video.cancel = true;
+                    break;
+                }
+                return false;
+            }
             if (e.key.key == SDLK_R) resetView(app);
             if (e.key.key == SDLK_TAB) app.showUi = !app.showUi;
             if (e.key.key == SDLK_F11) setFullscreen(app, !app.fullscreen);
@@ -587,6 +648,398 @@ bool handleEvent(App& app, const SDL_Event& e) {
             break;
     }
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Video export
+
+std::string videoStem(double zoom) {
+    const char* vidsC = SDL_GetUserFolder(SDL_FOLDER_VIDEOS);  // owned by SDL
+    std::string dir = vidsC ? vidsC : "";
+    dir += "Mandelbloom";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::time_t t = std::time(nullptr);
+    char stamp[32];
+    std::tm tmv{};
+    localtime_s(&tmv, &t);
+    std::strftime(stamp, sizeof stamp, "%Y%m%d_%H%M%S", &tmv);
+    char base[128];
+    std::snprintf(base, sizeof base, "mandel_%s_%.2e", stamp, zoom);
+    return dir + "/" + base;
+}
+
+// Scale (complex units per output pixel) of output frame f.
+double videoFrameScale(const VideoJob& job, int f) {
+    const VideoParams& p = job.p;
+    const double t = f / p.fps;
+    double u = p.seconds > 0 ? (t - p.holdStart) / p.seconds : 1.0;
+    u = std::min(std::max(u, 0.0), 1.0);
+    const double sm = u * u * (3.0 - 2.0 * u);
+    u += (sm - u) * p.ease;
+    return job.startScale * std::pow(job.endScale / job.startScale, u);
+}
+
+// The coarser of the two keyframes bracketing scale s.
+int videoOuter(const VideoJob& job, double s) {
+    const int k = (int)std::floor(std::log2(job.startScale / s) + 1e-9);
+    return std::min(std::max(k, 0), job.keyCount - 1);
+}
+
+View videoKeyView(const App& app, int k) {
+    View v = app.video.target;
+    v.scale = app.video.startScale / std::ldexp(1.0, k);
+    return v;
+}
+
+void videoStartKey(App& app, int k) {
+    VideoJob& job = app.video;
+    const View kv = videoKeyView(app, k);
+    app.render = kv;
+    syncViewScale(app);
+    App::Gen g;
+    g.view = kv;
+    g.id = app.nextGen;
+    app.nextGen = app.nextGen % 65535 + 1;
+    app.gens.clear();
+    app.gens.push_back(g);
+    // A re-reference during the previous keyframe moved the orbit off the
+    // target; bring it back (as the interactive path does per generation).
+    if (app.rerefRounds > 0) {
+        rebuildReference(app);
+    } else {
+        app.rerefCheckedStride = 0;
+        updateRefOffset(app);
+        rebuildBla(app);
+    }
+    app.renderer.beginIterate(app.view, g.id);
+    VideoJob::Key& key = job.keys[k];
+    key.gen = g.id;
+    key.slot = 1 + (k % 2);
+    key.ready = false;
+    key.minIter = -1.f;
+    job.iterating = k;
+}
+
+void videoFinish(App& app, bool cancelled) {
+    VideoJob& job = app.video;
+    int code = 0;
+    if (cancelled) job.enc.cancel();
+    else code = job.enc.finish();
+    app.renderer.endVideo();
+    app.render = job.savedRender;
+    app.shown = job.savedShown;
+    app.view = job.savedView;
+    app.gens.clear();
+    app.dirty = true;
+    app.ssApplied = 0;  // re-bind the display next frame
+    app.renderer.setOutputScale(app.sdrWhite, app.hdrHeadroom);
+    app.lastShadeValid = false;
+    app.lastPostValid = false;
+    app.cacheValid = false;
+    job.active = false;
+    const double secs = nowSeconds() - job.t0;
+    char msg[512];
+    if (cancelled && !job.error.empty())
+        std::snprintf(msg, sizeof msg, "video failed: %s", job.error.c_str());
+    else if (cancelled)
+        std::snprintf(msg, sizeof msg, "video cancelled after %d frames", job.frame);
+    else if (code != 0)
+        std::snprintf(msg, sizeof msg, "ffmpeg exited with %d (see .ffmpeg.log)", code);
+    else
+        std::snprintf(msg, sizeof msg, "saved %s (%d frames, %.0f s)", job.outPath.c_str(),
+                      job.frame, secs);
+    app.toast = msg;
+    app.toastUntil = nowSeconds() + 10.0;
+    app.lastVideoPath = job.outPath;
+    std::printf("video %s frames=%d/%d keyframes=%d/%d seconds=%.1f keyMs=%.0f code=%d%s%s\n",
+                job.outPath.c_str(), job.frame, job.totalFrames, job.keysDone, job.keyCount, secs,
+                job.keyMs, code, cancelled ? " cancelled" : "", job.error.empty() ? "" : " error");
+    std::fflush(stdout);
+}
+
+bool startVideo(App& app) {
+    VideoJob& job = app.video;
+    if (job.active) return false;
+    auto fail = [&](const std::string& why) {
+        app.toast = why;
+        app.toastUntil = nowSeconds() + 8.0;
+        std::printf("video not started: %s\n", why.c_str());
+        std::fflush(stdout);
+        return false;
+    };
+    const VideoParams p = app.videoParams;
+    const int winW = app.view.width / app.ss, winH = app.view.height / app.ss;
+    int w = p.width > 0 ? p.width : winW, h = p.height > 0 ? p.height : winH;
+    w &= ~1;
+    h &= ~1;
+    if (w < 16 || h < 16 || p.fps <= 0) return fail("video: bad size or fps");
+    job.p = p;
+    job.w = w;
+    job.h = h;
+    job.nits = p.nits > 0.f ? p.nits : (app.hdrEnabled ? 80.f * app.sdrWhite : 203.f);
+    // Tone map into the display's headroom for both: the HDR video carries
+    // it, the SDR video rolls it off like an F2 screenshot.
+    job.headroom = p.headroom > 0.f ? p.headroom : std::max(app.hdrHeadroom, 1.f);
+    // Same framing as the window at the target; keyframes 2x apart in zoom.
+    job.target = app.render;
+    job.target.scale = app.render.scale * ((double)winW / w);
+    job.endScale = job.target.scale;
+    job.startScale = 3.2 / (std::max(p.zoomFrom, 1e-6) * w);
+    if (job.startScale <= job.endScale * 1.0001) return fail("video: start zoom is past the target");
+    job.keyCount = (int)std::ceil(std::log2(job.startScale / job.endScale) - 1e-9) + 1;
+    job.keys.assign((size_t)job.keyCount, VideoJob::Key{});
+    job.keysDone = 0;
+    job.totalFrames = std::max(1, (int)std::llround((p.holdStart + p.seconds + p.holdEnd) * p.fps));
+    job.frame = 0;
+    job.nextKey = 0;
+    job.iterating = -1;
+    job.keyMs = 0;
+    job.error.clear();
+    job.cancel = false;
+    job.previewOk = true;
+
+    const double zoom = 3.2 / (job.endScale * w);
+    std::string stem = p.outPath;
+    if (stem.empty()) {
+        stem = videoStem(zoom);
+    } else if (stem.size() > 4 && stem.compare(stem.size() - 4, 4, ".mp4") == 0) {
+        stem.resize(stem.size() - 4);
+    }
+    job.outPath = stem + ".mp4";
+    writeLocationFile(app, stem);  // command line + .preset sidecar, like F2
+    {
+        std::ofstream loc(stem + ".txt", std::ios::app);
+        loc << "--video-seconds " << p.seconds << " --video-fps " << p.fps << " --video-size " << w
+            << "x" << h << " --video-from " << p.zoomFrom << (p.hdr ? "" : " --video-sdr")
+            << " --video-cq " << p.cq << " --video-hold " << p.holdStart << "," << p.holdEnd
+            << " --video-ease " << p.ease << " --video-nits " << job.nits << "\n";
+    }
+    VideoEncodeSettings es;
+    es.outPath = job.outPath;
+    es.width = w;
+    es.height = h;
+    es.fps = p.fps;
+    es.hdr = p.hdr;
+    es.cq = p.cq;
+    es.codec = p.codec;
+    es.logPath = stem + ".ffmpeg.log";
+    if (!job.enc.start(es)) return fail("ffmpeg failed to start: " + job.enc.error());
+
+    // Take over the renderer.
+    job.savedRender = app.render;
+    job.savedShown = app.shown;
+    job.savedView = app.view;
+    if (!app.renderer.bindVideo(w, h, app.ss, 2)) {
+        job.enc.cancel();
+        return fail("video: could not allocate the render buffers");
+    }
+    app.view.width = w * app.ss;
+    app.view.height = h * app.ss;
+    app.render = job.target;
+    app.shown = job.target;
+    syncViewScale(app);
+    app.gens.clear();
+    rebuildReference(app);  // once, at the target; keyframes only rebuild the BLA table
+    app.renderer.buildPaletteLut(app.shade);
+    app.renderer.setOutputScale(1.f, job.headroom);
+    job.t0 = nowSeconds();
+    job.active = true;
+    std::printf("video start %s %dx%d fps=%g frames=%d keyframes=%d hdr=%d nits=%.0f headroom=%.2f\n",
+                job.outPath.c_str(), w, h, p.fps, job.totalFrames, job.keyCount, p.hdr ? 1 : 0,
+                job.nits, job.headroom);
+    std::printf("  ffmpeg: %s\n", job.enc.commandLine().c_str());
+    std::fflush(stdout);
+    app.toast = "rendering " + job.outPath;
+    app.toastUntil = nowSeconds() + 4.0;
+    return true;
+}
+
+// Debug: write keyframe k as a PNG, composited 1:1 from its slot.
+void videoDumpKey(App& app, int k, const char* suffix) {
+    VideoJob& job = app.video;
+    const VideoJob::Key& key = job.keys[(size_t)k];
+    const View kv = videoKeyView(app, k);
+    const double savedScale = app.shown.scale;
+    app.shown.scale = kv.scale;
+    CompositeMap m;
+    m.ss = 2;
+    m.genCount = 1;
+    GenMap& gm = m.gens[0];
+    mapOnto(app, kv, app.ss, app.view.width, app.view.height, gm.ox, gm.oy, gm.ratio);
+    gm.pixelScale = (float)(kv.scale / app.ss);
+    gm.gen = key.gen;
+    gm.slot = key.slot;
+    app.renderer.composite(app.shade, 0.f, m);
+    app.renderer.postProcess(app.post, 0);
+    std::vector<uint32_t> px;
+    if (app.renderer.readOutput(px)) {
+        char name[96];
+        std::snprintf(name, sizeof name, "_k%03d%s.png", k, suffix);
+        const std::string stem = job.outPath.substr(0, job.outPath.size() - 4);
+        writePng((stem + name).c_str(), px.data(), job.w, job.h);
+    }
+    app.shown.scale = savedScale;
+}
+
+// Keyframe pipeline: keep the live field iterating the next keyframe whose
+// slot is free, stash finished ones.
+void videoPumpKeys(App& app) {
+    VideoJob& job = app.video;
+    if (app.renderer.iterateBusy()) return;
+    if (job.iterating >= 0) {
+        const bool sliceDone = app.renderer.takeSliceFinished();
+        const int done = app.renderer.completedStride();
+        if (sliceDone && app.ref.escaped && done > 0 && done != app.rerefCheckedStride &&
+            app.rerefRounds < 12) {
+            app.rerefCheckedStride = done;
+            int fx, fy;
+            if (app.renderer.findUnreliable(fx, fy)) {
+                rereferenceAt(app, fx, fy);
+                std::printf("video keyframe %d: re-reference %d at stride %d\n", job.iterating,
+                            app.rerefRounds, done);
+            }
+        }
+        if (!app.renderer.iterateDone()) {
+            app.renderer.stepIterate();
+            return;
+        }
+        VideoJob::Key& key = job.keys[(size_t)job.iterating];
+        if (job.p.debug) {
+            CudaRenderer::DebugStats st;
+            if (app.renderer.debugStats(key.gen, st))
+                std::printf("video keyframe %d gen %d: total=%d match=%d zero=%d other=%d active=%d "
+                            "escaped=%d inside=%d matchInside=%d iterMs=%.0f min=%.0f\n",
+                            job.iterating, key.gen, st.total, st.genMatch, st.genZero, st.genOther,
+                            st.stActive, st.stEscaped, st.stInside, st.genMatchInside,
+                            app.renderer.lastIterateMs(), app.renderer.minIter());
+            std::fflush(stdout);
+        }
+        app.renderer.stashField(key.slot);
+        if (job.p.debug) videoDumpKey(app, job.iterating, "");
+        key.minIter = app.renderer.minIter();
+        key.ready = true;
+        job.keyMs += app.renderer.lastIterateMs();
+        job.iterating = -1;
+        ++job.keysDone;
+    }
+    if (job.nextKey < job.keyCount) {
+        const int k = job.nextKey;
+        const int outer = videoOuter(job, videoFrameScale(job, job.frame));
+        if (k < 2 || k - 2 < outer) {  // its slot's previous keyframe is no longer needed
+            videoStartKey(app, k);
+            ++job.nextKey;
+        }
+    }
+}
+
+void videoStep(App& app) {
+    VideoJob& job = app.video;
+    if (job.cancel) {
+        videoFinish(app, true);
+        return;
+    }
+    videoPumpKeys(app);
+    const double budgetEnd = nowSeconds() + 0.05;  // then let the window update
+    while (job.frame < job.totalFrames && nowSeconds() < budgetEnd) {
+        const double s = videoFrameScale(job, job.frame);
+        const int outer = videoOuter(job, s);
+        const int inner = outer + 1 < job.keyCount ? outer + 1 : -1;
+        if (!job.keys[(size_t)outer].ready || (inner >= 0 && !job.keys[(size_t)inner].ready)) break;
+        app.shown.scale = s;
+        CompositeMap m;
+        m.ss = std::max(1, job.p.subsamples);
+        m.genCount = 0;
+        auto add = [&](int k) {
+            GenMap& gm = m.gens[m.genCount++];
+            const View kv = videoKeyView(app, k);
+            mapOnto(app, kv, app.ss, app.view.width, app.view.height, gm.ox, gm.oy, gm.ratio);
+            gm.pixelScale = (float)(kv.scale / app.ss);
+            gm.gen = job.keys[(size_t)k].gen;
+            gm.slot = job.keys[(size_t)k].slot;
+        };
+        if (inner >= 0) add(inner);
+        add(outer);
+        // Palette anchor: between the two keyframes' minima.
+        float base = 0.f;
+        if (app.shade.anchor) {
+            const float mo = job.keys[(size_t)outer].minIter;
+            const float mi = inner >= 0 ? job.keys[(size_t)inner].minIter : -1.f;
+            if (mo >= 0.f && mi >= 0.f) {
+                const double frac = std::log2(job.startScale / s) - outer;
+                base = (float)(mo + (mi - mo) * std::min(std::max(frac, 0.0), 1.0));
+            } else {
+                base = std::max(mo, mi);
+            }
+            base = std::floor(std::max(base, 0.f));
+        }
+        app.shade.iterBase = base;
+        const float t = app.animate ? (float)(job.frame / job.p.fps) : 0.f;
+        app.renderer.composite(app.shade, t, m);
+        app.renderer.postProcess(app.post, (uint32_t)job.frame);
+        size_t bytes = 0;
+        const void* buf = app.renderer.convertFrame(
+            job.p.hdr ? CudaRenderer::VIDEO_P010 : CudaRenderer::VIDEO_YUV420P8, job.nits, bytes);
+        if (!buf) {
+            job.error = "frame conversion failed";
+            job.cancel = true;
+            break;
+        }
+        if (!job.enc.submit(buf, bytes)) {
+            job.error = job.enc.error();
+            job.cancel = true;
+            break;
+        }
+        ++job.frame;
+        videoPumpKeys(app);
+    }
+    if (job.previewOk) app.renderer.previewToDisplay(app.sdrWhite);
+    app.renderer.syncDisplay();
+    if (!job.cancel && job.frame >= job.totalFrames) videoFinish(app, false);
+}
+
+void drawVideoUi(App& app) {
+    if (!ImGui::CollapsingHeader("Video")) return;
+    VideoJob& job = app.video;
+    VideoParams& vp = app.videoParams;
+    if (job.active) {
+        const double el = nowSeconds() - job.t0;
+        const float prog = job.totalFrames > 0 ? (float)job.frame / job.totalFrames : 0.f;
+        const double eta = job.frame > 0 ? el / job.frame * (job.totalFrames - job.frame) : 0.0;
+        char label[96];
+        std::snprintf(label, sizeof label, "%d / %d frames", job.frame, job.totalFrames);
+        ImGui::ProgressBar(prog, ImVec2(-FLT_MIN, 0), label);
+        ImGui::Text("keyframes %d / %d   elapsed %.0f s   eta %.0f s", job.keysDone, job.keyCount,
+                    el, eta);
+        ImGui::TextWrapped("%s", job.outPath.c_str());
+        if (ImGui::Button("cancel (Esc)")) job.cancel = true;
+        return;
+    }
+    const char* sizes[] = {"window", "1920 x 1080", "2560 x 1440", "3840 x 2160"};
+    static const int sw[] = {0, 1920, 2560, 3840}, sh[] = {0, 1080, 1440, 2160};
+    ImGui::Combo("size", &app.videoSizeChoice, sizes, 4);
+    vp.width = sw[app.videoSizeChoice];
+    vp.height = sh[app.videoSizeChoice];
+    float secs = (float)vp.seconds;
+    if (ImGui::SliderFloat("seconds", &secs, 2.f, 1200.f, "%.0f", ImGuiSliderFlags_Logarithmic))
+        vp.seconds = secs;
+    int fpsChoice = vp.fps >= 100 ? 2 : vp.fps >= 45 ? 1 : 0;
+    const char* fpss[] = {"30", "60", "120"};
+    if (ImGui::Combo("fps", &fpsChoice, fpss, 3)) vp.fps = fpsChoice == 2 ? 120.0 : fpsChoice == 1 ? 60.0 : 30.0;
+    const double zoomEnd = 3.2 / (app.render.scale * std::max(1, app.view.width / app.ss));
+    const float maxLog = (float)std::max(0.1, std::log10(std::max(zoomEnd, 1.0)) - 0.3);
+    float fromLog = (float)std::log10(std::max(vp.zoomFrom, 1.0));
+    if (ImGui::SliderFloat("start zoom", &fromLog, 0.f, maxLog, "1e%.1f")) vp.zoomFrom = std::pow(10.0, fromLog);
+    ImGui::SliderFloat("ease", &vp.ease, 0.f, 1.f);
+    float hs = (float)vp.holdStart, he = (float)vp.holdEnd;
+    if (ImGui::SliderFloat("hold start", &hs, 0.f, 10.f, "%.1f s")) vp.holdStart = hs;
+    if (ImGui::SliderFloat("hold end", &he, 0.f, 10.f, "%.1f s")) vp.holdEnd = he;
+    ImGui::Checkbox("HDR (10-bit PQ)", &vp.hdr);
+    ImGui::SliderInt("quality (cq)", &vp.cq, 10, 35);
+    const double doublings = std::log2(std::max(zoomEnd, 1.0) / std::max(vp.zoomFrom, 1.0));
+    ImGui::Text("%.0f doublings, %.2f per second", doublings, vp.seconds > 0 ? doublings / vp.seconds : 0.0);
+    if (ImGui::Button("render video")) startVideo(app);
+    if (!app.lastVideoPath.empty()) ImGui::TextWrapped("last: %s", app.lastVideoPath.c_str());
 }
 
 void drawUi(App& app) {
@@ -824,6 +1277,7 @@ void drawUi(App& app) {
             ImGui::SliderFloat("wave cyc/s", &sp.waveSpeed, -2.f, 2.f, "%.2f");
             ImGui::SliderFloat("settled fps cap", &app.bgFps, 0.f, 240.f, "%.0f (0 = every frame)");
         }
+        drawVideoUi(app);
         if (ImGui::CollapsingHeader("Post")) {
             PostParams& pp = app.post;
             const char* tms[] = {"clamp", "Reinhard", "ACES"};
@@ -874,6 +1328,9 @@ int main(int argc, char** argv) {
     std::string argAa;    // "pattern,filter,radius" 
     bool argFullscreen = false;
     bool argHidden = false;  // scripted runs: never show or focus the window  // "bloom=1.2,vignette=0.4,tonemap=2,..." 
+    bool argVideo = false;
+    VideoParams argVideoParams;
+    int argWinW = 0, argWinH = 0;  // initial window size in pixels
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
@@ -902,6 +1359,37 @@ int main(int argc, char** argv) {
             argAa = argv[++i];
         } else if (std::strcmp(argv[i], "--hidden") == 0) {
             argHidden = true;
+        } else if (std::strcmp(argv[i], "--video") == 0) {
+            argVideo = true;
+            if (i + 1 < argc && argv[i + 1][0] != '-') argVideoParams.outPath = argv[++i];
+        } else if (std::strcmp(argv[i], "--video-seconds") == 0 && i + 1 < argc) {
+            argVideoParams.seconds = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--video-fps") == 0 && i + 1 < argc) {
+            argVideoParams.fps = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--video-size") == 0 && i + 1 < argc) {
+            std::sscanf(argv[++i], "%dx%d", &argVideoParams.width, &argVideoParams.height);
+        } else if (std::strcmp(argv[i], "--video-from") == 0 && i + 1 < argc) {
+            argVideoParams.zoomFrom = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--video-sdr") == 0) {
+            argVideoParams.hdr = false;
+        } else if (std::strcmp(argv[i], "--video-cq") == 0 && i + 1 < argc) {
+            argVideoParams.cq = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--video-hold") == 0 && i + 1 < argc) {
+            std::sscanf(argv[++i], "%lf,%lf", &argVideoParams.holdStart, &argVideoParams.holdEnd);
+        } else if (std::strcmp(argv[i], "--video-ease") == 0 && i + 1 < argc) {
+            argVideoParams.ease = (float)std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--video-nits") == 0 && i + 1 < argc) {
+            argVideoParams.nits = (float)std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--video-headroom") == 0 && i + 1 < argc) {
+            argVideoParams.headroom = (float)std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--video-sub") == 0 && i + 1 < argc) {
+            argVideoParams.subsamples = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--video-codec") == 0 && i + 1 < argc) {
+            argVideoParams.codec = argv[++i];
+        } else if (std::strcmp(argv[i], "--video-debug") == 0) {
+            argVideoParams.debug = true;
+        } else if (std::strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
+            std::sscanf(argv[++i], "%dx%d", &argWinW, &argWinH);
         } else {
             positional.push_back(argv[i]);
         }
@@ -921,8 +1409,9 @@ int main(int argc, char** argv) {
     App app;
     float initialScale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (initialScale <= 0.f) initialScale = 1.f;
-    app.window = SDL_CreateWindow("mandelbloom", (int)(1280 * initialScale),
-                                  (int)(800 * initialScale),
+    app.window = SDL_CreateWindow("mandelbloom",
+                                  argWinW > 0 ? argWinW : (int)(1280 * initialScale),
+                                  argWinH > 0 ? argWinH : (int)(800 * initialScale),
                                   SDL_WINDOW_RESIZABLE |
                                       (argHidden ? (SDL_WINDOW_HIDDEN | SDL_WINDOW_NOT_FOCUSABLE)
                                                  : 0));
@@ -951,6 +1440,11 @@ int main(int argc, char** argv) {
     std::printf("HDR: %s, SDR white %.2f, headroom %.2f\n", app.hdrEnabled ? "on" : "off",
                 app.sdrWhite, app.hdrHeadroom);
     applyPreset(app, argPreset);  // classic (0) sets the linear anchored transfer
+    app.videoParams = argVideoParams;
+    if (argVideo) {
+        app.autoVideo = true;
+        app.video.quitAfter = true;
+    }
     if (!argLoad.empty()) {
         Preset pr;
         if (loadPreset(argLoad, pr)) {
@@ -1085,7 +1579,8 @@ int main(int argc, char** argv) {
         // before anything writes into it again.
         app.display.waitForGpu();
         const bool resized = app.display.resize(pw, ph);
-        if (resized || app.ssApplied != app.ss) {
+        if (resized && app.video.active) app.video.previewOk = false;  // display buffer replaced
+        if (!app.video.active && (resized || app.ssApplied != app.ss)) {
             const bool first = app.view.width == 0;
             app.view.width = pw * app.ss;
             app.view.height = ph * app.ss;
@@ -1109,7 +1604,15 @@ int main(int argc, char** argv) {
             app.dirty = true;
         }
         if (pw <= 0 || ph <= 0) continue;
+        if (app.autoVideo && app.view.width > 0 && !app.video.active) {
+            app.autoVideo = false;
+            if (!startVideo(app)) running = false;
+        }
 
+        if (app.video.active) {
+            videoStep(app);
+            if (!app.video.active && app.video.quitAfter) running = false;
+        } else {
         // View changes are applied only between slices, so the slice in
         // flight finishes (its samples stay valid for its generation) and the
         // main thread never blocks on the GPU.
@@ -1248,6 +1751,7 @@ int main(int argc, char** argv) {
             app.lastPostValid = true;
             ++app.frameIndex;
         }
+        }  // interactive path
 
         app.display.imguiNewFrame();
         ImGui_ImplSDL3_NewFrame();
