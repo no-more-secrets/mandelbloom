@@ -18,49 +18,72 @@
 
 namespace {
 
-// Milestone 1 iteration kernel: plain double precision, with the
-// derivative dz/dc carried along for the distance estimate. Placeholder
-// until the perturbation path lands.
-__global__ void iterateDouble(FieldSample* __restrict__ field, int w, int h, double cx,
-                              double cy, double scale, int maxIter) {
+// Perturbation iteration in double precision with Zhuoran's rebasing.
+// Pixel parameter c = C + dc where C is the reference centre. We track
+// dz = z - Z_m and the derivative dz/dc (scaled by pixel size) for the
+// distance estimate.
+//   dz_{n+1} = 2 Z_m dz_n + dz_n^2 + dc
+//   rebase when |Z_m + dz| < |dz|: dz = Z_m + dz, m = 0
+__global__ void iteratePerturb(FieldSample* __restrict__ field, int w, int h, double scale,
+                               int maxIter, DeviceReference ref) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
 
-    const double cr = cx + ((double)x - 0.5 * w) * scale;
-    const double ci = cy - ((double)y - 0.5 * h) * scale;
+    const double dcr = ((double)x - 0.5 * w) * scale;
+    const double dci = -((double)y - 0.5 * h) * scale;
 
-    double zr = 0.0, zi = 0.0;    // z
-    double dr = 0.0, di = 0.0;    // dz/dc
-    double zr2 = 0.0, zi2 = 0.0;
-    int i = 0;
+    double dzr = 0.0, dzi = 0.0;  // dz
+    double zr = 0.0, zi = 0.0;    // full z = Z_m + dz
+    double dr = 0.0, di = 0.0;    // d(z)/d(c) * scale
+    int m = 0;                    // reference index
+    int n = 0;                    // pixel iteration
     const double bailout = 65536.0;
-    while (i < maxIter && zr2 + zi2 < bailout) {
-        // d' = 2 z d + 1
-        const double ndr = 2.0 * (zr * dr - zi * di) + 1.0;
-        const double ndi = 2.0 * (zr * di + zi * dr);
+    const int refLast = ref.length - 1;
+    bool escaped = false;
+
+    while (n < maxIter) {
+        const double Zr = ref.zr[m];
+        const double Zi = ref.zi[m];
+        // derivative uses full z_n = Z_m + dz_n (before the step)
+        const double fzr = Zr + dzr, fzi = Zi + dzi;
+        const double ndr = 2.0 * (fzr * dr - fzi * di) + scale;
+        const double ndi = 2.0 * (fzr * di + fzi * dr);
         dr = ndr;
         di = ndi;
-        zi = 2.0 * zr * zi + ci;
-        zr = zr2 - zi2 + cr;
-        zr2 = zr * zr;
-        zi2 = zi * zi;
-        ++i;
+        // dz' = (2 Z + dz) dz + dc
+        const double ar = 2.0 * Zr + dzr, ai = 2.0 * Zi + dzi;
+        const double ndzr = ar * dzr - ai * dzi + dcr;
+        const double ndzi = ar * dzi + ai * dzr + dci;
+        dzr = ndzr;
+        dzi = ndzi;
+        ++m;
+        ++n;
+        zr = ref.zr[m] + dzr;
+        zi = ref.zi[m] + dzi;
+        const double zmag2 = zr * zr + zi * zi;
+        if (zmag2 > bailout) { escaped = true; break; }
+        const double dzmag2 = dzr * dzr + dzi * dzi;
+        if (zmag2 < dzmag2 || m >= refLast) {
+            dzr = zr;
+            dzi = zi;
+            m = 0;
+        }
     }
 
     FieldSample s;
-    if (i >= maxIter) {
+    if (!escaped) {
         s.iter = -1.f;
         s.de = 0.f;
         s.angle = 0.f;
     } else {
-        const double mag2 = zr2 + zi2;
+        const double mag2 = zr * zr + zi * zi;
         const double logMag = 0.5 * log(mag2);
-        // Continuous escape time: mu = i + 1 - log2(log|z|)
-        s.iter = (float)(i + 1.0 - log2(logMag / 0.6931471805599453));
-        // Distance estimate: |z| log|z| / |dz/dc|
+        s.iter = (float)(n + 1.0 - log2(logMag / 0.6931471805599453));
         const double dmag = sqrt(dr * dr + di * di);
-        s.de = dmag > 0.0 ? (float)(sqrt(mag2) * logMag / dmag) : 0.f;
+        // de here is already in pixels (derivative was scaled), convert to
+        // complex units so the shader's pixelScale division still holds.
+        s.de = dmag > 0.0 ? (float)(sqrt(mag2) * logMag / dmag * scale) : 0.f;
         s.angle = (float)atan2(zi, zr);
     }
     s.pad = 0.f;
@@ -81,6 +104,7 @@ __global__ void shadeKernel(const FieldSample* __restrict__ field, uint32_t* __r
 CudaRenderer::~CudaRenderer() {
     unregisterPbo();
     freeField();
+    freeReference();
     if (evStart_) cudaEventDestroy((cudaEvent_t)evStart_);
     if (evStop_) cudaEventDestroy((cudaEvent_t)evStop_);
 }
@@ -114,6 +138,30 @@ void CudaRenderer::freeField() {
     }
 }
 
+void CudaRenderer::freeReference() {
+    if (refZr_) cudaFree(refZr_);
+    if (refZi_) cudaFree(refZi_);
+    refZr_ = refZi_ = nullptr;
+    refCapacity_ = 0;
+    ref_ = DeviceReference{};
+}
+
+bool CudaRenderer::uploadReference(const double* zr, const double* zi, int length, bool escaped) {
+    if (length > refCapacity_) {
+        freeReference();
+        refCapacity_ = length + length / 4 + 1024;
+        CUDA_CHECK(cudaMalloc(&refZr_, sizeof(double) * (size_t)refCapacity_));
+        CUDA_CHECK(cudaMalloc(&refZi_, sizeof(double) * (size_t)refCapacity_));
+    }
+    CUDA_CHECK(cudaMemcpy(refZr_, zr, sizeof(double) * (size_t)length, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(refZi_, zi, sizeof(double) * (size_t)length, cudaMemcpyHostToDevice));
+    ref_.zr = refZr_;
+    ref_.zi = refZi_;
+    ref_.length = length;
+    ref_.escaped = escaped;
+    return true;
+}
+
 bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height) {
     unregisterPbo();
     freeField();
@@ -128,11 +176,11 @@ bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height) {
 
 bool CudaRenderer::iterate(const ViewParams& view) {
     if (!field_ || view.width != width_ || view.height != height_) return false;
+    if (ref_.length < 2) return false;
     const dim3 block(16, 16);
     const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
     cudaEventRecord((cudaEvent_t)evStart_, 0);
-    iterateDouble<<<grid, block>>>(field_, width_, height_, view.cx, view.cy, view.scale,
-                                   view.maxIter);
+    iteratePerturb<<<grid, block>>>(field_, width_, height_, view.scale, view.maxIter, ref_);
     cudaEventRecord((cudaEvent_t)evStop_, 0);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)evStop_));

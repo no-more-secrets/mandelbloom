@@ -6,8 +6,12 @@
 #include <imgui_impl_opengl3.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
+#include <string>
+#include "bigfloat.h"
 #include "gl_display.h"
+#include "reference.h"
 #include "render_cuda.h"
 
 namespace {
@@ -18,6 +22,8 @@ struct App {
     GlDisplay display;
     CudaRenderer renderer;
     ViewParams view;
+    BigFloat cx{64}, cy{64};   // view centre = reference parameter
+    ReferenceOrbit ref;
     ShadeParams shade;
     bool dirty = true;        // view changed: re-iterate and re-shade
     bool shadeDirty = true;   // only coloring changed
@@ -44,22 +50,45 @@ void applyUiScale(App& app) {
     style.FontScaleDpi = s;
 }
 
+// Bits needed so the centre is exact to well under a pixel.
+mpfr_prec_t precisionFor(double scale) {
+    const double bits = -std::log2(std::max(scale, 1e-300)) + 64.0;
+    return (mpfr_prec_t)std::max(64.0, std::ceil(bits / 32.0) * 32.0);
+}
+
+void updatePrecision(App& app) {
+    const mpfr_prec_t p = precisionFor(app.view.scale);
+    if (p != app.cx.prec()) {
+        app.cx.setPrec(p);
+        app.cy.setPrec(p);
+    }
+}
+
 void zoomAt(App& app, float mx, float my, double factor) {
     // Keep the complex point under the cursor fixed while scaling.
     const double hx = 0.5 * app.view.width, hy = 0.5 * app.view.height;
-    const double ur = app.view.cx + (mx - hx) * app.view.scale;
-    const double ui = app.view.cy - (my - hy) * app.view.scale;
+    const double px = mx - hx, py = my - hy;
+    const double oldScale = app.view.scale;
     app.view.scale *= factor;
-    app.view.cx = ur - (mx - hx) * app.view.scale;
-    app.view.cy = ui + (my - hy) * app.view.scale;
+    updatePrecision(app);
+    app.cx.addDouble(px * (oldScale - app.view.scale));
+    app.cy.subDouble(py * (oldScale - app.view.scale));
     app.dirty = true;
 }
 
 void resetView(App& app) {
-    app.view.cx = -0.5;
-    app.view.cy = 0.0;
     app.view.scale = 3.2 / std::max(1, app.view.width);
+    updatePrecision(app);
+    app.cx.set(-0.5);
+    app.cy.set(0.0);
     app.dirty = true;
+}
+
+// Recompute the reference orbit at the current centre and hand it to the GPU.
+void rebuildReference(App& app) {
+    computeReference(app.cx, app.cy, app.view.maxIter, 65536.0, app.ref);
+    app.renderer.uploadReference(app.ref.zr.data(), app.ref.zi.data(), app.ref.length,
+                                 app.ref.escaped);
 }
 
 bool handleEvent(App& app, const SDL_Event& e) {
@@ -87,8 +116,8 @@ bool handleEvent(App& app, const SDL_Event& e) {
             break;
         case SDL_EVENT_MOUSE_MOTION:
             if (app.dragging && !io.WantCaptureMouse) {
-                app.view.cx -= e.motion.xrel * app.view.scale;
-                app.view.cy += e.motion.yrel * app.view.scale;
+                app.cx.subDouble(e.motion.xrel * app.view.scale);
+                app.cy.addDouble(e.motion.yrel * app.view.scale);
                 app.dirty = true;
             }
             break;
@@ -113,16 +142,19 @@ void drawUi(App& app) {
     if (ImGui::Begin("mandelgpu", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted(app.renderer.deviceName());
         ImGui::Separator();
-        ImGui::Text("center  %.17g", app.view.cx);
-        ImGui::Text("        %.17g i", app.view.cy);
+        const int digits = std::max(5, (int)std::ceil(-std::log10(app.view.scale)) + 3);
+        ImGui::Text("center  %s", app.cx.toString(digits).c_str());
+        ImGui::Text("        %s i", app.cy.toString(digits).c_str());
         const double zoom = 3.2 / (app.view.scale * app.view.width);
-        ImGui::Text("zoom    %.3g x", zoom);
+        ImGui::Text("zoom    %.3g x   (%ld bits)", zoom, (long)app.cx.prec());
         ImGui::Text("size    %d x %d", app.view.width, app.view.height);
         if (ImGui::SliderInt("max iter", &app.view.maxIter, 64, 65536, "%d",
                              ImGuiSliderFlags_Logarithmic)) {
             app.dirty = true;
         }
         ImGui::Separator();
+        ImGui::Text("ref     %.2f ms  (%d iters%s)", app.ref.computeMs, app.ref.length,
+                    app.ref.escaped ? ", escaped" : "");
         ImGui::Text("iterate %.2f ms", app.renderer.lastIterateMs());
         ImGui::Text("shade   %.2f ms", app.renderer.lastShadeMs());
         ImGui::Text("frame   %.0f fps", app.fps);
@@ -156,8 +188,19 @@ void drawUi(App& app) {
 
 }  // namespace
 
-int main(int, char**) {
+int main(int argc, char** argv) {
     SDL_SetMainReady();
+    // Optional start location: mandelgpu <re> <im> <scale> [maxIter]
+    // Numbers are decimal strings, any length. scale is complex units per pixel.
+    std::string argRe, argIm;
+    double argScale = 0.0;
+    int argIter = 0;
+    if (argc >= 4) {
+        argRe = argv[1];
+        argIm = argv[2];
+        argScale = std::atof(argv[3]);
+        if (argc >= 5) argIter = std::atoi(argv[4]);
+    }
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -214,12 +257,22 @@ int main(int, char**) {
             const bool first = app.view.width == 0;
             app.view.width = pw;
             app.view.height = ph;
-            if (first) resetView(app);
+            if (first) {
+                resetView(app);
+                if (argScale > 0.0) {
+                    app.view.scale = argScale;
+                    updatePrecision(app);
+                    app.cx.set(argRe);
+                    app.cy.set(argIm);
+                    if (argIter > 0) app.view.maxIter = argIter;
+                }
+            }
             app.renderer.bindPixelBuffer(app.display.pbo(), pw, ph);
             app.dirty = true;
         }
 
         if (app.dirty && pw > 0 && ph > 0) {
+            rebuildReference(app);
             app.renderer.iterate(app.view);
             app.dirty = false;
             app.shadeDirty = true;
