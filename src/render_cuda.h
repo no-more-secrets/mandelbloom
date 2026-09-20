@@ -75,6 +75,7 @@ private:
     FieldSample* field_ = nullptr;
     struct PixelState* state_ = nullptr;
     int* activeCount_ = nullptr;      // device
+    unsigned long long* sliceStart_ns_ = nullptr;  // device, GPU clock at slice start
     int* activeCountHost_ = nullptr;  // pinned
     void* stream_ = nullptr;
     void* evSlice_ = nullptr;

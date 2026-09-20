@@ -79,9 +79,22 @@ __device__ __forceinline__ const BlaNode* findBla(const DeviceBla& bla, int m, d
     return nullptr;
 }
 
+__device__ __forceinline__ unsigned long long globalTimerNs() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+
+// Stamps the GPU clock right before the slice so the deadline is relative
+// to when the GPU actually started it, not when the host queued it.
+__global__ void stampTimer(unsigned long long* __restrict__ out) { *out = globalTimerNs(); }
+
 __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __restrict__ field,
                              int w, int h, double scale, int maxIter, int sliceIters,
-                             DeviceReference ref, DeviceBla bla, int* __restrict__ activeCount) {
+                             const unsigned long long* __restrict__ startNs,
+                             unsigned long long budgetNs, DeviceReference ref, DeviceBla bla,
+                             int* __restrict__ activeCount) {
+    const unsigned long long deadlineNs = *startNs + budgetNs;
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     const bool inBounds = x < w && y < h;
@@ -102,7 +115,10 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
         bool escaped = false;
 
         double dzmag2 = dzr * dzr + dzi * dzi;
+        int budgetCheck = 0;
         while (n < stop) {
+            // Hard wall-clock budget so a slice can never freeze the display.
+            if ((++budgetCheck & 63) == 0 && globalTimerNs() > deadlineNs) break;
             if (bla.enabled) {
                 const BlaNode* nd = findBla(bla, m, dzmag2, refLast);
                 if (nd) {
@@ -204,6 +220,7 @@ CudaRenderer::~CudaRenderer() {
     if (evShadeA_) cudaEventDestroy((cudaEvent_t)evShadeA_);
     if (evShadeB_) cudaEventDestroy((cudaEvent_t)evShadeB_);
     if (activeCount_) cudaFree(activeCount_);
+    if (sliceStart_ns_) cudaFree(sliceStart_ns_);
     if (activeCountHost_) cudaFreeHost(activeCountHost_);
     if (stream_) cudaStreamDestroy((cudaStream_t)stream_);
 }
@@ -230,6 +247,7 @@ bool CudaRenderer::init() {
     CUDA_CHECK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
     stream_ = st;
     CUDA_CHECK(cudaMalloc(&activeCount_, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&sliceStart_ns_, sizeof(unsigned long long)));
     CUDA_CHECK(cudaMallocHost(&activeCountHost_, sizeof(int)));
     *activeCountHost_ = 0;
     return true;
@@ -335,6 +353,7 @@ bool CudaRenderer::beginIterate(const ViewParams& view) {
     iterView_ = view;
     bla_.enabled = view.useBla ? 1 : 0;
     sliceStart_ = 0;
+    sliceIters_ = 64;  // start small every pass; the adaptive step grows it
     iterDone_ = false;
     sliceInFlight_ = false;
     passMs_ = 0.f;
@@ -354,7 +373,7 @@ bool CudaRenderer::iterateBusy() {
     cudaEventElapsedTime(&sliceMs_, (cudaEvent_t)evStart_, (cudaEvent_t)evStop_);
     passMs_ += sliceMs_;
     iterateMs_ = passMs_;
-    if (*activeCountHost_ == 0 || sliceStart_ >= iterView_.maxIter) iterDone_ = true;
+    if (*activeCountHost_ == 0) iterDone_ = true;
     // Adapt the slice length toward ~25 ms of GPU time.
     if (sliceMs_ > 0.f) {
         float f = 25.f / sliceMs_;
@@ -371,9 +390,10 @@ bool CudaRenderer::stepIterate() {
     const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
     CUDA_CHECK(cudaMemsetAsync(activeCount_, 0, sizeof(int), stream));
     cudaEventRecord((cudaEvent_t)evStart_, stream);
+    stampTimer<<<1, 1, 0, stream>>>(sliceStart_ns_);
     iterateSlice<<<grid, block, 0, stream>>>(state_, field_, width_, height_, iterView_.scale,
-                                             iterView_.maxIter, sliceIters_, ref_, bla_,
-                                             activeCount_);
+                                             iterView_.maxIter, sliceIters_, sliceStart_ns_,
+                                             50ull * 1000000ull, ref_, bla_, activeCount_);
     CUDA_CHECK(cudaGetLastError());
     cudaEventRecord((cudaEvent_t)evStop_, stream);
     CUDA_CHECK(cudaMemcpyAsync(activeCountHost_, activeCount_, sizeof(int),
