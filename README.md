@@ -65,7 +65,9 @@ animation.
 `--script "wait:1500;wheel:5;drag:300,120,12;pan:8,0;shot:out.png;quit"`
 replays input through SDL events and saves the composited frame, with field
 statistics on stdout. `--preset N` picks a shading preset, `--ss N`
-supersampling, `--post "bloom=1.5,vignette=0.4,tonemap=2"` sets post
+supersampling, `--aa pattern,filter,radius` antialiasing (0 grid/1 rotated/2
+stochastic; 0 box/1 tent/2 gaussian/3 blackman), `--hidden` keeps the window
+off screen, `--post "bloom=1.5,vignette=0.4,tonemap=2"` sets post
 parameters, `--nobla` and `--double` select the slow paths for comparison.
 Run it minimised. `build/shots/cmp.py a.png b.png` reports differing pixels.
 
@@ -77,7 +79,8 @@ Run it minimised. `build/shots/cmp.py a.png b.png` reports differing pixels.
 4. Float kernel with exponents (floatexp). (done)
 5. Progressive refinement, generational field, tweened zoom, pan inertia. (done)
 6. Shaders: gradient/cosine palettes, slope lighting, iteration lines, modes, presets. (done)
-7. Supersampling 1x/2x/3x. (done)
+7. Supersampling 1x/2x/3x, rotated-grid and stochastic sample patterns,
+   tent/gaussian/blackman reconstruction filters on the settled image. (done)
 8. Better BLA validity (Imagina-style) for spiral regions.
 9. HDR output (D3D12 swapchain) and post-processing. (done)
 10. 4K image export, zoom video export.
