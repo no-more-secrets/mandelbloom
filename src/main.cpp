@@ -30,6 +30,15 @@ struct App {
     ShadeParams shade;
     bool dirty = true;        // view changed: re-iterate and re-shade
     bool shadeDirty = true;   // only coloring changed
+    // What the display texture currently holds, so it can be reprojected
+    // while a new pass runs.
+    struct Shown {
+        bool valid = false;
+        BigFloat cx{64}, cy{64};
+        double scale = 1.0;
+        int width = 0, height = 0;
+    } shown;
+    bool showingNewPass = false;  // texture follows the running pass
     bool animate = false;
     float animSpeed = 0.05f;  // palette cycles per second
     float animTime = 0.f;
@@ -85,6 +94,48 @@ void resetView(App& app) {
     app.cx.set(-0.5);
     app.cy.set(0.0);
     app.dirty = true;
+}
+
+// Texture coordinates that place the shown frame under the current view.
+void reprojectUv(const App& app, float& u0, float& v0, float& u1, float& v1) {
+    const auto& sh = app.shown;
+    if (!sh.valid || app.showingNewPass) {
+        u0 = v0 = 0.f;
+        u1 = v1 = 1.f;
+        return;
+    }
+    const double ratio = app.view.scale / sh.scale;  // new pixel in old pixels
+    const double dx = BigFloat::diff(app.cx, sh.cx) / sh.scale;   // centre shift, old px
+    const double dy = -BigFloat::diff(app.cy, sh.cy) / sh.scale;
+    const double ox = 0.5 * sh.width + dx, oy = 0.5 * sh.height + dy;
+    const double hx = 0.5 * app.view.width, hy = 0.5 * app.view.height;
+    u0 = (float)((ox - hx * ratio) / sh.width);
+    v0 = (float)((oy - hy * ratio) / sh.height);
+    u1 = (float)((ox + hx * ratio) / sh.width);
+    v1 = (float)((oy + hy * ratio) / sh.height);
+}
+
+void markShown(App& app) {
+    app.shown.valid = true;
+    app.shown.cx = app.cx;
+    app.shown.cy = app.cy;
+    app.shown.scale = app.view.scale;
+    app.shown.width = app.view.width;
+    app.shown.height = app.view.height;
+}
+
+// Switch the display from the reprojected old frame to the running pass once
+// the pass has at least as much detail as the stretched old frame.
+bool newPassWorthShowing(const App& app) {
+    const int done = app.renderer.completedStride();
+    if (done == 0) return false;
+    if (!app.shown.valid) return true;
+    const double magnification = app.shown.scale / app.view.scale;  // >1 zoomed in
+    // Zoomed in: wait until the new pass beats the stretched old frame.
+    // Panned or zoomed out: the old frame leaves black edges, so accept the
+    // half-resolution level rather than waiting for the full one.
+    const double threshold = magnification > 1.0 ? magnification : 2.0;
+    return (double)done <= threshold;
 }
 
 // Recompute the reference orbit at the current centre, build its BLA
@@ -173,9 +224,10 @@ void drawUi(App& app) {
         if (app.renderer.iterateDone()) {
             ImGui::Text("iterate %.0f ms", app.renderer.lastIterateMs());
         } else {
-            ImGui::Text("iterate %.0f ms  (%d / %d, slice %.1f ms)", app.renderer.lastIterateMs(),
-                        app.renderer.iterateProgress(), app.view.maxIter,
-                        app.renderer.lastSliceMs());
+            ImGui::Text("iterate %.0f ms  (stride %d, %d / %d, slice %.1f ms)",
+                        app.renderer.lastIterateMs(), app.renderer.currentStride(),
+                        std::min(app.renderer.iterateProgress(), app.view.maxIter),
+                        app.view.maxIter, app.renderer.lastSliceMs());
         }
         ImGui::Text("shade   %.2f ms", app.renderer.lastShadeMs());
         ImGui::Text("frame   %.0f fps", app.fps);
@@ -289,22 +341,35 @@ int main(int argc, char** argv) {
                 }
             }
             app.renderer.bindPixelBuffer(app.display.pbo(), pw, ph);
+            app.shown.valid = false;
             app.dirty = true;
         }
 
         if (app.dirty && pw > 0 && ph > 0) {
             rebuildReference(app);
             app.renderer.beginIterate(app.view);
+            app.showingNewPass = false;
             app.dirty = false;
         }
         // One slice in flight at a time. Shade only when the stream is idle so
         // the display never queues behind a slice.
         if (!app.renderer.iterateBusy()) {
-            if (app.renderer.takeSliceFinished()) app.shadeDirty = true;
-            if (app.animate) app.shadeDirty = true;
-            if (app.shadeDirty && pw > 0 && ph > 0) {
-                if (app.renderer.shade(app.shade, app.animTime, app.view.scale)) app.display.upload();
-                app.shadeDirty = false;
+            const bool sliceDone = app.renderer.takeSliceFinished();
+            if (!app.showingNewPass && newPassWorthShowing(app)) {
+                app.showingNewPass = true;
+                app.shadeDirty = true;
+            }
+            if (app.showingNewPass) {
+                if (sliceDone) app.shadeDirty = true;
+                if (app.animate) app.shadeDirty = true;
+                if (app.shadeDirty && pw > 0 && ph > 0) {
+                    const int fill = app.renderer.iterateDone() ? 1 : app.renderer.completedStride();
+                    if (app.renderer.shade(app.shade, app.animTime, app.view.scale, fill)) {
+                        app.display.upload();
+                        markShown(app);
+                    }
+                    app.shadeDirty = false;
+                }
             }
             if (!app.renderer.iterateDone()) app.renderer.stepIterate();
         }
@@ -312,7 +377,11 @@ int main(int argc, char** argv) {
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        app.display.draw();
+        {
+            float u0, v0, u1, v1;
+            reprojectUv(app, u0, v0, u1, v1);
+            app.display.draw(u0, v0, u1, v1);
+        }
         drawUi(app);
         ImGui::Render();
 

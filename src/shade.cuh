@@ -14,7 +14,9 @@ __device__ __forceinline__ float3 cosPalette(const ShadeParams& p, float t) {
 // used to turn the distance estimate into an edge weight.
 __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeParams& p,
                                               float timeSec, float pixelScale) {
-    if (s.iter < 0.f) return make_float3(p.inside[0], p.inside[1], p.inside[2]);
+    // Inside the set, or not computed yet (never show a partial count: it
+    // changes every slice and strobes).
+    if (s.iter < 0.f || s.pad > 0.5f) return make_float3(p.inside[0], p.inside[1], p.inside[2]);
 
     float t;
     if (p.logScale) {
@@ -25,8 +27,7 @@ __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeP
     t += p.offset + timeSec;
     float3 col = cosPalette(p, t);
 
-    const bool pending = s.pad > 0.5f;  // no distance estimate yet
-    if (p.deStrength > 0.f && !pending) {
+    if (p.deStrength > 0.f) {
         // Filaments thinner than a pixel still get drawn dark.
         float edge = s.de / pixelScale;
         edge = fminf(fmaxf(edge, 0.f), 1.f);

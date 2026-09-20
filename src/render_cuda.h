@@ -58,8 +58,14 @@ public:
     // True once after each slice completes (cleared by the call).
     bool takeSliceFinished() { bool f = sliceFinished_; sliceFinished_ = false; return f; }
     int iterateProgress() const { return sliceStart_; }  // iterations issued so far
+    // Coarse-to-fine: the pass runs at stride 8, 4, 2, 1. completedStride is
+    // the finest stride whose pixels are all finished (0 = none yet).
+    int currentStride() const { return stride_; }
+    int completedStride() const { return completedStride_; }
     // Light pass: color the field into the bound pixel buffer.
-    bool shade(const ShadeParams& params, float timeSec, double pixelScale);
+    // fillStride: pixels not yet computed take the value of the nearest
+    // pixel aligned to this stride (block fill of the coarse level).
+    bool shade(const ShadeParams& params, float timeSec, double pixelScale, int fillStride);
 
     float lastIterateMs() const { return iterateMs_; }  // total for the last full pass
     float lastSliceMs() const { return sliceMs_; }
@@ -81,6 +87,9 @@ private:
     void* evSlice_ = nullptr;
     ViewParams iterView_;
     int sliceStart_ = 0;
+    int stride_ = 1;
+    int completedStride_ = 0;
+    int firstStride_ = 8;
     int sliceIters_ = 256;
     bool iterDone_ = true;
     bool sliceInFlight_ = false;

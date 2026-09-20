@@ -90,13 +90,13 @@ __device__ __forceinline__ unsigned long long globalTimerNs() {
 __global__ void stampTimer(unsigned long long* __restrict__ out) { *out = globalTimerNs(); }
 
 __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __restrict__ field,
-                             int w, int h, double scale, int maxIter, int sliceIters,
+                             int w, int h, int stride, double scale, int maxIter, int sliceIters,
                              const unsigned long long* __restrict__ startNs,
                              unsigned long long budgetNs, DeviceReference ref, DeviceBla bla,
                              int* __restrict__ activeCount) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    const int x = (blockIdx.x * blockDim.x + threadIdx.x) * stride;
+    const int y = (blockIdx.y * blockDim.y + threadIdx.y) * stride;
     const bool inBounds = x < w && y < h;
     const size_t idx = inBounds ? (size_t)y * w + x : 0;
     PixelState st{};
@@ -199,12 +199,19 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
 }
 
 __global__ void shadeKernel(const FieldSample* __restrict__ field, uint32_t* __restrict__ out,
-                            int w, int h, ShadeParams p, float timeSec, float pixelScale) {
+                            int w, int h, ShadeParams p, float timeSec, float pixelScale,
+                            int fillStride) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
     const size_t idx = (size_t)y * w + x;
-    out[idx] = packSRGB8(shadeSample(field[idx], p, timeSec, pixelScale));
+    FieldSample s = field[idx];
+    if (s.pad > 0.5f && fillStride > 1) {
+        // Not computed yet: borrow the finished coarse sample for this block.
+        const int bx = x - (x % fillStride), by = y - (y % fillStride);
+        s = field[(size_t)by * w + bx];
+    }
+    out[idx] = packSRGB8(shadeSample(s, p, timeSec, pixelScale));
 }
 
 }  // namespace
@@ -353,7 +360,9 @@ bool CudaRenderer::beginIterate(const ViewParams& view) {
     iterView_ = view;
     bla_.enabled = view.useBla ? 1 : 0;
     sliceStart_ = 0;
-    sliceIters_ = 64;  // start small every pass; the adaptive step grows it
+    sliceIters_ = 512;  // modest start each pass; the GPU deadline bounds it anyway
+    stride_ = firstStride_;
+    completedStride_ = 0;
     iterDone_ = false;
     sliceInFlight_ = false;
     passMs_ = 0.f;
@@ -373,11 +382,19 @@ bool CudaRenderer::iterateBusy() {
     cudaEventElapsedTime(&sliceMs_, (cudaEvent_t)evStart_, (cudaEvent_t)evStop_);
     passMs_ += sliceMs_;
     iterateMs_ = passMs_;
-    if (*activeCountHost_ == 0) iterDone_ = true;
+    if (*activeCountHost_ == 0) {
+        completedStride_ = stride_;
+        if (stride_ <= 1) {
+            iterDone_ = true;
+        } else {
+            stride_ /= 2;
+            sliceStart_ = 0;
+        }
+    }
     // Adapt the slice length toward ~25 ms of GPU time.
     if (sliceMs_ > 0.f) {
         float f = 25.f / sliceMs_;
-        f = fminf(fmaxf(f, 0.5f), 2.f);
+        f = fminf(fmaxf(f, 0.5f), 4.f);
         sliceIters_ = (int)fminf(fmaxf((float)sliceIters_ * f, 16.f), 65536.f);
     }
     return false;
@@ -387,12 +404,14 @@ bool CudaRenderer::stepIterate() {
     if (iterDone_ || sliceInFlight_) return false;
     cudaStream_t stream = (cudaStream_t)stream_;
     const dim3 block(32, 8);
-    const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
+    const int sw = (width_ + stride_ - 1) / stride_, sh = (height_ + stride_ - 1) / stride_;
+    const dim3 grid((sw + block.x - 1) / block.x, (sh + block.y - 1) / block.y);
     CUDA_CHECK(cudaMemsetAsync(activeCount_, 0, sizeof(int), stream));
     cudaEventRecord((cudaEvent_t)evStart_, stream);
     stampTimer<<<1, 1, 0, stream>>>(sliceStart_ns_);
-    iterateSlice<<<grid, block, 0, stream>>>(state_, field_, width_, height_, iterView_.scale,
-                                             iterView_.maxIter, sliceIters_, sliceStart_ns_,
+    iterateSlice<<<grid, block, 0, stream>>>(state_, field_, width_, height_, stride_,
+                                             iterView_.scale, iterView_.maxIter, sliceIters_,
+                                             sliceStart_ns_,
                                              50ull * 1000000ull, ref_, bla_, activeCount_);
     CUDA_CHECK(cudaGetLastError());
     cudaEventRecord((cudaEvent_t)evStop_, stream);
@@ -404,7 +423,8 @@ bool CudaRenderer::stepIterate() {
     return true;
 }
 
-bool CudaRenderer::shade(const ShadeParams& params, float timeSec, double pixelScale) {
+bool CudaRenderer::shade(const ShadeParams& params, float timeSec, double pixelScale,
+                         int fillStride) {
     if (!pboResource_ || !field_) return false;
     cudaStream_t stream = (cudaStream_t)stream_;
     CUDA_CHECK(cudaGraphicsMapResources(1, &pboResource_, stream));
@@ -425,7 +445,7 @@ bool CudaRenderer::shade(const ShadeParams& params, float timeSec, double pixelS
     }
     if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
     shadeKernel<<<grid, block, 0, stream>>>(field_, devPtr, width_, height_, params, timeSec,
-                                            (float)pixelScale);
+                                            (float)pixelScale, fillStride);
     err = cudaGetLastError();
     if (!shadePending_) {
         cudaEventRecord((cudaEvent_t)evShadeB_, stream);

@@ -26,10 +26,12 @@ bool GlDisplay::resize(int width, int height) {
 
     glGenTextures(1, &tex_);
     glBindTexture(GL_TEXTURE_2D, tex_);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+    const float border[4] = {0.f, 0.f, 0.f, 1.f};
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w_, h_, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     glBindTexture(GL_TEXTURE_2D, 0);
     return true;
@@ -44,8 +46,9 @@ void GlDisplay::upload() {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 }
 
-void GlDisplay::draw() const {
+void GlDisplay::draw(float u0, float v0, float u1, float v1) const {
     if (!tex_) return;
     ImDrawList* dl = ImGui::GetBackgroundDrawList();
-    dl->AddImage((ImTextureID)(uintptr_t)tex_, ImVec2(0, 0), ImVec2((float)w_, (float)h_));
+    dl->AddImage((ImTextureID)(uintptr_t)tex_, ImVec2(0, 0), ImVec2((float)w_, (float)h_),
+                 ImVec2(u0, v0), ImVec2(u1, v1));
 }

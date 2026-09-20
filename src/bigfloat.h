@@ -2,6 +2,7 @@
 // Thin RAII wrapper over MPFR for the handful of operations the viewer
 // needs: view center arithmetic and the reference orbit.
 #include <mpfr.h>
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -30,6 +31,16 @@ public:
         std::string r = n >= 0 && s ? s : "?";
         if (s) mpfr_free_str(s);
         return r;
+    }
+
+    // (a - b) as a double; exact enough when the difference is small.
+    static double diff(const BigFloat& a, const BigFloat& b) {
+        mpfr_t t;
+        mpfr_init2(t, std::max(a.prec(), b.prec()));
+        mpfr_sub(t, a.v_, b.v_, MPFR_RNDN);
+        const double d = mpfr_get_d(t, MPFR_RNDN);
+        mpfr_clear(t);
+        return d;
     }
 
     void addDouble(double d) { mpfr_add_d(v_, v_, d, MPFR_RNDN); }
