@@ -1,6 +1,5 @@
-#include <glad/glad.h>
 #include <cuda_runtime.h>
-#include <cuda_gl_interop.h>
+#include <algorithm>
 #include <cstdio>
 #include <cmath>
 #include <utility>
@@ -375,11 +374,23 @@ __device__ __forceinline__ bool sampleBest(const FieldSample* __restrict__ field
     return true;
 }
 
+// Write a linear colour as RGBA16F into the output buffer (scRGB).
+__device__ __forceinline__ void storeOut(uint16_t* __restrict__ out, int pitchPx, int x, int y,
+                                         float3 c, float scale) {
+    ushort4 v;
+    v.x = f2h(c.x * scale);
+    v.y = f2h(c.y * scale);
+    v.z = f2h(c.z * scale);
+    v.w = f2h(1.f);
+    *reinterpret_cast<ushort4*>(out + ((size_t)y * pitchPx + x) * 4) = v;
+}
+
 // Display composite: ss x ss subsamples per display pixel, each taken from
 // the generation with the most detail at that point.
 __global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, int fh, int mx,
-                                int my, uint32_t* __restrict__ out, int w, int h, ShadeParams p,
-                                float timeSec, CompositeMap map, const float4* __restrict__ lut) {
+                                int my, uint16_t* __restrict__ out, int pitchPx, float outScale,
+                                int w, int h, ShadeParams p, float timeSec, CompositeMap map,
+                                const float4* __restrict__ lut) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
@@ -402,10 +413,11 @@ __global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, i
     }
     if (have > 0) {
         const float inv = 1.f / have;
-        out[idx] = packSRGB8(make_float3(acc.x * inv, acc.y * inv, acc.z * inv));
+        storeOut(out, pitchPx, x, y, make_float3(acc.x * inv, acc.y * inv, acc.z * inv), outScale);
     } else {
-        out[idx] = 0xFF000000u;
+        storeOut(out, pitchPx, x, y, make_float3(0.f, 0.f, 0.f), 1.f);
     }
+    (void)idx;
 }
 
 // Settled path, step 1: resolve every subsample once into a ShadeInput.
@@ -433,9 +445,9 @@ __global__ void buildCacheKernel(const FieldSample* __restrict__ field, int fw, 
 }
 
 // Settled path, step 2: colour the cache. Pure streaming.
-__global__ void shadeCachedKernel(const ShadeInput* __restrict__ cache, uint32_t* __restrict__ out,
-                                  int w, int h, int ss, ShadeParams p, float timeSec,
-                                  const float4* __restrict__ lut) {
+__global__ void shadeCachedKernel(const ShadeInput* __restrict__ cache, uint16_t* __restrict__ out,
+                                  int pitchPx, float outScale, int w, int h, int ss, ShadeParams p,
+                                  float timeSec, const float4* __restrict__ lut) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
@@ -449,7 +461,7 @@ __global__ void shadeCachedKernel(const ShadeInput* __restrict__ cache, uint32_t
         acc.z += c.z;
     }
     const float inv = 1.f / (ss * ss);
-    out[idx] = packSRGB8(make_float3(acc.x * inv, acc.y * inv, acc.z * inv));
+    storeOut(out, pitchPx, x, y, make_float3(acc.x * inv, acc.y * inv, acc.z * inv), outScale);
 }
 
 __global__ void paletteLutKernel(float4* __restrict__ lut, ShadeParams p) {
@@ -462,7 +474,7 @@ __global__ void paletteLutKernel(float4* __restrict__ lut, ShadeParams p) {
 }  // namespace
 
 CudaRenderer::~CudaRenderer() {
-    unregisterPbo();
+    freeOutput();
     freeField();
     freeReference();
     freeBla();
@@ -514,12 +526,54 @@ void CudaRenderer::syncAll() {
     if (dispStream_) cudaStreamSynchronize((cudaStream_t)dispStream_);
 }
 
-void CudaRenderer::unregisterPbo() {
-    if (pboResource_) {
-        syncAll();
-        cudaGraphicsUnregisterResource(pboResource_);
-        pboResource_ = nullptr;
+void CudaRenderer::freeOutput() {
+    syncAll();
+    if (out_) {
+        cudaFree(out_);
+        out_ = nullptr;
     }
+    if (extMem_) {
+        cudaDestroyExternalMemory(extMem_);
+        extMem_ = nullptr;
+    }
+    outPitchPx_ = 0;
+}
+
+bool CudaRenderer::syncDisplay() {
+    CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)dispStream_));
+    return true;
+}
+
+bool CudaRenderer::readOutput(std::vector<uint32_t>& rgba8) {
+    if (!out_) return false;
+    CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)dispStream_));
+    const size_t n = (size_t)outPitchPx_ * height_ * 4;
+    std::vector<uint16_t> h(n);
+    CUDA_CHECK(cudaMemcpy(h.data(), out_, n * sizeof(uint16_t), cudaMemcpyDeviceToHost));
+    rgba8.resize((size_t)width_ * height_);
+    auto halfToFloat = [](uint16_t v) {
+        const uint32_t sgn = (v >> 15) & 1u, exp = (v >> 10) & 0x1Fu, man = v & 0x3FFu;
+        float f;
+        if (exp == 0) f = std::ldexp((float)man, -24);
+        else if (exp == 31) f = man ? 0.f : 1e30f;
+        else f = std::ldexp((float)(man | 0x400u), (int)exp - 25);
+        return sgn ? -f : f;
+    };
+    auto enc = [](float v) {
+        v = std::min(std::max(v, 0.f), 1.f);
+        v = v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
+        return (uint32_t)(v * 255.f + 0.5f);
+    };
+    const float inv = outScale_ > 0.f ? 1.f / outScale_ : 1.f;
+    for (int y = 0; y < height_; ++y) {
+        for (int x = 0; x < width_; ++x) {
+            const uint16_t* px = h.data() + ((size_t)y * outPitchPx_ + x) * 4;
+            const uint32_t r = enc(halfToFloat(px[0]) * inv), g = enc(halfToFloat(px[1]) * inv),
+                           b = enc(halfToFloat(px[2]) * inv);
+            rgba8[(size_t)y * width_ + x] = r | (g << 8) | (b << 16) | 0xFF000000u;
+        }
+    }
+    return true;
 }
 
 void CudaRenderer::freeField() {
@@ -609,13 +663,30 @@ bool CudaRenderer::uploadReference(const double* zr, const double* zi, int lengt
     return true;
 }
 
-bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height, int ss) {
-    unregisterPbo();
+bool CudaRenderer::bindOutput(void* sharedHandle, size_t sharedSize, int rowPitchBytes, int width,
+                              int height, int ss) {
+    freeOutput();
     freeField();
     width_ = width;
     height_ = height;
     ss_ = ss < 1 ? 1 : ss;
-    if (!glPbo || width <= 0 || height <= 0) return true;
+    if (!sharedHandle || width <= 0 || height <= 0) return true;
+    {
+        cudaExternalMemoryHandleDesc hd{};
+        hd.type = cudaExternalMemoryHandleTypeD3D12Resource;
+        hd.handle.win32.handle = sharedHandle;
+        hd.size = sharedSize;
+        hd.flags = cudaExternalMemoryDedicated;
+        CUDA_CHECK(cudaImportExternalMemory(&extMem_, &hd));
+        cudaExternalMemoryBufferDesc bd{};
+        bd.offset = 0;
+        bd.size = sharedSize;
+        bd.flags = 0;
+        void* ptr = nullptr;
+        CUDA_CHECK(cudaExternalMemoryGetMappedBuffer(&ptr, extMem_, &bd));
+        out_ = (uint16_t*)ptr;
+        outPitchPx_ = rowPitchBytes / 8;
+    }
     viewW_ = width * ss_;
     viewH_ = height * ss_;
     marginX_ = (viewW_ + 7) / 8;
@@ -624,8 +695,6 @@ bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height, int ss
     fieldH_ = viewH_ + 2 * marginY_;
     const size_t n = (size_t)width * height;
     const size_t fn = (size_t)fieldW_ * fieldH_;
-    CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&pboResource_, glPbo,
-                                            cudaGraphicsRegisterFlagsWriteDiscard));
     CUDA_CHECK(cudaMalloc(&field_, sizeof(FieldSample) * fn));
     CUDA_CHECK(cudaMalloc(&state_, sizeof(PixelState) * fn));
     CUDA_CHECK(cudaMalloc(&fieldAlt_, sizeof(FieldSample) * fn));
@@ -800,35 +869,24 @@ bool CudaRenderer::debugStats(int gen, DebugStats& out) {
 }
 
 bool CudaRenderer::composite(const ShadeParams& params, float timeSec, const CompositeMap& map) {
-    if (!pboResource_ || !field_) return false;
+    if (!out_ || !field_) return false;
     cudaStream_t stream = (cudaStream_t)dispStream_;
-    CUDA_CHECK(cudaGraphicsMapResources(1, &pboResource_, stream));
-    uint32_t* devPtr = nullptr;
-    size_t bytes = 0;
-    cudaError_t err = cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &bytes, pboResource_);
-    if (err != cudaSuccess) {
-        cudaGraphicsUnmapResources(1, &pboResource_, stream);
-        std::fprintf(stderr, "map failed: %s\n", cudaGetErrorString(err));
-        return false;
-    }
     const dim3 block(16, 16);
     const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
-    // Timing of the previous composite, harvested without blocking.
+    // Timing of the previous display pass, harvested without blocking.
     if (shadePending_ && cudaEventQuery((cudaEvent_t)evShadeB_) == cudaSuccess) {
         cudaEventElapsedTime(&shadeMs_, (cudaEvent_t)evShadeA_, (cudaEvent_t)evShadeB_);
         shadePending_ = false;
     }
     if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
-    compositeKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, marginX_, marginY_,
-                                                devPtr, width_, height_, params, timeSec, map,
-                                                paletteLut_);
-    err = cudaGetLastError();
+    compositeKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, marginX_, marginY_, out_,
+                                                outPitchPx_, outScale_, width_, height_, params,
+                                                timeSec, map, paletteLut_);
+    const cudaError_t err = cudaGetLastError();
     if (!shadePending_) {
         cudaEventRecord((cudaEvent_t)evShadeB_, stream);
         shadePending_ = true;
     }
-    // Unmap is stream-ordered; later GL calls wait for it without a host sync.
-    CUDA_CHECK(cudaGraphicsUnmapResources(1, &pboResource_, stream));
     if (err != cudaSuccess) {
         std::fprintf(stderr, "composite kernel failed: %s\n", cudaGetErrorString(err));
         return false;
@@ -856,16 +914,8 @@ bool CudaRenderer::buildShadeCache(const ShadeParams& params, const CompositeMap
 }
 
 bool CudaRenderer::shadeCached(const ShadeParams& params, float timeSec) {
-    if (!pboResource_ || !shadeCache_) return false;
+    if (!out_ || !shadeCache_) return false;
     cudaStream_t stream = (cudaStream_t)dispStream_;
-    CUDA_CHECK(cudaGraphicsMapResources(1, &pboResource_, stream));
-    uint32_t* devPtr = nullptr;
-    size_t bytes = 0;
-    cudaError_t err = cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &bytes, pboResource_);
-    if (err != cudaSuccess) {
-        cudaGraphicsUnmapResources(1, &pboResource_, stream);
-        return false;
-    }
     const dim3 block(16, 16);
     const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
     if (shadePending_ && cudaEventQuery((cudaEvent_t)evShadeB_) == cudaSuccess) {
@@ -873,14 +923,13 @@ bool CudaRenderer::shadeCached(const ShadeParams& params, float timeSec) {
         shadePending_ = false;
     }
     if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
-    shadeCachedKernel<<<grid, block, 0, stream>>>(shadeCache_, devPtr, width_, height_, ss_,
-                                                  params, timeSec, paletteLut_);
-    err = cudaGetLastError();
+    shadeCachedKernel<<<grid, block, 0, stream>>>(shadeCache_, out_, outPitchPx_, outScale_, width_,
+                                                  height_, ss_, params, timeSec, paletteLut_);
+    const cudaError_t err = cudaGetLastError();
     if (!shadePending_) {
         cudaEventRecord((cudaEvent_t)evShadeB_, stream);
         shadePending_ = true;
     }
-    CUDA_CHECK(cudaGraphicsUnmapResources(1, &pboResource_, stream));
     if (err != cudaSuccess) {
         std::fprintf(stderr, "shadeCached kernel failed: %s\n", cudaGetErrorString(err));
         return false;

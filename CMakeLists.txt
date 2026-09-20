@@ -10,7 +10,6 @@ set(CMAKE_CUDA_STANDARD 20)
 
 find_package(SDL3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
-find_package(glad CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 find_package(Stb REQUIRED)
 find_path(MPFR_INCLUDE_DIR mpfr.h REQUIRED)
@@ -19,7 +18,7 @@ find_library(GMP_LIBRARY NAMES gmp REQUIRED)
 
 add_executable(mandelgpu
   src/main.cpp
-  src/gl_display.cpp
+  src/dx_display.cpp
   src/reference.cpp
   src/bla.cpp
   src/script.cpp
@@ -30,12 +29,15 @@ target_include_directories(mandelgpu PRIVATE src ${MPFR_INCLUDE_DIR} ${Stb_INCLU
 target_link_libraries(mandelgpu PRIVATE
   SDL3::SDL3
   imgui::imgui
-  glad::glad
+  d3d12
+  dxgi
+  dxguid
+  d3dcompiler
   CUDA::cudart
   ${MPFR_LIBRARY}
   ${GMP_LIBRARY}
 )
-target_compile_definitions(mandelgpu PRIVATE SDL_MAIN_HANDLED)
+target_compile_definitions(mandelgpu PRIVATE SDL_MAIN_HANDLED NOMINMAX WIN32_LEAN_AND_MEAN)
 if(MSVC)
   target_compile_options(mandelgpu PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /Zc:preprocessor>)
 endif()

@@ -1,0 +1,330 @@
+#include "dx_display.h"
+#include <imgui.h>
+#include <imgui_impl_dx12.h>
+#include <cstdio>
+#include <vector>
+
+using Microsoft::WRL::ComPtr;
+
+namespace {
+
+constexpr DXGI_FORMAT kFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+// Minimal descriptor allocator for Dear ImGui's DX12 backend.
+struct SrvAllocator {
+    ID3D12DescriptorHeap* heap = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE cpuStart{};
+    D3D12_GPU_DESCRIPTOR_HANDLE gpuStart{};
+    unsigned stride = 0;
+    std::vector<int> free;
+    void init(ID3D12Device* dev, ID3D12DescriptorHeap* h, int count) {
+        heap = h;
+        cpuStart = h->GetCPUDescriptorHandleForHeapStart();
+        gpuStart = h->GetGPUDescriptorHandleForHeapStart();
+        stride = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        free.clear();
+        for (int i = count - 1; i >= 0; --i) free.push_back(i);
+    }
+    void alloc(D3D12_CPU_DESCRIPTOR_HANDLE* cpu, D3D12_GPU_DESCRIPTOR_HANDLE* gpu) {
+        const int i = free.back();
+        free.pop_back();
+        cpu->ptr = cpuStart.ptr + (SIZE_T)i * stride;
+        gpu->ptr = gpuStart.ptr + (UINT64)i * stride;
+    }
+    void release(D3D12_CPU_DESCRIPTOR_HANDLE cpu, D3D12_GPU_DESCRIPTOR_HANDLE) {
+        free.push_back((int)((cpu.ptr - cpuStart.ptr) / stride));
+    }
+};
+SrvAllocator g_srv;
+
+bool fail(const char* what, HRESULT hr) {
+    std::fprintf(stderr, "D3D12: %s failed (0x%08lx)\n", what, (unsigned long)hr);
+    return false;
+}
+
+}  // namespace
+
+DxDisplay::~DxDisplay() { shutdown(); }
+
+bool DxDisplay::init(HWND hwnd, int width, int height) {
+    hwnd_ = hwnd;
+    width_ = width;
+    height_ = height;
+    HRESULT hr;
+#ifndef NDEBUG
+    {
+        ComPtr<ID3D12Debug> dbg;
+        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
+    }
+#endif
+    ComPtr<IDXGIFactory6> factory;
+    hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&factory));
+    if (FAILED(hr)) return fail("CreateDXGIFactory2", hr);
+    // The adapter with the most video memory = the RTX, which is where CUDA
+    // lives; the shared buffer must be on the same GPU.
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT i = 0;
+         factory->EnumAdapterByGpuPreference(i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                             IID_PPV_ARGS(&adapter)) != DXGI_ERROR_NOT_FOUND;
+         ++i) {
+        DXGI_ADAPTER_DESC1 d{};
+        adapter->GetDesc1(&d);
+        if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+        if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+                                        IID_PPV_ARGS(&device_))))
+            break;
+    }
+    if (!device_) return fail("D3D12CreateDevice", E_FAIL);
+
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    hr = device_->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue_));
+    if (FAILED(hr)) return fail("CreateCommandQueue", hr);
+
+    BOOL allowTearing = FALSE;
+    if (SUCCEEDED(factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing,
+                                               sizeof allowTearing)))
+        tearing_ = allowTearing != 0;
+
+    DXGI_SWAP_CHAIN_DESC1 sd{};
+    sd.Width = (UINT)width;
+    sd.Height = (UINT)height;
+    sd.Format = kFormat;
+    sd.SampleDesc.Count = 1;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferCount = kFrames;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+    sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    ComPtr<IDXGISwapChain1> sc1;
+    hr = factory->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1);
+    if (FAILED(hr)) return fail("CreateSwapChainForHwnd", hr);
+    factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+    hr = sc1.As(&swapchain_);
+    if (FAILED(hr)) return fail("IDXGISwapChain3", hr);
+    // FP16 + this colour space is scRGB: linear, 1.0 = SDR white reference
+    // (80 nits), values above 1 are HDR when the display allows it.
+    swapchain_->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709);
+
+    D3D12_DESCRIPTOR_HEAP_DESC rd{};
+    rd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    rd.NumDescriptors = kFrames;
+    hr = device_->CreateDescriptorHeap(&rd, IID_PPV_ARGS(&rtvHeap_));
+    if (FAILED(hr)) return fail("CreateDescriptorHeap RTV", hr);
+    rtvStride_ = device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = 64;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    hr = device_->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&srvHeap_));
+    if (FAILED(hr)) return fail("CreateDescriptorHeap SRV", hr);
+    g_srv.init(device_.Get(), srvHeap_.Get(), 64);
+
+    for (int i = 0; i < kFrames; ++i) {
+        hr = device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                             IID_PPV_ARGS(&allocators_[i]));
+        if (FAILED(hr)) return fail("CreateCommandAllocator", hr);
+    }
+    hr = device_->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators_[0].Get(),
+                                    nullptr, IID_PPV_ARGS(&cmdList_));
+    if (FAILED(hr)) return fail("CreateCommandList", hr);
+    cmdList_->Close();
+
+    hr = device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_));
+    if (FAILED(hr)) return fail("CreateFence", hr);
+    fenceEvent_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+    if (!createSwapchainResources()) return false;
+    if (!createSharedBuffer()) return false;
+    return true;
+}
+
+bool DxDisplay::createSwapchainResources() {
+    for (int i = 0; i < kFrames; ++i) {
+        HRESULT hr = swapchain_->GetBuffer((UINT)i, IID_PPV_ARGS(&backBuffers_[i]));
+        if (FAILED(hr)) return fail("GetBuffer", hr);
+        D3D12_CPU_DESCRIPTOR_HANDLE h = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)i * rtvStride_;
+        device_->CreateRenderTargetView(backBuffers_[i].Get(), nullptr, h);
+    }
+    return true;
+}
+
+void DxDisplay::releaseSwapchainResources() {
+    for (int i = 0; i < kFrames; ++i) backBuffers_[i].Reset();
+}
+
+bool DxDisplay::createSharedBuffer() {
+    releaseSharedBuffer();
+    // Row pitch must satisfy D3D12's 256-byte placed-footprint alignment.
+    rowPitch_ = ((width_ * 8) + 255) & ~255;
+    sharedSize_ = (size_t)rowPitch_ * (size_t)height_;
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd{};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = sharedSize_;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN;
+    rd.SampleDesc.Count = 1;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    HRESULT hr = device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd,
+                                                  D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                  IID_PPV_ARGS(&shared_));
+    if (FAILED(hr)) return fail("CreateCommittedResource shared", hr);
+    hr = device_->CreateSharedHandle(shared_.Get(), nullptr, GENERIC_ALL, nullptr,
+                                     &sharedHandle_);
+    if (FAILED(hr)) return fail("CreateSharedHandle", hr);
+    return true;
+}
+
+void DxDisplay::releaseSharedBuffer() {
+    if (sharedHandle_) {
+        CloseHandle(sharedHandle_);
+        sharedHandle_ = nullptr;
+    }
+    shared_.Reset();
+}
+
+void DxDisplay::waitForGpu() {
+    if (!fence_ || fenceValue_ == 0) return;
+    if (fence_->GetCompletedValue() < fenceValue_) {
+        fence_->SetEventOnCompletion(fenceValue_, fenceEvent_);
+        WaitForSingleObject(fenceEvent_, INFINITE);
+    }
+}
+
+bool DxDisplay::resize(int width, int height) {
+    if (width == width_ && height == height_) return false;
+    if (width <= 0 || height <= 0) return false;
+    waitForGpu();
+    releaseSwapchainResources();
+    width_ = width;
+    height_ = height;
+    HRESULT hr = swapchain_->ResizeBuffers(kFrames, (UINT)width, (UINT)height, kFormat,
+                                           tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    if (FAILED(hr)) {
+        fail("ResizeBuffers", hr);
+        return true;
+    }
+    createSwapchainResources();
+    createSharedBuffer();
+    return true;
+}
+
+bool DxDisplay::present(ImDrawData* drawData, bool vsync) {
+    const UINT bi = swapchain_->GetCurrentBackBufferIndex();
+    // Make sure this frame's allocator is free.
+    if (frameFence_[bi] != 0 && fence_->GetCompletedValue() < frameFence_[bi]) {
+        fence_->SetEventOnCompletion(frameFence_[bi], fenceEvent_);
+        WaitForSingleObject(fenceEvent_, INFINITE);
+    }
+    allocators_[bi]->Reset();
+    cmdList_->Reset(allocators_[bi].Get(), nullptr);
+
+    ID3D12Resource* bb = backBuffers_[bi].Get();
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = bb;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    cmdList_->ResourceBarrier(1, &b);
+
+    // Shared buffer -> back buffer.
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = shared_.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = 0;
+    src.PlacedFootprint.Footprint.Format = kFormat;
+    src.PlacedFootprint.Footprint.Width = (UINT)width_;
+    src.PlacedFootprint.Footprint.Height = (UINT)height_;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = (UINT)rowPitch_;
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = bb;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+    cmdList_->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    cmdList_->ResourceBarrier(1, &b);
+
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtvHeap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += (SIZE_T)bi * rtvStride_;
+    cmdList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    ID3D12DescriptorHeap* heaps[] = {srvHeap_.Get()};
+    cmdList_->SetDescriptorHeaps(1, heaps);
+    if (drawData && imguiUp_) ImGui_ImplDX12_RenderDrawData(drawData, cmdList_.Get());
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    cmdList_->ResourceBarrier(1, &b);
+    cmdList_->Close();
+    ID3D12CommandList* lists[] = {cmdList_.Get()};
+    queue_->ExecuteCommandLists(1, lists);
+
+    HRESULT hr;
+    if (vsync) {
+        hr = swapchain_->Present(1, 0);
+    } else {
+        hr = swapchain_->Present(0, tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    }
+    ++fenceValue_;
+    queue_->Signal(fence_.Get(), fenceValue_);
+    frameFence_[bi] = fenceValue_;
+    if (FAILED(hr)) return fail("Present", hr);
+    return true;
+}
+
+bool DxDisplay::imguiInit() {
+    ImGui_ImplDX12_InitInfo info{};
+    info.Device = device_.Get();
+    info.CommandQueue = queue_.Get();
+    info.NumFramesInFlight = kFrames;
+    info.RTVFormat = kFormat;
+    info.DSVFormat = DXGI_FORMAT_UNKNOWN;
+    info.SrvDescriptorHeap = srvHeap_.Get();
+    info.SrvDescriptorAllocFn = [](ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE* cpu,
+                                   D3D12_GPU_DESCRIPTOR_HANDLE* gpu) { g_srv.alloc(cpu, gpu); };
+    info.SrvDescriptorFreeFn = [](ImGui_ImplDX12_InitInfo*, D3D12_CPU_DESCRIPTOR_HANDLE cpu,
+                                  D3D12_GPU_DESCRIPTOR_HANDLE gpu) { g_srv.release(cpu, gpu); };
+    imguiUp_ = ImGui_ImplDX12_Init(&info);
+    return imguiUp_;
+}
+
+void DxDisplay::imguiNewFrame() {
+    if (imguiUp_) ImGui_ImplDX12_NewFrame();
+}
+
+void DxDisplay::imguiShutdown() {
+    if (imguiUp_) {
+        waitForGpu();
+        ImGui_ImplDX12_Shutdown();
+        imguiUp_ = false;
+    }
+}
+
+void DxDisplay::shutdown() {
+    if (!device_) return;
+    waitForGpu();
+    imguiShutdown();
+    releaseSharedBuffer();
+    releaseSwapchainResources();
+    if (fenceEvent_) {
+        CloseHandle(fenceEvent_);
+        fenceEvent_ = nullptr;
+    }
+    fence_.Reset();
+    cmdList_.Reset();
+    for (int i = 0; i < kFrames; ++i) allocators_[i].Reset();
+    srvHeap_.Reset();
+    rtvHeap_.Reset();
+    swapchain_.Reset();
+    queue_.Reset();
+    device_.Reset();
+}

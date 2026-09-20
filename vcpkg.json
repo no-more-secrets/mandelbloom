@@ -7,10 +7,9 @@
       "name": "imgui",
       "features": [
         "sdl3-binding",
-        "opengl3-binding"
+        "dx12-binding"
       ]
     },
-    "glad",
     "gmp",
     "mpfr",
     "stb"

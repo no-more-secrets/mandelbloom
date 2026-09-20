@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <vector>
 #include <cuda_runtime.h>
 #include "field.h"
 
@@ -65,11 +66,20 @@ public:
 
     // Call after the GL context is current. Returns false on failure.
     bool init();
-    // (Re)register the GL pixel unpack buffer and size the field to match,
-    // plus a margin around the view so pans land on existing coarse data.
-    // ss: supersampling factor; the field's view region is (width*ss) x
-    // (height*ss) and the composite averages ss*ss samples per pixel.
-    bool bindPixelBuffer(unsigned glPbo, int width, int height, int ss);
+    // Import the D3D12 shared buffer that receives RGBA16F output (rows of
+    // rowPitchBytes) and size the field to match, plus a margin around the
+    // view so pans land on existing coarse data. ss: supersampling factor;
+    // the field's view region is (width*ss) x (height*ss) and the composite
+    // averages ss*ss samples per pixel.
+    bool bindOutput(void* sharedHandle, size_t sharedSize, int rowPitchBytes, int width,
+                    int height, int ss);
+    // Linear multiplier applied when writing output (SDR white level in
+    // scRGB: 1.0 on SDR displays, e.g. 2.5 for a 200-nit SDR white in HDR).
+    void setOutputScale(float s) { outScale_ = s; }
+    // Wait for the display stream, so D3D12 may copy the output buffer.
+    bool syncDisplay();
+    // Read the output back as 8-bit sRGB (divided by the output scale).
+    bool readOutput(std::vector<uint32_t>& rgba8);
     // Upload a new reference orbit (host arrays of `length` doubles).
     bool uploadReference(const double* zr, const double* zi, int length, bool escaped);
     // Upload a BLA table built for the current reference and view.
@@ -125,14 +135,17 @@ public:
     const char* deviceName() const { return deviceName_; }
 
 private:
-    void unregisterPbo();
+    void freeOutput();
     void freeField();
     void freeReference();
     void freeBla();
     void syncAll();
     void resetPass(const ViewParams& view);
 
-    struct cudaGraphicsResource* pboResource_ = nullptr;
+    cudaExternalMemory_t extMem_ = nullptr;
+    uint16_t* out_ = nullptr;   // mapped shared buffer, RGBA16F
+    int outPitchPx_ = 0;        // pixels per row in out_
+    float outScale_ = 1.f;
     FieldSample* field_ = nullptr;
     struct PixelState* state_ = nullptr;
     FieldSample* fieldAlt_ = nullptr;

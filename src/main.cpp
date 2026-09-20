@@ -1,9 +1,7 @@
-#include <glad/glad.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
-#include <imgui_impl_opengl3.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -13,7 +11,7 @@
 #include <vector>
 #include "bigfloat.h"
 #include "bla.h"
-#include "gl_display.h"
+#include "dx_display.h"
 #include "image_io.h"
 #include "script.h"
 #include "reference.h"
@@ -29,8 +27,12 @@ struct View {
 
 struct App {
     SDL_Window* window = nullptr;
-    SDL_GLContext gl = nullptr;
-    GlDisplay display;
+    DxDisplay display;
+    // HDR state of the window's display, from SDL.
+    bool hdrEnabled = false;
+    float sdrWhite = 1.f;   // SDR white in linear scRGB units (1.0 = 80 nits)
+    float hdrHeadroom = 1.f;
+    bool vsync = true;
     CudaRenderer renderer;
 
     // render: where the pass computes (the target). shown: what the display
@@ -100,6 +102,26 @@ void applyUiScale(App& app) {
     ImGui::StyleColorsDark();
     style.ScaleAllSizes(s);
     style.FontScaleDpi = s;
+    // The back buffer is linear scRGB: convert the sRGB style colours and
+    // lift them to SDR white so the UI looks the same on SDR and HDR.
+    auto lin = [](float v) { return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f); };
+    for (int i = 0; i < ImGuiCol_COUNT; ++i) {
+        ImVec4& c = style.Colors[i];
+        c.x = lin(c.x) * app.sdrWhite;
+        c.y = lin(c.y) * app.sdrWhite;
+        c.z = lin(c.z) * app.sdrWhite;
+    }
+}
+
+void readHdrState(App& app) {
+    const SDL_PropertiesID props = SDL_GetWindowProperties(app.window);
+    app.hdrEnabled = SDL_GetBooleanProperty(props, SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false);
+    app.sdrWhite = SDL_GetFloatProperty(props, SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT, 1.f);
+    app.hdrHeadroom = SDL_GetFloatProperty(props, SDL_PROP_WINDOW_HDR_HEADROOM_FLOAT, 1.f);
+    if (app.sdrWhite <= 0.f) app.sdrWhite = 1.f;
+    app.renderer.setOutputScale(app.sdrWhite);
+    app.uiScale = 0.f;  // re-apply style with the new white level
+    applyUiScale(app);
 }
 
 // Bits needed so the centre is exact to well under a pixel.
@@ -411,6 +433,10 @@ bool handleEvent(App& app, const SDL_Event& e) {
             app.uiScale = 0.f;  // force re-apply
             applyUiScale(app);
             break;
+        case SDL_EVENT_WINDOW_HDR_STATE_CHANGED:
+            readHdrState(app);
+            app.cachedShown = false;  // output scale changed: recolour
+            break;
         case SDL_EVENT_KEY_DOWN:
             if (io.WantCaptureKeyboard) break;
             if (e.key.key == SDLK_ESCAPE) return false;
@@ -510,6 +536,10 @@ void drawUi(App& app) {
         }
         ImGui::Text("display %.2f ms%s", app.renderer.lastShadeMs(),
                     app.cachedShown ? "  (cached)" : "");
+        ImGui::Text("output  %s  SDR white %.2f  headroom %.2f",
+                    app.hdrEnabled ? "HDR scRGB FP16" : "SDR (FP16 scRGB)", app.sdrWhite,
+                    app.hdrHeadroom);
+        ImGui::Checkbox("vsync", &app.vsync);
         ImGui::Text("frame   %.0f fps", app.fps);
         ImGui::Checkbox("smooth zoom", &app.tweenEnabled);
         ImGui::SameLine();
@@ -666,43 +696,36 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 6);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-
     App app;
     float initialScale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (initialScale <= 0.f) initialScale = 1.f;
     app.window = SDL_CreateWindow("mandelgpu", (int)(1280 * initialScale),
                                   (int)(800 * initialScale),
-                                  SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
+                                  SDL_WINDOW_RESIZABLE);
     if (!app.window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
     }
-    app.gl = SDL_GL_CreateContext(app.window);
-    if (!app.gl) {
-        std::fprintf(stderr, "SDL_GL_CreateContext failed: %s\n", SDL_GetError());
-        return 1;
+    HWND hwnd = (HWND)SDL_GetPointerProperty(SDL_GetWindowProperties(app.window),
+                                             SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr);
+    {
+        int pw0 = 0, ph0 = 0;
+        SDL_GetWindowSizeInPixels(app.window, &pw0, &ph0);
+        if (!app.display.init(hwnd, pw0, ph0)) return 1;
     }
-    SDL_GL_MakeCurrent(app.window, app.gl);
-    SDL_GL_SetSwapInterval(1);
-    if (!gladLoadGLLoader((GLADloadproc)SDL_GL_GetProcAddress)) {
-        std::fprintf(stderr, "gladLoadGLLoader failed\n");
-        return 1;
-    }
-    std::printf("OpenGL %s on %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
+    std::printf("D3D12 FP16 scRGB swapchain\n");
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
-    ImGui_ImplSDL3_InitForOpenGL(app.window, app.gl);
-    ImGui_ImplOpenGL3_Init("#version 460");
-    applyUiScale(app);
+    ImGui_ImplSDL3_InitForD3D(app.window);
+    if (!app.display.imguiInit()) return 1;
 
     if (!app.renderer.init()) return 1;
     std::printf("CUDA: %s\n", app.renderer.deviceName());
+    readHdrState(app);
+    std::printf("HDR: %s, SDR white %.2f, headroom %.2f\n", app.hdrEnabled ? "on" : "off",
+                app.sdrWhite, app.hdrHeadroom);
     if (argPreset > 0) applyPreset(app.shade, argPreset);
     app.ss = std::min(3, std::max(1, argSs));
     if (argNoBla) app.view.useBla = false;
@@ -725,6 +748,9 @@ int main(int argc, char** argv) {
 
         int pw = 0, ph = 0;
         SDL_GetWindowSizeInPixels(app.window, &pw, &ph);
+        // The previous frame's copy out of the shared buffer must finish
+        // before anything writes into it again.
+        app.display.waitForGpu();
         const bool resized = app.display.resize(pw, ph);
         if (resized || app.ssApplied != app.ss) {
             const bool first = app.view.width == 0;
@@ -744,7 +770,8 @@ int main(int argc, char** argv) {
                     snapShown(app);
                 }
             }
-            app.renderer.bindPixelBuffer(app.display.pbo(), pw, ph, app.ss);
+            app.renderer.bindOutput(app.display.sharedHandle(), app.display.sharedSize(),
+                                    app.display.rowPitch(), pw, ph, app.ss);
             app.gens.clear();
             app.dirty = true;
         }
@@ -831,7 +858,7 @@ int main(int argc, char** argv) {
             if (!settled) {
                 app.cacheValid = false;
                 app.cachedShown = false;
-                if (app.renderer.composite(app.shade, app.animTime, m)) app.display.upload();
+                app.renderer.composite(app.shade, app.animTime, m);
             } else {
                 if (!app.cacheValid || staticChanged || app.cacheGen != gen0) {
                     app.renderer.buildShadeCache(app.shade, m);
@@ -846,7 +873,6 @@ int main(int argc, char** argv) {
                 }
                 if (need) {
                     if (app.renderer.shadeCached(app.shade, app.animTime)) {
-                        app.display.upload();
                         app.cachedShown = true;
                         app.lastShadeSec = nowSeconds();
                     }
@@ -856,17 +882,14 @@ int main(int argc, char** argv) {
             app.lastShadeValid = true;
         }
 
-        ImGui_ImplOpenGL3_NewFrame();
+        app.display.imguiNewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
-        app.display.draw(0.f, 0.f, 1.f, 1.f);
         drawUi(app);
         ImGui::Render();
 
-        glViewport(0, 0, pw, ph);
-        glClearColor(0.f, 0.f, 0.f, 1.f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        // CUDA must be done writing the output before D3D12 copies it.
+        app.renderer.syncDisplay();
 
         if (scripted) {
             bool quit = false;
@@ -882,9 +905,9 @@ int main(int argc, char** argv) {
             if (!shot.empty()) {
                 // The composited image straight from the pixel buffer, plus
                 // the numbers the overlay would show, on stdout.
-                std::vector<uint32_t> px((size_t)pw * ph);
-                if (!app.display.readPixels(px.data(), (int)px.size())) {
-                    std::printf("shot: readPixels failed\n");
+                std::vector<uint32_t> px;
+                if (!app.renderer.readOutput(px)) {
+                    std::printf("shot: readOutput failed\n");
                 } else if (!writePng(shot.c_str(), px.data(), pw, ph)) {
                     std::printf("shot: writePng failed for %s\n", shot.c_str());
                 }
@@ -917,13 +940,13 @@ int main(int argc, char** argv) {
             }
             if (quit) running = false;
         }
-        SDL_GL_SwapWindow(app.window);
+        app.display.present(ImGui::GetDrawData(), app.vsync);
     }
 
-    ImGui_ImplOpenGL3_Shutdown();
+    app.display.imguiShutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
-    SDL_GL_DestroyContext(app.gl);
+    app.display.shutdown();
     SDL_DestroyWindow(app.window);
     SDL_Quit();
     return 0;
