@@ -2,9 +2,10 @@
 #include <cstdint>
 #include "field.h"
 
-// The pixel grid and how it maps onto the complex plane. The centre
-// itself lives in the reference orbit (high precision); the kernel only
-// sees pixel offsets from it. scale is complex units per pixel.
+// The pixel grid of the render pass and how it maps onto the complex
+// plane. The centre itself lives on the host (high precision); the kernel
+// only sees pixel offsets from the reference orbit. scale is complex units
+// per pixel.
 struct ViewParams {
     double scale = 3.0 / 800.0;
     // View centre minus reference centre, complex units. Non-zero after pans
@@ -33,6 +34,17 @@ struct DeviceReference {
     bool escaped = false;
 };
 
+// How the display view maps onto the two image sources. A display pixel p
+// lands on source pixel (ox, oy) + (p - centre) * ratio.
+struct CompositeMap {
+    double nox = 0, noy = 0, ratioN = 1;  // running pass's field
+    double oox = 0, ooy = 0, ratioO = 1;  // last finished frame
+    float newDetail = 0.f;  // source pixels per display pixel, 0 = unusable
+    float oldDetail = 0.f;
+    float pixelScaleN = 1.f;  // field's complex units per field pixel
+    int snapshot = 0;         // keep the result as the new "last frame"
+};
+
 // Owns the CUDA side: the iteration field, the interop registration of
 // the GL pixel buffer, kernel launches, and timing.
 class CudaRenderer {
@@ -51,6 +63,7 @@ public:
     // Upload a BLA table built for the current reference and view.
     bool uploadBla(const struct BlaNode* nodes, int count, const int* levelOffset, int levels,
                    int steps);
+
     // Heavy pass, run in slices so the UI stays live and no kernel runs long
     // enough to trip the Windows GPU watchdog. beginIterate resets state;
     // call stepIterate whenever !iterateBusy() until iterateDone().
@@ -64,23 +77,18 @@ public:
     bool stepIterate();
     bool iterateBusy();
     bool iterateDone() const { return iterDone_; }
-    // True once after each slice completes (cleared by the call).
-    bool takeSliceFinished() { bool f = sliceFinished_; sliceFinished_ = false; return f; }
     int iterateProgress() const { return sliceStart_; }  // iterations issued so far
     // Coarse-to-fine: the pass runs at stride 8, 4, 2, 1. completedStride is
     // the finest stride whose pixels are all finished (0 = none yet).
     int currentStride() const { return stride_; }
     int completedStride() const { return completedStride_; }
-    // Light pass: color the field into the bound pixel buffer.
-    // fillStride: pixels not yet computed take the value of the nearest
-    // pixel aligned to this stride (block fill of the coarse level).
-    bool shade(const ShadeParams& params, float timeSec, double pixelScale, int fillStride);
-    // Composite for the display while a pass runs: the last shaded frame,
-    // reprojected (old pixel = (ox, oy) + (pixel - centre) * ratio), where it
-    // has data; otherwise the running pass's field with block fill; black
-    // where neither has anything yet.
-    bool reproject(const ShadeParams& params, float timeSec, double pixelScale, int fillStride,
-                   double ox, double oy, double ratio);
+    // True once after each slice completes (cleared by the call).
+    bool takeSliceFinished() { bool f = sliceFinished_; sliceFinished_ = false; return f; }
+
+    // Display pass: colour the running field and the last finished frame
+    // into the bound pixel buffer through the given mappings. Runs on its
+    // own stream so it never waits for a slice.
+    bool composite(const ShadeParams& params, float timeSec, const CompositeMap& map);
 
     float lastIterateMs() const { return iterateMs_; }  // total for the last full pass
     float lastSliceMs() const { return sliceMs_; }
@@ -92,31 +100,15 @@ private:
     void freeField();
     void freeReference();
     void freeBla();
+    void syncAll();
+    void resetPass(const ViewParams& view);
+
     struct cudaGraphicsResource* pboResource_ = nullptr;
     FieldSample* field_ = nullptr;
     struct PixelState* state_ = nullptr;
     FieldSample* fieldAlt_ = nullptr;
-    uint32_t* lastImage_ = nullptr;  // copy of the last shaded frame
     struct PixelState* stateAlt_ = nullptr;
-    int* activeCount_ = nullptr;      // device
-    unsigned long long* sliceStart_ns_ = nullptr;  // device, GPU clock at slice start
-    int* activeCountHost_ = nullptr;  // pinned
-    void* stream_ = nullptr;
-    void* evSlice_ = nullptr;
-    ViewParams iterView_;
-    int sliceStart_ = 0;
-    int stride_ = 1;
-    int completedStride_ = 0;
-    int firstStride_ = 8;
-    int sliceIters_ = 256;
-    bool iterDone_ = true;
-    bool sliceInFlight_ = false;
-    bool sliceFinished_ = false;
-    void* evShadeA_ = nullptr;
-    void* evShadeB_ = nullptr;
-    bool shadePending_ = false;
-    float sliceMs_ = 0.f;
-    float passMs_ = 0.f;
+    uint32_t* lastImage_ = nullptr;  // copy of the last finished frame
     double* refZr_ = nullptr;
     double* refZi_ = nullptr;
     int refCapacity_ = 0;
@@ -126,8 +118,28 @@ private:
     int blaNodeCapacity_ = 0;
     int blaLevelCapacity_ = 0;
     DeviceBla bla_;
+    int* activeCount_ = nullptr;      // device
+    unsigned long long* sliceStart_ns_ = nullptr;  // device, GPU clock at slice start
+    int* activeCountHost_ = nullptr;  // pinned
+    void* stream_ = nullptr;      // iteration
+    void* dispStream_ = nullptr;  // composite
+    void* evSlice_ = nullptr;
+    ViewParams iterView_;
+    int sliceStart_ = 0;
+    int sliceIters_ = 512;
+    int stride_ = 1;
+    int completedStride_ = 0;
+    int firstStride_ = 8;
+    bool iterDone_ = true;
+    bool sliceInFlight_ = false;
+    bool sliceFinished_ = false;
+    void* evShadeA_ = nullptr;
+    void* evShadeB_ = nullptr;
+    bool shadePending_ = false;
     int width_ = 0, height_ = 0;
     float iterateMs_ = 0.f, shadeMs_ = 0.f;
+    float sliceMs_ = 0.f;
+    float passMs_ = 0.f;
     char deviceName_[256] = "none";
     void* evStart_ = nullptr;
     void* evStop_ = nullptr;

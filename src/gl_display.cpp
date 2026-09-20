@@ -46,6 +46,14 @@ void GlDisplay::upload() {
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 }
 
+bool GlDisplay::readPixels(unsigned* rgba, int count) const {
+    if (!pbo_ || count < w_ * h_) return false;
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo_);
+    glGetBufferSubData(GL_PIXEL_UNPACK_BUFFER, 0, (GLsizeiptr)w_ * h_ * 4, rgba);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    return true;
+}
+
 void GlDisplay::draw(float u0, float v0, float u1, float v1) const {
     if (!tex_) return;
     ImDrawList* dl = ImGui::GetBackgroundDrawList();

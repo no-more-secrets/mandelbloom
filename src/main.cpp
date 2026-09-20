@@ -7,41 +7,52 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cmath>
 #include <string>
+#include <vector>
 #include "bigfloat.h"
 #include "bla.h"
 #include "gl_display.h"
+#include "image_io.h"
+#include "script.h"
 #include "reference.h"
 #include "render_cuda.h"
 
 namespace {
+
+// A view of the plane: centre at high precision, pixel scale.
+struct View {
+    BigFloat cx{64}, cy{64};
+    double scale = 1.0;
+};
 
 struct App {
     SDL_Window* window = nullptr;
     SDL_GLContext gl = nullptr;
     GlDisplay display;
     CudaRenderer renderer;
-    ViewParams view;
-    BigFloat cx{64}, cy{64};   // view centre
+
+    // Three views. render: where the pass computes (the target). shown: what
+    // the display shows, tweened toward render. last: the last finished
+    // frame kept on the GPU for reprojection.
+    ViewParams view;   // render pass grid + scale
+    View render;
+    View shown;
+    View last;
+    bool lastValid = false;
+    bool tweening = false;
+    float tweenTau = 0.08f;  // seconds to close ~63% of the gap
+    bool tweenEnabled = true;
+
     BigFloat refCx{64}, refCy{64};  // reference orbit centre (kept across pans)
-    int panDx = 0, panDy = 0;  // accumulated pan this frame, field pixels
+    int panDx = 0, panDy = 0;       // accumulated pan this frame, field pixels
     bool panDirty = false;
     ReferenceOrbit ref;
     BlaTable bla;
     float blaEpsLog2 = -24.f;
     ShadeParams shade;
-    bool dirty = true;        // view changed: re-iterate and re-shade
-    bool shadeDirty = true;   // only coloring changed
-    // What the display texture currently holds, so it can be reprojected
-    // while a new pass runs.
-    struct Shown {
-        bool valid = false;
-        BigFloat cx{64}, cy{64};
-        double scale = 1.0;
-        int width = 0, height = 0;
-    } shown;
-    bool showingNewPass = false;  // texture follows the running pass
+    bool dirty = true;  // render view changed: restart the pass
     bool animate = false;
     float animSpeed = 0.05f;  // palette cycles per second
     float animTime = 0.f;
@@ -72,72 +83,63 @@ mpfr_prec_t precisionFor(double scale) {
 }
 
 void updatePrecision(App& app) {
-    const mpfr_prec_t p = precisionFor(app.view.scale);
-    if (p != app.cx.prec()) {
-        app.cx.setPrec(p);
-        app.cy.setPrec(p);
+    const mpfr_prec_t p = precisionFor(app.render.scale);
+    if (p != app.render.cx.prec()) {
+        app.render.cx.setPrec(p);
+        app.render.cy.setPrec(p);
     }
+    if (p > app.shown.cx.prec()) {
+        app.shown.cx.setPrec(p);
+        app.shown.cy.setPrec(p);
+    }
+}
+
+void snapShown(App& app) {
+    app.shown.cx = app.render.cx;
+    app.shown.cy = app.render.cy;
+    app.shown.scale = app.render.scale;
+    app.tweening = false;
 }
 
 void zoomAt(App& app, float mx, float my, double factor) {
     // Keep the complex point under the cursor fixed while scaling.
     const double hx = 0.5 * app.view.width, hy = 0.5 * app.view.height;
     const double px = mx - hx, py = my - hy;
-    const double oldScale = app.view.scale;
-    app.view.scale *= factor;
+    const double oldScale = app.render.scale;
+    app.render.scale *= factor;
+    app.view.scale = app.render.scale;
     updatePrecision(app);
-    app.cx.addDouble(px * (oldScale - app.view.scale));
-    app.cy.subDouble(py * (oldScale - app.view.scale));
+    app.render.cx.addDouble(px * (oldScale - app.render.scale));
+    app.render.cy.subDouble(py * (oldScale - app.render.scale));
     app.dirty = true;
+    if (app.tweenEnabled) app.tweening = true;
+    else snapShown(app);
 }
 
 void resetView(App& app) {
-    app.view.scale = 3.2 / std::max(1, app.view.width);
+    app.render.scale = 3.2 / std::max(1, app.view.width);
+    app.view.scale = app.render.scale;
     updatePrecision(app);
-    app.cx.set(-0.5);
-    app.cy.set(0.0);
+    app.render.cx.set(-0.5);
+    app.render.cy.set(0.0);
+    snapShown(app);
     app.dirty = true;
 }
 
-// Where the current view's centre lands in the shown frame (old pixels) and
-// how many old pixels one new pixel spans.
-void reprojectMapping(const App& app, double& ox, double& oy, double& ratio) {
-    const auto& sh = app.shown;
-    if (!sh.valid) {
-        ox = oy = -1e9;  // nothing valid: everything off-frame
-        ratio = 1.0;
-        return;
-    }
-    ratio = app.view.scale / sh.scale;
-    ox = 0.5 * sh.width + BigFloat::diff(app.cx, sh.cx) / sh.scale;
-    oy = 0.5 * sh.height - BigFloat::diff(app.cy, sh.cy) / sh.scale;
+// Move the shown view toward the render view.
+void tweenShown(App& app, double dt) {
+    if (!app.tweening) return;
+    const double k = 1.0 - std::exp(-dt / app.tweenTau);
+    const double logRatio = std::log(app.render.scale / app.shown.scale);
+    const double dx = BigFloat::diff(app.render.cx, app.shown.cx);
+    const double dy = BigFloat::diff(app.render.cy, app.shown.cy);
+    app.shown.scale *= std::exp(logRatio * k);
+    app.shown.cx.addDouble(dx * k);
+    app.shown.cy.addDouble(dy * k);
+    const double pxErr = std::hypot(dx, dy) / app.render.scale;
+    if (std::fabs(logRatio) < 2e-4 && pxErr < 0.05) snapShown(app);
 }
 
-void markShown(App& app) {
-    app.shown.valid = true;
-    app.shown.cx = app.cx;
-    app.shown.cy = app.cy;
-    app.shown.scale = app.view.scale;
-    app.shown.width = app.view.width;
-    app.shown.height = app.view.height;
-}
-
-// Switch the display from the reprojected old frame to the running pass once
-// the pass has at least as much detail as the stretched old frame.
-bool newPassWorthShowing(const App& app) {
-    const int done = app.renderer.completedStride();
-    if (done == 0) return false;
-    if (!app.shown.valid) return true;
-    const double magnification = app.shown.scale / app.view.scale;  // >1 zoomed in
-    // Zoomed in: wait until the new pass beats the stretched old frame.
-    // Panned or zoomed out: the old frame leaves black edges, so accept the
-    // half-resolution level rather than waiting for the full one.
-    const double threshold = magnification > 1.0 ? magnification : 2.0;
-    return (double)done <= threshold;
-}
-
-// Recompute the reference orbit at the current centre, build its BLA
-// table for this view, and hand both to the GPU.
 // Half the image diagonal in complex units.
 double halfDiagonal(const App& app) {
     return 0.5 * std::hypot((double)app.view.width, (double)app.view.height) * app.view.scale;
@@ -145,8 +147,8 @@ double halfDiagonal(const App& app) {
 
 // View centre relative to the reference centre, into the view params.
 void updateRefOffset(App& app) {
-    app.view.refOffX = BigFloat::diff(app.cx, app.refCx);
-    app.view.refOffY = BigFloat::diff(app.cy, app.refCy);
+    app.view.refOffX = BigFloat::diff(app.render.cx, app.refCx);
+    app.view.refOffY = BigFloat::diff(app.render.cy, app.refCy);
 }
 
 void rebuildBla(App& app) {
@@ -157,13 +159,21 @@ void rebuildBla(App& app) {
 }
 
 void rebuildReference(App& app) {
-    app.refCx = app.cx;
-    app.refCy = app.cy;
+    app.refCx = app.render.cx;
+    app.refCy = app.render.cy;
     updateRefOffset(app);
     computeReference(app.refCx, app.refCy, app.view.maxIter, 65536.0, app.ref);
     app.renderer.uploadReference(app.ref.zr.data(), app.ref.zi.data(), app.ref.length,
                                  app.ref.escaped);
     rebuildBla(app);
+}
+
+// Mapping of a source view onto the shown view: where the shown centre
+// lands in source pixels, and source pixels per shown pixel.
+void mapOnto(const App& app, const View& src, double& ox, double& oy, double& ratio) {
+    ratio = app.shown.scale / src.scale;
+    ox = 0.5 * app.view.width + BigFloat::diff(app.shown.cx, src.cx) / src.scale;
+    oy = 0.5 * app.view.height - BigFloat::diff(app.shown.cy, src.cy) / src.scale;
 }
 
 bool handleEvent(App& app, const SDL_Event& e) {
@@ -191,9 +201,13 @@ bool handleEvent(App& app, const SDL_Event& e) {
             break;
         case SDL_EVENT_MOUSE_MOTION:
             if (app.dragging && !io.WantCaptureMouse) {
+                // A drag is 1:1, so cut any zoom tween short first.
+                if (app.tweening) snapShown(app);
                 const int dx = (int)e.motion.xrel, dy = (int)e.motion.yrel;
-                app.cx.subDouble(dx * app.view.scale);
-                app.cy.addDouble(dy * app.view.scale);
+                app.render.cx.subDouble(dx * app.render.scale);
+                app.render.cy.addDouble(dy * app.render.scale);
+                app.shown.cx = app.render.cx;
+                app.shown.cy = app.render.cy;
                 // Content moves with the mouse: new pixel x shows old pixel x - dx.
                 app.panDx -= dx;
                 app.panDy -= dy;
@@ -202,10 +216,8 @@ bool handleEvent(App& app, const SDL_Event& e) {
             break;
         case SDL_EVENT_MOUSE_WHEEL: {
             if (io.WantCaptureMouse) break;
-            float mx, my;
-            SDL_GetMouseState(&mx, &my);
             const double factor = std::pow(0.8, (double)e.wheel.y);
-            zoomAt(app, mx, my, factor);
+            zoomAt(app, e.wheel.mouse_x, e.wheel.mouse_y, factor);
             break;
         }
         default:
@@ -221,11 +233,11 @@ void drawUi(App& app) {
     if (ImGui::Begin("mandelgpu", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         ImGui::TextUnformatted(app.renderer.deviceName());
         ImGui::Separator();
-        const int digits = std::max(5, (int)std::ceil(-std::log10(app.view.scale)) + 3);
-        ImGui::Text("center  %s", app.cx.toString(digits).c_str());
-        ImGui::Text("        %s i", app.cy.toString(digits).c_str());
-        const double zoom = 3.2 / (app.view.scale * app.view.width);
-        ImGui::Text("zoom    %.3g x   (%ld bits)", zoom, (long)app.cx.prec());
+        const int digits = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
+        ImGui::Text("center  %s", app.render.cx.toString(digits).c_str());
+        ImGui::Text("        %s i", app.render.cy.toString(digits).c_str());
+        const double zoom = 3.2 / (app.render.scale * app.view.width);
+        ImGui::Text("zoom    %.3g x   (%ld bits)", zoom, (long)app.render.cx.prec());
         ImGui::Text("size    %d x %d", app.view.width, app.view.height);
         if (ImGui::SliderInt("max iter", &app.view.maxIter, 64, 65536, "%d",
                              ImGuiSliderFlags_Logarithmic)) {
@@ -248,31 +260,33 @@ void drawUi(App& app) {
                         std::min(app.renderer.iterateProgress(), app.view.maxIter),
                         app.view.maxIter, app.renderer.lastSliceMs());
         }
-        ImGui::Text("shade   %.2f ms", app.renderer.lastShadeMs());
+        ImGui::Text("display %.2f ms", app.renderer.lastShadeMs());
         ImGui::Text("frame   %.0f fps", app.fps);
+        ImGui::Checkbox("smooth zoom", &app.tweenEnabled);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120 * app.uiScale);
+        ImGui::SliderFloat("tau", &app.tweenTau, 0.02f, 0.3f, "%.2f s");
         ImGui::TextDisabled("drag: pan  wheel: zoom  R: reset  Tab: hide");
 
         if (ImGui::CollapsingHeader("Shading")) {
             ShadeParams& sp = app.shade;
-            bool ch = false;
-            ch |= ImGui::Checkbox("animate", &app.animate);
+            ImGui::Checkbox("animate", &app.animate);
             ImGui::SameLine();
-            ch |= ImGui::SliderFloat("speed", &app.animSpeed, -1.f, 1.f, "%.3f cyc/s");
-            ch |= ImGui::SliderFloat("density", &sp.density, 4.f, 1024.f, "%.1f",
-                                     ImGuiSliderFlags_Logarithmic);
-            ch |= ImGui::SliderFloat("offset", &sp.offset, 0.f, 1.f);
+            ImGui::SliderFloat("speed", &app.animSpeed, -1.f, 1.f, "%.3f cyc/s");
+            ImGui::SliderFloat("density", &sp.density, 4.f, 1024.f, "%.1f",
+                               ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("offset", &sp.offset, 0.f, 1.f);
             bool logScale = sp.logScale != 0;
-            if (ImGui::Checkbox("log scale", &logScale)) { sp.logScale = logScale; ch = true; }
-            ch |= ImGui::SliderFloat("edge (DE)", &sp.deStrength, 0.f, 4.f);
-            ch |= ImGui::SliderFloat("exposure", &sp.exposure, 0.f, 4.f);
-            ch |= ImGui::ColorEdit3("inside", sp.inside, ImGuiColorEditFlags_Float);
+            if (ImGui::Checkbox("log scale", &logScale)) sp.logScale = logScale;
+            ImGui::SliderFloat("edge (DE)", &sp.deStrength, 0.f, 4.f);
+            ImGui::SliderFloat("exposure", &sp.exposure, 0.f, 4.f);
+            ImGui::ColorEdit3("inside", sp.inside, ImGuiColorEditFlags_Float);
             ImGui::TextDisabled("palette a + b cos(2pi(c t + d))");
-            ch |= ImGui::DragFloat3("a", sp.a, 0.01f, -1.f, 2.f);
-            ch |= ImGui::DragFloat3("b", sp.b, 0.01f, -1.f, 2.f);
-            ch |= ImGui::DragFloat3("c", sp.c, 0.01f, -4.f, 4.f);
-            ch |= ImGui::DragFloat3("d", sp.d, 0.01f, -1.f, 1.f);
-            if (ImGui::Button("reset palette")) { sp = ShadeParams(); ch = true; }
-            if (ch) app.shadeDirty = true;
+            ImGui::DragFloat3("a", sp.a, 0.01f, -1.f, 2.f);
+            ImGui::DragFloat3("b", sp.b, 0.01f, -1.f, 2.f);
+            ImGui::DragFloat3("c", sp.c, 0.01f, -4.f, 4.f);
+            ImGui::DragFloat3("d", sp.d, 0.01f, -1.f, 1.f);
+            if (ImGui::Button("reset palette")) sp = ShadeParams();
         }
     }
     ImGui::End();
@@ -284,15 +298,26 @@ int main(int argc, char** argv) {
     SDL_SetMainReady();
     // Optional start location: mandelgpu <re> <im> <scale> [maxIter]
     // Numbers are decimal strings, any length. scale is complex units per pixel.
-    std::string argRe, argIm;
+    // Optional: --script "wheel:5;wait:500;shot:out.png;quit" (see script.h).
+    std::string argRe, argIm, scriptText;
     double argScale = 0.0;
     int argIter = 0;
-    if (argc >= 4) {
-        argRe = argv[1];
-        argIm = argv[2];
-        argScale = std::atof(argv[3]);
-        if (argc >= 5) argIter = std::atoi(argv[4]);
+    std::vector<std::string> positional;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
+            scriptText = argv[++i];
+        } else {
+            positional.push_back(argv[i]);
+        }
     }
+    if (positional.size() >= 3) {
+        argRe = positional[0];
+        argIm = positional[1];
+        argScale = std::atof(positional[2].c_str());
+        if (positional.size() >= 4) argIter = std::atoi(positional[3].c_str());
+    }
+    Script script;
+    const bool scripted = !scriptText.empty() && script.parse(scriptText);
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -343,6 +368,12 @@ int main(int argc, char** argv) {
             if (!handleEvent(app, e)) running = false;
         }
 
+        const Uint64 now = SDL_GetPerformanceCounter();
+        const double dt = (double)(now - lastTick) / (double)SDL_GetPerformanceFrequency();
+        lastTick = now;
+        if (dt > 0) app.fps = 0.9 * app.fps + 0.1 * (1.0 / dt);
+        if (app.animate) app.animTime += (float)dt * app.animSpeed;
+
         int pw = 0, ph = 0;
         SDL_GetWindowSizeInPixels(app.window, &pw, &ph);
         if (app.display.resize(pw, ph)) {
@@ -352,19 +383,22 @@ int main(int argc, char** argv) {
             if (first) {
                 resetView(app);
                 if (argScale > 0.0) {
+                    app.render.scale = argScale;
                     app.view.scale = argScale;
                     updatePrecision(app);
-                    app.cx.set(argRe);
-                    app.cy.set(argIm);
+                    app.render.cx.set(argRe);
+                    app.render.cy.set(argIm);
                     if (argIter > 0) app.view.maxIter = argIter;
+                    snapShown(app);
                 }
             }
             app.renderer.bindPixelBuffer(app.display.pbo(), pw, ph);
-            app.shown.valid = false;
+            app.lastValid = false;
             app.dirty = true;
         }
+        if (pw <= 0 || ph <= 0) continue;
 
-        if (app.panDirty && !app.dirty && pw > 0 && ph > 0) {
+        if (app.panDirty && !app.dirty) {
             // Shift what we have, keep the reference unless we drifted more
             // than a view radius from it, and continue on the exposed strip.
             updateRefOffset(app);
@@ -375,50 +409,49 @@ int main(int argc, char** argv) {
             } else {
                 rebuildBla(app);
             }
-            app.showingNewPass = true;
-            app.shadeDirty = true;
             app.panDx = app.panDy = 0;
             app.panDirty = false;
         }
-        if (app.dirty && pw > 0 && ph > 0) {
+        if (app.dirty) {
             rebuildReference(app);
             app.renderer.beginIterate(app.view);
-            app.showingNewPass = false;
             app.panDx = app.panDy = 0;
             app.panDirty = false;
             app.dirty = false;
         }
-        // One slice in flight at a time. Shade only when the stream is idle so
-        // the display never queues behind a slice.
+        tweenShown(app, dt);
+
+        // Keep one slice in flight.
         if (!app.renderer.iterateBusy()) {
-            const bool sliceDone = app.renderer.takeSliceFinished();
-            if (!app.showingNewPass && newPassWorthShowing(app)) {
-                app.showingNewPass = true;
-                app.shadeDirty = true;
-            }
-            if (app.showingNewPass) {
-                if (sliceDone) app.shadeDirty = true;
-                if (app.animate) app.shadeDirty = true;
-                if (app.shadeDirty && pw > 0 && ph > 0) {
-                    const int fill = app.renderer.iterateDone() ? 1 : app.renderer.completedStride();
-                    if (app.renderer.shade(app.shade, app.animTime, app.view.scale, fill)) {
-                        app.display.upload();
-                        markShown(app);
-                    }
-                    app.shadeDirty = false;
-                }
-            } else if (pw > 0 && ph > 0) {
-                // Old frame reprojected, new coarse data where the old frame
-                // has none. Cheap, so do it every frame.
-                double ox, oy, ratio;
-                reprojectMapping(app, ox, oy, ratio);
-                const int fill = app.renderer.completedStride();
-                if (app.renderer.reproject(app.shade, app.animTime, app.view.scale, fill, ox, oy,
-                                           ratio)) {
-                    app.display.upload();
-                }
-            }
+            app.renderer.takeSliceFinished();
             if (!app.renderer.iterateDone()) app.renderer.stepIterate();
+        }
+
+        // Display: composite the running field and the last finished frame
+        // onto the shown view. Cheap, runs every frame on its own stream.
+        {
+            CompositeMap m;
+            mapOnto(app, app.render, m.nox, m.noy, m.ratioN);
+            const int done = app.renderer.completedStride();
+            m.newDetail = app.renderer.iterateDone() ? (float)m.ratioN
+                          : done > 0                 ? (float)(m.ratioN / done)
+                                                     : 0.f;
+            if (app.lastValid) {
+                mapOnto(app, app.last, m.oox, m.ooy, m.ratioO);
+                m.oldDetail = (float)m.ratioO;
+            }
+            m.pixelScaleN = (float)app.render.scale;
+            const bool settled = app.renderer.iterateDone() && !app.tweening;
+            m.snapshot = settled ? 1 : 0;
+            if (app.renderer.composite(app.shade, app.animTime, m)) {
+                app.display.upload();
+                if (settled) {
+                    app.last.cx = app.shown.cx;
+                    app.last.cy = app.shown.cy;
+                    app.last.scale = app.shown.scale;
+                    app.lastValid = true;
+                }
+            }
         }
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -432,13 +465,29 @@ int main(int argc, char** argv) {
         glClearColor(0.f, 0.f, 0.f, 1.f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        SDL_GL_SwapWindow(app.window);
 
-        const Uint64 now = SDL_GetPerformanceCounter();
-        const double dt = (double)(now - lastTick) / (double)SDL_GetPerformanceFrequency();
-        lastTick = now;
-        if (dt > 0) app.fps = 0.9 * app.fps + 0.1 * (1.0 / dt);
-        if (app.animate) app.animTime += (float)dt * app.animSpeed;
+        if (scripted) {
+            bool quit = false;
+            const std::string shot = script.tick(
+                (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency(), pw,
+                ph, quit);
+            if (!shot.empty()) {
+                // The composited image straight from the pixel buffer, plus
+                // the numbers the overlay would show, on stdout.
+                std::vector<uint32_t> px((size_t)pw * ph);
+                if (app.display.readPixels(px.data(), (int)px.size())) {
+                    writePng(shot.c_str(), px.data(), pw, ph);
+                }
+                const double zoom = 3.2 / (app.render.scale * app.view.width);
+                std::printf("shot %s zoom=%.3g iterate=%.0fms done=%d stride=%d/%d tween=%d\n",
+                            shot.c_str(), zoom, app.renderer.lastIterateMs(),
+                            app.renderer.iterateDone() ? 1 : 0, app.renderer.currentStride(),
+                            app.renderer.completedStride(), app.tweening ? 1 : 0);
+                std::fflush(stdout);
+            }
+            if (quit) running = false;
+        }
+        SDL_GL_SwapWindow(app.window);
     }
 
     ImGui_ImplOpenGL3_Shutdown();

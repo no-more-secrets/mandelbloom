@@ -3,11 +3,13 @@
 
 // One sample of the iteration field. Written by the iteration kernel,
 // read by the shading kernel. Coloring never touches iteration state.
+// 24 bytes.
 struct FieldSample {
     float iter;   // smooth escape iteration; < 0 means inside the set
     float de;     // distance estimate in complex units (0 if inside)
     float angle;  // arg(z_final) in [-pi, pi]
-    float pad;
+    float nx, ny; // exterior surface normal (Milnor: z / dz, normalised), 0 inside
+    float flags;  // 1 = pending (not computed yet), 0 = final
 };
 
 // Everything the shading pass needs. Changing these never re-iterates.
@@ -19,7 +21,7 @@ struct ShadeParams {
     float d[3] = {0.00f, 0.33f, 0.67f};
     float density = 64.f;   // iterations per palette cycle (linear mode)
     float offset = 0.f;     // palette phase offset in cycles
-    int logScale = 1;       // 1: t = log2(iter) * density/8, 0: t = iter / density
+    int logScale = 1;       // 1: t = log2(iter) * density/64, 0: t = iter / density
     float deStrength = 1.f; // 0 disables distance-estimate edge darkening
     float exposure = 1.f;
     float inside[3] = {0.f, 0.f, 0.f};

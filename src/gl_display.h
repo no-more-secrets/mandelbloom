@@ -13,6 +13,10 @@ public:
     // Outside [0,1] shows black.
     void draw(float u0, float v0, float u1, float v1) const;
 
+    // Copy the pixel buffer (the composited image, no UI) to host memory.
+    // Works even when the window is minimised, unlike reading the framebuffer.
+    bool readPixels(unsigned* rgba, int count) const;
+
     unsigned pbo() const { return pbo_; }
     unsigned texture() const { return tex_; }
     int width() const { return w_; }

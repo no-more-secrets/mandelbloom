@@ -16,7 +16,7 @@ __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeP
                                               float timeSec, float pixelScale) {
     // Inside the set, or not computed yet (never show a partial count: it
     // changes every slice and strobes).
-    if (s.iter < 0.f || s.pad > 0.5f) return make_float3(p.inside[0], p.inside[1], p.inside[2]);
+    if (s.iter < 0.f || s.flags > 0.5f) return make_float3(p.inside[0], p.inside[1], p.inside[2]);
 
     float t;
     if (p.logScale) {

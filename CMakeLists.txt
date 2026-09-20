@@ -12,6 +12,7 @@ find_package(SDL3 CONFIG REQUIRED)
 find_package(imgui CONFIG REQUIRED)
 find_package(glad CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
+find_package(Stb REQUIRED)
 find_path(MPFR_INCLUDE_DIR mpfr.h REQUIRED)
 find_library(MPFR_LIBRARY NAMES mpfr REQUIRED)
 find_library(GMP_LIBRARY NAMES gmp REQUIRED)
@@ -21,9 +22,11 @@ add_executable(mandelgpu
   src/gl_display.cpp
   src/reference.cpp
   src/bla.cpp
+  src/script.cpp
+  src/image_io.cpp
   src/render_cuda.cu
 )
-target_include_directories(mandelgpu PRIVATE src ${MPFR_INCLUDE_DIR})
+target_include_directories(mandelgpu PRIVATE src ${MPFR_INCLUDE_DIR} ${Stb_INCLUDE_DIR})
 target_link_libraries(mandelgpu PRIVATE
   SDL3::SDL3
   imgui::imgui
