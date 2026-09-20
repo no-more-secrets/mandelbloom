@@ -285,10 +285,9 @@ __device__ __forceinline__ FieldSample fetchGen(const FieldSample* __restrict__ 
 }
 
 // Shade one field sample (with same-generation neighbour gradient for lines).
-__device__ __forceinline__ float3 shadeField(const FieldSample* __restrict__ field, int fw, int fh,
-                                             int xi, int yi, const FieldSample& s,
-                                             const ShadeParams& p, float timeSec,
-                                             const GenMap& gm) {
+__device__ __forceinline__ IterGradient gradientAt(const FieldSample* __restrict__ field, int fw,
+                                                   int fh, int xi, int yi, const FieldSample& s,
+                                                   const ShadeParams& p, const GenMap& gm) {
     IterGradient g;
     if (p.lines && xi + 1 < fw && yi + 1 < fh && s.iter >= 0.f) {
         const FieldSample sx = field[(size_t)yi * fw + xi + 1];
@@ -299,16 +298,24 @@ __device__ __forceinline__ float3 shadeField(const FieldSample* __restrict__ fie
             g.valid = true;
         }
     }
-    return shadeSample(s, p, timeSec, gm.pixelScale, g);
+    return g;
+}
+
+__device__ __forceinline__ float3 shadeField(const FieldSample* __restrict__ field, int fw, int fh,
+                                             int xi, int yi, const FieldSample& s,
+                                             const ShadeParams& p, float timeSec,
+                                             const GenMap& gm, const float4* __restrict__ lut) {
+    return shadeSample(s, p, timeSec, gm.pixelScale, gradientAt(field, fw, fh, xi, yi, s, p, gm),
+                       lut);
 }
 
 // One subsample: search the generations for the best data at this point.
-// Returns false if no generation has anything here.
-__device__ __forceinline__ bool sampleBest(const FieldSample* __restrict__ field, int fw, int fh,
-                                           int mx, int my, double px, double py,
-                                           const CompositeMap& map, const ShadeParams& p,
-                                           float timeSec, float3& col) {
-    // Newest generation: exact pixel or coarse anchor.
+// Returns false if no generation has anything here; otherwise the sample,
+// its field position and the generation it came from.
+__device__ __forceinline__ bool resolveBest(const FieldSample* __restrict__ field, int fw, int fh,
+                                            int mx, int my, double px, double py,
+                                            const CompositeMap& map, FieldSample& out, int& outX,
+                                            int& outY, int& outGen) {
     float bestDetail = 0.f;
     FieldSample best{};
     int bestX = 0, bestY = 0, bestGen = -1;
@@ -328,15 +335,11 @@ __device__ __forceinline__ bool sampleBest(const FieldSample* __restrict__ field
             bestY = yi;
             bestGen = k;
         }
-        // An exact hit in this generation beats anything older unless the
-        // older one is genuinely finer (zoomed out). Stop early when the
-        // remaining generations cannot beat it.
         if (level == 1 && k + 1 < map.genCount && map.gens[k + 1].ratio <= gm.ratio) break;
     }
     if (bestGen < 0) {
         // Nothing covers this point: extend the nearest field edge of the
-        // first generation with data there. Streaky, but only for the frame
-        // or two before the new pass's coarse level lands.
+        // first generation with data there.
         for (int k = 0; k < map.genCount; ++k) {
             const GenMap& gm = map.gens[k];
             const double u = gm.ox + px * gm.ratio + mx, v = gm.oy + py * gm.ratio + my;
@@ -345,12 +348,30 @@ __device__ __forceinline__ bool sampleBest(const FieldSample* __restrict__ field
             int level = 0;
             const FieldSample sm = fetchGen(field, fw, xi, yi, gm.gen, level);
             if (level == 0) continue;
-            col = shadeField(field, fw, fh, xi, yi, sm, p, timeSec, gm);
+            out = sm;
+            outX = xi;
+            outY = yi;
+            outGen = k;
             return true;
         }
         return false;
     }
-    col = shadeField(field, fw, fh, bestX, bestY, best, p, timeSec, map.gens[bestGen]);
+    out = best;
+    outX = bestX;
+    outY = bestY;
+    outGen = bestGen;
+    return true;
+}
+
+__device__ __forceinline__ bool sampleBest(const FieldSample* __restrict__ field, int fw, int fh,
+                                           int mx, int my, double px, double py,
+                                           const CompositeMap& map, const ShadeParams& p,
+                                           float timeSec, const float4* __restrict__ lut,
+                                           float3& col) {
+    FieldSample s;
+    int xi, yi, gi;
+    if (!resolveBest(field, fw, fh, mx, my, px, py, map, s, xi, yi, gi)) return false;
+    col = shadeField(field, fw, fh, xi, yi, s, p, timeSec, map.gens[gi], lut);
     return true;
 }
 
@@ -358,7 +379,7 @@ __device__ __forceinline__ bool sampleBest(const FieldSample* __restrict__ field
 // the generation with the most detail at that point.
 __global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, int fh, int mx,
                                 int my, uint32_t* __restrict__ out, int w, int h, ShadeParams p,
-                                float timeSec, CompositeMap map) {
+                                float timeSec, CompositeMap map, const float4* __restrict__ lut) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
@@ -371,7 +392,7 @@ __global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, i
         for (int i = 0; i < ss; ++i) {
             const double sx = px + (i + 0.5) / ss - 0.5, sy = py + (j + 0.5) / ss - 0.5;
             float3 c;
-            if (sampleBest(field, fw, fh, mx, my, sx, sy, map, p, timeSec, c)) {
+            if (sampleBest(field, fw, fh, mx, my, sx, sy, map, p, timeSec, lut, c)) {
                 acc.x += c.x;
                 acc.y += c.y;
                 acc.z += c.z;
@@ -387,6 +408,57 @@ __global__ void compositeKernel(const FieldSample* __restrict__ field, int fw, i
     }
 }
 
+// Settled path, step 1: resolve every subsample once into a ShadeInput.
+__global__ void buildCacheKernel(const FieldSample* __restrict__ field, int fw, int fh, int mx,
+                                 int my, ShadeInput* __restrict__ cache, int w, int h,
+                                 ShadeParams p, CompositeMap map) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const double px = (double)x - 0.5 * w, py = (double)y - 0.5 * h;
+    const int ss = map.ss < 1 ? 1 : map.ss;
+    ShadeInput* dst = cache + ((size_t)y * w + x) * (size_t)(ss * ss);
+    for (int j = 0; j < ss; ++j) {
+        for (int i = 0; i < ss; ++i) {
+            const double sx = px + (i + 0.5) / ss - 0.5, sy = py + (j + 0.5) / ss - 0.5;
+            FieldSample s;
+            int xi, yi, gi;
+            ShadeInput in{};
+            if (resolveBest(field, fw, fh, mx, my, sx, sy, map, s, xi, yi, gi)) {
+                in = prepareSample(s, p, gradientAt(field, fw, fh, xi, yi, s, p, map.gens[gi]));
+            }
+            dst[j * ss + i] = in;
+        }
+    }
+}
+
+// Settled path, step 2: colour the cache. Pure streaming.
+__global__ void shadeCachedKernel(const ShadeInput* __restrict__ cache, uint32_t* __restrict__ out,
+                                  int w, int h, int ss, ShadeParams p, float timeSec,
+                                  const float4* __restrict__ lut) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t idx = (size_t)y * w + x;
+    const ShadeInput* src = cache + idx * (size_t)(ss * ss);
+    float3 acc = make_float3(0.f, 0.f, 0.f);
+    for (int k = 0; k < ss * ss; ++k) {
+        const float3 c = colourInput(src[k], p, timeSec, lut);
+        acc.x += c.x;
+        acc.y += c.y;
+        acc.z += c.z;
+    }
+    const float inv = 1.f / (ss * ss);
+    out[idx] = packSRGB8(make_float3(acc.x * inv, acc.y * inv, acc.z * inv));
+}
+
+__global__ void paletteLutKernel(float4* __restrict__ lut, ShadeParams p) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= PALETTE_LUT_SIZE) return;
+    const float3 c = paletteDirect(p, (i + 0.5f) / PALETTE_LUT_SIZE);
+    lut[i] = make_float4(c.x, c.y, c.z, 0.f);
+}
+
 }  // namespace
 
 CudaRenderer::~CudaRenderer() {
@@ -400,6 +472,7 @@ CudaRenderer::~CudaRenderer() {
     if (evShadeA_) cudaEventDestroy((cudaEvent_t)evShadeA_);
     if (evShadeB_) cudaEventDestroy((cudaEvent_t)evShadeB_);
     if (activeCount_) cudaFree(activeCount_);
+    if (paletteLut_) cudaFree(paletteLut_);
     if (sliceStart_ns_) cudaFree(sliceStart_ns_);
     if (activeCountHost_) cudaFreeHost(activeCountHost_);
     if (stream_) cudaStreamDestroy((cudaStream_t)stream_);
@@ -455,8 +528,10 @@ void CudaRenderer::freeField() {
     if (state_) cudaFree(state_);
     if (fieldAlt_) cudaFree(fieldAlt_);
     if (stateAlt_) cudaFree(stateAlt_);
+    if (shadeCache_) cudaFree(shadeCache_);
     field_ = fieldAlt_ = nullptr;
     state_ = stateAlt_ = nullptr;
+    shadeCache_ = nullptr;
     iterDone_ = true;
     sliceInFlight_ = false;
 }
@@ -555,7 +630,8 @@ bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height, int ss
     CUDA_CHECK(cudaMalloc(&state_, sizeof(PixelState) * fn));
     CUDA_CHECK(cudaMalloc(&fieldAlt_, sizeof(FieldSample) * fn));
     CUDA_CHECK(cudaMalloc(&stateAlt_, sizeof(PixelState) * fn));
-    (void)n;
+    CUDA_CHECK(cudaMalloc(&shadeCache_, sizeof(ShadeInput) * n * (size_t)(ss_ * ss_)));
+    if (!paletteLut_) CUDA_CHECK(cudaMalloc(&paletteLut_, sizeof(float4) * PALETTE_LUT_SIZE));
     clearField<<<(int)((fn + 255) / 256), 256>>>(field_, (int)fn);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
@@ -744,7 +820,8 @@ bool CudaRenderer::composite(const ShadeParams& params, float timeSec, const Com
     }
     if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
     compositeKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, marginX_, marginY_,
-                                                devPtr, width_, height_, params, timeSec, map);
+                                                devPtr, width_, height_, params, timeSec, map,
+                                                paletteLut_);
     err = cudaGetLastError();
     if (!shadePending_) {
         cudaEventRecord((cudaEvent_t)evShadeB_, stream);
@@ -754,6 +831,58 @@ bool CudaRenderer::composite(const ShadeParams& params, float timeSec, const Com
     CUDA_CHECK(cudaGraphicsUnmapResources(1, &pboResource_, stream));
     if (err != cudaSuccess) {
         std::fprintf(stderr, "composite kernel failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool CudaRenderer::buildPaletteLut(const ShadeParams& params) {
+    if (!paletteLut_) return false;
+    cudaStream_t stream = (cudaStream_t)dispStream_;
+    paletteLutKernel<<<PALETTE_LUT_SIZE / 256, 256, 0, stream>>>(paletteLut_, params);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool CudaRenderer::buildShadeCache(const ShadeParams& params, const CompositeMap& map) {
+    if (!field_ || !shadeCache_) return false;
+    cudaStream_t stream = (cudaStream_t)dispStream_;
+    const dim3 block(16, 16);
+    const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
+    buildCacheKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, marginX_, marginY_,
+                                                 shadeCache_, width_, height_, params, map);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+bool CudaRenderer::shadeCached(const ShadeParams& params, float timeSec) {
+    if (!pboResource_ || !shadeCache_) return false;
+    cudaStream_t stream = (cudaStream_t)dispStream_;
+    CUDA_CHECK(cudaGraphicsMapResources(1, &pboResource_, stream));
+    uint32_t* devPtr = nullptr;
+    size_t bytes = 0;
+    cudaError_t err = cudaGraphicsResourceGetMappedPointer((void**)&devPtr, &bytes, pboResource_);
+    if (err != cudaSuccess) {
+        cudaGraphicsUnmapResources(1, &pboResource_, stream);
+        return false;
+    }
+    const dim3 block(16, 16);
+    const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
+    if (shadePending_ && cudaEventQuery((cudaEvent_t)evShadeB_) == cudaSuccess) {
+        cudaEventElapsedTime(&shadeMs_, (cudaEvent_t)evShadeA_, (cudaEvent_t)evShadeB_);
+        shadePending_ = false;
+    }
+    if (!shadePending_) cudaEventRecord((cudaEvent_t)evShadeA_, stream);
+    shadeCachedKernel<<<grid, block, 0, stream>>>(shadeCache_, devPtr, width_, height_, ss_,
+                                                  params, timeSec, paletteLut_);
+    err = cudaGetLastError();
+    if (!shadePending_) {
+        cudaEventRecord((cudaEvent_t)evShadeB_, stream);
+        shadePending_ = true;
+    }
+    CUDA_CHECK(cudaGraphicsUnmapResources(1, &pboResource_, stream));
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "shadeCached kernel failed: %s\n", cudaGetErrorString(err));
         return false;
     }
     return true;

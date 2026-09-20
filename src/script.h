@@ -9,6 +9,7 @@
 //   wheelgap:MS        delay between notches (default 60)
 //   drag:DX,DY,STEPS   left-drag by DX,DY pixels over STEPS frames
 //   pan:DX,DY          pan by DX,DY pixels directly (no drag, no inertia)
+//   animate:0|1        turn shading animation off/on
 //   shot:PATH          save the current frame as PNG
 //   quit               exit the app
 // Wheel and drag events are posted through SDL so the normal handlers run.
@@ -25,6 +26,7 @@ public:
     // to capture this frame (empty if none) and sets quit when done.
     std::string tick(double nowSec, int winW, int winH, bool& quit);
     // Set when the last tick issued a direct pan; consumed by the caller.
+    int takeAnimate() { const int a = animate_; animate_ = -1; return a; }  // -1 = no change
     bool takePan(int& dx, int& dy) {
         if (!panPending_) return false;
         dx = panDx_; dy = panDy_; panPending_ = false; return true;
@@ -42,5 +44,6 @@ private:
     double mouseX_ = 0, mouseY_ = 0;
     bool started_ = false;
     bool panPending_ = false;
+    int animate_ = -1;
     int panDx_ = 0, panDy_ = 0;
 };

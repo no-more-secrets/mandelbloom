@@ -1,8 +1,15 @@
 #pragma once
 // Device-side coloring. Included by render_cuda.cu only.
+// Shading is split in two. prepareSample() turns a field sample into a
+// ShadeInput: everything that does not depend on time (palette position,
+// edge factor, line coverage, normal). colourInput() turns a ShadeInput
+// into a colour for a given time. The live composite runs both per frame;
+// the settled path caches ShadeInputs once and runs only colourInput().
 #include <cstdint>
 #include <cuda_fp16.h>
 #include "field.h"
+
+#define PALETTE_LUT_SIZE 1024
 
 __device__ __forceinline__ float h2f(uint16_t h) { return __half2float(__ushort_as_half(h)); }
 __device__ __forceinline__ uint16_t f2h(float f) { return __half_as_ushort(__float2half(f)); }
@@ -65,8 +72,19 @@ __device__ __forceinline__ float3 cosPalette(const ShadeParams& p, float t) {
                        p.a[2] + p.b[2] * cosf(k * (p.c[2] * t + p.d[2])));
 }
 
-__device__ __forceinline__ float3 palette(const ShadeParams& p, float t) {
+// Direct evaluation; used to fill the lookup table.
+__device__ __forceinline__ float3 paletteDirect(const ShadeParams& p, float t) {
     return p.paletteType == 1 ? cosPalette(p, t) : gradientPalette(p, t);
+}
+
+// One palette cycle tabulated: linear interpolation with wrap.
+__device__ __forceinline__ float3 paletteLut(const float4* __restrict__ lut, float t) {
+    const float u = fracf(t) * PALETTE_LUT_SIZE;
+    const int i0 = (int)u;
+    const int i1 = (i0 + 1) & (PALETTE_LUT_SIZE - 1);
+    const float f = u - i0;
+    const float4 a = lut[i0 & (PALETTE_LUT_SIZE - 1)], b = lut[i1];
+    return make_float3(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f, a.z + (b.z - a.z) * f);
 }
 
 // Screen-space rate of change of the iteration count, per display pixel,
@@ -76,81 +94,49 @@ struct IterGradient {
     bool valid = false;
 };
 
-// Shade one sample to linear RGB. de is in pixels; pixelScale is unused
-// now but kept for future colourings in complex units.
-__device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeParams& p,
-                                              float timeSec, float pixelScale,
-                                              const IterGradient& g) {
-    if (s.iter < 0.f || s.gen == 0) return make_float3(p.inside[0], p.inside[1], p.inside[2]);
-    const float de = h2f(s.de), nx = h2f(s.nx), ny = h2f(s.ny);
+// Time-independent shading data for one sample. 16 bytes.
+struct ShadeInput {
+    float t;          // palette position in cycles, before the time term
+    uint16_t edge;    // half: distance-estimate edge factor, already powered
+    uint16_t line;    // half: line coverage 0..1, before lineStrength
+    uint16_t nx, ny;  // half: exterior normal
+    uint16_t flags;   // 0 inside or no data, 1 exterior
+    uint16_t pad;
+};
 
-    // Palette position in cycles.
+__device__ __forceinline__ ShadeInput prepareSample(const FieldSample& s, const ShadeParams& p,
+                                                    const IterGradient& g) {
+    ShadeInput in{};
+    if (s.iter < 0.f || s.gen == 0) return in;  // flags 0
+    in.flags = 1;
+    const float de = h2f(s.de);
+
     float t;
     if (p.logScale) {
         t = log2f(fmaxf(s.iter, 1.f)) * (p.density / 64.f);
     } else {
         t = s.iter / p.density;
     }
-    t += p.offset + p.cycleSpeed * timeSec;
-    const float phase = p.waveSpeed * timeSec;
-
-    float3 col;
     switch (p.mode) {
-        case SHADE_LOGSTEPS: {
-            // Within each of `special` bands per cycle, brightness ramps
-            // logarithmically from dark to full.
-            const float f = fracf(t * p.special + phase);
-            const float ramp = logf(1.f + f * 1.7182818f);  // 0..1
-            const float3 c = palette(p, t);
-            const float k = 0.25f + 0.75f * ramp;
-            col = make_float3(c.x * k, c.y * k, c.z * k);
+        case SHADE_ANGLE:
+            t = h2f(s.angle) * 0.15915494f * p.special;  // turns * cycles per turn
             break;
-        }
-        case SHADE_WAVE: {
-            const float w = 0.5f + 0.5f * sinf(6.2831853f * (t * p.special + phase));
-            const float3 c = palette(p, t);
-            col = make_float3(c.x * w, c.y * w, c.z * w);
+        case SHADE_DISTANCE:
+            t = log10f(fmaxf(de, 1e-6f)) / fmaxf(p.special, 0.01f);
             break;
-        }
-        case SHADE_PANELS: {
-            // Flat panels with soft dark gaps of ~15% of the panel.
-            const float f = fracf(t * p.special + phase);
-            const float gap = 0.15f;
-            const float k = smoothstepf(0.f, gap, f) * smoothstepf(1.f, 1.f - gap, f);
-            const float3 c = palette(p, t);
-            const float m = 0.1f + 0.9f * k;
-            col = make_float3(c.x * m, c.y * m, c.z * m);
-            break;
-        }
-        case SHADE_ANGLE: {
-            // Escape angle over the palette; `special` cycles per turn.
-            const float ang = h2f(s.angle) * 0.15915494f;  // turns
-            col = palette(p, ang * p.special + p.offset + p.cycleSpeed * timeSec);
-            break;
-        }
-        case SHADE_DISTANCE: {
-            // Log distance from the set, in pixels; `special` decades per cycle.
-            const float dpx = fmaxf(de, 1e-6f);
-            const float v = log10f(dpx) / fmaxf(p.special, 0.01f);
-            col = palette(p, v + p.offset + p.cycleSpeed * timeSec);
-            break;
-        }
         default:
-            col = palette(p, t);
             break;
     }
+    in.t = t + p.offset;
 
-    if (p.slopes) {
-        const float ang = (p.slopeAngle + p.lightSpeed * timeSec) * 0.017453292f;
-        const float lx = cosf(ang), ly = sinf(ang);
-        float light = (nx * lx + ny * ly + p.slopeHeight) / (1.f + p.slopeHeight);
-        light = fminf(fmaxf(light, 0.f), 1.f);
-        const float shade = 1.f - p.slopeStrength * (1.f - light);
-        col.x *= shade;
-        col.y *= shade;
-        col.z *= shade;
+    float edge = 1.f;
+    if (p.deStrength > 0.f) {
+        edge = fminf(fmaxf(de, 0.f), 1.f);
+        edge = powf(edge, 0.5f * p.deStrength);
     }
+    in.edge = f2h(edge);
 
+    float cover = 0.f;
     if (p.lines && g.valid) {
         const float v = s.iter * p.lineDensity;
         const float f = v - floorf(v);
@@ -159,27 +145,74 @@ __device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeP
         if (rate > 1e-12f) {
             const float distPx = distCycles / rate;
             const float halfW = 0.5f * p.lineWidth;
-            float cover = 1.f - smoothstepf(halfW - 0.5f, halfW + 0.5f, distPx);
+            cover = 1.f - smoothstepf(halfW - 0.5f, halfW + 0.5f, distPx);
             cover *= fminf(fmaxf(1.5f - 2.f * halfW * rate, 0.f), 1.f);
-            const float k = cover * p.lineStrength;
-            col.x += (p.lineColor[0] - col.x) * k;
-            col.y += (p.lineColor[1] - col.y) * k;
-            col.z += (p.lineColor[2] - col.z) * k;
         }
     }
+    in.line = f2h(cover);
+    in.nx = s.nx;
+    in.ny = s.ny;
+    return in;
+}
 
-    if (p.deStrength > 0.f) {
-        float edge = de;
-        edge = fminf(fmaxf(edge, 0.f), 1.f);
-        edge = powf(edge, 0.5f * p.deStrength);
-        col.x *= edge;
-        col.y *= edge;
-        col.z *= edge;
+// Colour for a ShadeInput at a given time. Only time-dependent and cheap
+// parameters are applied here.
+__device__ __forceinline__ float3 colourInput(const ShadeInput& in, const ShadeParams& p,
+                                              float timeSec, const float4* __restrict__ lut) {
+    if (in.flags == 0) return make_float3(p.inside[0], p.inside[1], p.inside[2]);
+    const float tt = in.t + p.cycleSpeed * timeSec;
+    float3 col = paletteLut(lut, tt);
+
+    switch (p.mode) {
+        case SHADE_LOGSTEPS: {
+            const float f = fracf(tt * p.special + p.waveSpeed * timeSec);
+            const float k = 0.25f + 0.75f * logf(1.f + f * 1.7182818f);
+            col.x *= k; col.y *= k; col.z *= k;
+            break;
+        }
+        case SHADE_WAVE: {
+            const float w = 0.5f + 0.5f * sinf(6.2831853f * (tt * p.special + p.waveSpeed * timeSec));
+            col.x *= w; col.y *= w; col.z *= w;
+            break;
+        }
+        case SHADE_PANELS: {
+            const float f = fracf(tt * p.special + p.waveSpeed * timeSec);
+            const float gap = 0.15f;
+            const float k = smoothstepf(0.f, gap, f) * smoothstepf(1.f, 1.f - gap, f);
+            const float m = 0.1f + 0.9f * k;
+            col.x *= m; col.y *= m; col.z *= m;
+            break;
+        }
+        default:
+            break;
     }
-    col.x *= p.exposure;
-    col.y *= p.exposure;
-    col.z *= p.exposure;
+
+    if (p.slopes) {
+        const float ang = (p.slopeAngle + p.lightSpeed * timeSec) * 0.017453292f;
+        const float lx = cosf(ang), ly = sinf(ang);
+        float light = (h2f(in.nx) * lx + h2f(in.ny) * ly + p.slopeHeight) / (1.f + p.slopeHeight);
+        light = fminf(fmaxf(light, 0.f), 1.f);
+        const float shade = 1.f - p.slopeStrength * (1.f - light);
+        col.x *= shade; col.y *= shade; col.z *= shade;
+    }
+
+    const float k = h2f(in.line) * p.lineStrength;
+    if (k > 0.f) {
+        col.x += (p.lineColor[0] - col.x) * k;
+        col.y += (p.lineColor[1] - col.y) * k;
+        col.z += (p.lineColor[2] - col.z) * k;
+    }
+
+    const float edge = h2f(in.edge) * p.exposure;
+    col.x *= edge; col.y *= edge; col.z *= edge;
     return col;
+}
+
+__device__ __forceinline__ float3 shadeSample(const FieldSample& s, const ShadeParams& p,
+                                              float timeSec, float /*pixelScale*/,
+                                              const IterGradient& g,
+                                              const float4* __restrict__ lut) {
+    return colourInput(prepareSample(s, p, g), p, timeSec, lut);
 }
 
 __device__ __forceinline__ uint32_t packSRGB8(float3 c) {

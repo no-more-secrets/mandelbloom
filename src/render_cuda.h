@@ -103,6 +103,14 @@ public:
     // own stream so it never waits for a slice.
     bool composite(const ShadeParams& params, float timeSec, const CompositeMap& map);
 
+    // Settled path. buildPaletteLut tabulates one palette cycle (call when
+    // palette parameters change). buildShadeCache resolves every subsample
+    // once through the generation search; shadeCached then colours the
+    // cache for a given time: a streaming pass with no field access.
+    bool buildPaletteLut(const ShadeParams& params);
+    bool buildShadeCache(const ShadeParams& params, const CompositeMap& map);
+    bool shadeCached(const ShadeParams& params, float timeSec);
+
     // Debug: read the view region back and count pixels by state. Slow.
     struct DebugStats {
         int total = 0, genMatch = 0, genZero = 0, genOther = 0;
@@ -128,6 +136,8 @@ private:
     FieldSample* field_ = nullptr;
     struct PixelState* state_ = nullptr;
     FieldSample* fieldAlt_ = nullptr;
+    struct ShadeInput* shadeCache_ = nullptr;  // w*h*ss*ss entries
+    float4* paletteLut_ = nullptr;
     struct PixelState* stateAlt_ = nullptr;
     double* refZr_ = nullptr;
     double* refZi_ = nullptr;

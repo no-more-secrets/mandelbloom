@@ -66,6 +66,15 @@ struct App {
     bool dirty = true;  // render view changed: restart the pass
     bool animate = false;
     float animTime = 0.f;  // seconds of animation elapsed (advances only while animating)
+    // Settled display: cache of resolved subsamples + palette LUT, so an
+    // animated but otherwise static view costs one streaming pass per frame.
+    bool cacheValid = false;
+    bool cachedShown = false;   // the pixel buffer currently holds a cached shade
+    ShadeParams lastShade;      // what the cache / LUT / last shade were built with
+    bool lastShadeValid = false;
+    int cacheGen = -1;
+    double lastShadeSec = 0.0;
+    float bgFps = 0.f;          // cap for animated frames while settled; 0 = every frame
     bool dragging = false;
     // Pan inertia: velocity in pixels per second, carried after release.
     double velX = 0, velY = 0;
@@ -239,6 +248,37 @@ void rebuildReference(App& app) {
     app.renderer.uploadReference(app.ref.zr.data(), app.ref.zi.data(), app.ref.length,
                                  app.ref.escaped);
     rebuildBla(app);
+}
+
+// Parameter groups for the settled display path.
+bool paletteEqual(const ShadeParams& a, const ShadeParams& b) {
+    if (a.paletteType != b.paletteType || a.stopCount != b.stopCount) return false;
+    for (int i = 0; i < 3; ++i)
+        if (a.a[i] != b.a[i] || a.b[i] != b.b[i] || a.c[i] != b.c[i] || a.d[i] != b.d[i]) return false;
+    for (int i = 0; i < MAX_STOPS; ++i) {
+        if (a.stopPos[i] != b.stopPos[i]) return false;
+        for (int k = 0; k < 3; ++k)
+            if (a.stopColor[i][k] != b.stopColor[i][k]) return false;
+    }
+    return true;
+}
+
+// Everything prepareSample() reads.
+bool staticEqual(const ShadeParams& a, const ShadeParams& b) {
+    return a.mode == b.mode && a.density == b.density && a.offset == b.offset &&
+           a.logScale == b.logScale && a.special == b.special && a.deStrength == b.deStrength &&
+           a.lines == b.lines && a.lineDensity == b.lineDensity && a.lineWidth == b.lineWidth;
+}
+
+// Everything colourInput() reads besides time.
+bool dynamicEqual(const ShadeParams& a, const ShadeParams& b) {
+    for (int i = 0; i < 3; ++i)
+        if (a.inside[i] != b.inside[i] || a.lineColor[i] != b.lineColor[i]) return false;
+    return a.mode == b.mode && a.special == b.special && a.cycleSpeed == b.cycleSpeed &&
+           a.waveSpeed == b.waveSpeed && a.lightSpeed == b.lightSpeed && a.slopes == b.slopes &&
+           a.slopeAngle == b.slopeAngle && a.slopeHeight == b.slopeHeight &&
+           a.slopeStrength == b.slopeStrength && a.lineStrength == b.lineStrength &&
+           a.exposure == b.exposure;
 }
 
 // Mapping of a source view onto the shown view: where the shown centre
@@ -468,7 +508,8 @@ void drawUi(App& app) {
                         std::min(app.renderer.iterateProgress(), app.view.maxIter),
                         app.view.maxIter, app.renderer.lastSliceMs());
         }
-        ImGui::Text("display %.2f ms", app.renderer.lastShadeMs());
+        ImGui::Text("display %.2f ms%s", app.renderer.lastShadeMs(),
+                    app.cachedShown ? "  (cached)" : "");
         ImGui::Text("frame   %.0f fps", app.fps);
         ImGui::Checkbox("smooth zoom", &app.tweenEnabled);
         ImGui::SameLine();
@@ -576,6 +617,7 @@ void drawUi(App& app) {
             ImGui::SliderFloat("palette cyc/s", &sp.cycleSpeed, -1.f, 1.f, "%.3f");
             ImGui::SliderFloat("light deg/s", &sp.lightSpeed, -90.f, 90.f, "%.1f");
             ImGui::SliderFloat("wave cyc/s", &sp.waveSpeed, -2.f, 2.f, "%.2f");
+            ImGui::SliderFloat("settled fps cap", &app.bgFps, 0.f, 240.f, "%.0f (0 = every frame)");
         }
     }
     ImGui::End();
@@ -585,6 +627,7 @@ void drawUi(App& app) {
 
 int main(int argc, char** argv) {
     SDL_SetMainReady();
+    std::setvbuf(stdout, nullptr, _IONBF, 0);  // scripted runs read stdout after a crash too
     // Optional start location: mandelgpu <re> <im> <scale> [maxIter]
     // Numbers are decimal strings, any length. scale is complex units per pixel.
     // Optional: --script "wheel:5;wait:500;shot:out.png;quit" (see script.h).
@@ -762,8 +805,9 @@ int main(int argc, char** argv) {
             if (!app.renderer.iterateDone()) app.renderer.stepIterate();
         }
 
-        // Display: composite the field onto the shown view, each pixel from
-        // the generation with the most detail there. Cheap, every frame.
+        // Display. While anything moves, composite every frame from the
+        // field. Once settled, resolve the subsamples once into a cache and
+        // recolour only when a parameter or the animation time changes.
         {
             CompositeMap m;
             m.ss = app.ss;
@@ -776,7 +820,40 @@ int main(int argc, char** argv) {
                 gm.pixelScale = (float)(g.view.scale / app.ss);
                 gm.gen = g.id;
             }
-            if (app.renderer.composite(app.shade, app.animTime, m)) app.display.upload();
+            const bool paletteChanged = !app.lastShadeValid || !paletteEqual(app.shade, app.lastShade);
+            const bool staticChanged = !app.lastShadeValid || !staticEqual(app.shade, app.lastShade);
+            const bool dynamicChanged = !app.lastShadeValid || !dynamicEqual(app.shade, app.lastShade);
+            if (paletteChanged) app.renderer.buildPaletteLut(app.shade);
+
+            const bool settled = app.renderer.iterateDone() && !app.tweening && !app.inertia &&
+                                 !app.panDirty && !app.dirty && !app.gens.empty();
+            const int gen0 = app.gens.empty() ? -1 : app.gens[0].id;
+            if (!settled) {
+                app.cacheValid = false;
+                app.cachedShown = false;
+                if (app.renderer.composite(app.shade, app.animTime, m)) app.display.upload();
+            } else {
+                if (!app.cacheValid || staticChanged || app.cacheGen != gen0) {
+                    app.renderer.buildShadeCache(app.shade, m);
+                    app.cacheValid = true;
+                    app.cacheGen = gen0;
+                    app.cachedShown = false;
+                }
+                bool need = !app.cachedShown || dynamicChanged || paletteChanged;
+                if (app.animate) {
+                    const double now = nowSeconds();
+                    if (app.bgFps <= 0.f || now - app.lastShadeSec >= 1.0 / app.bgFps) need = true;
+                }
+                if (need) {
+                    if (app.renderer.shadeCached(app.shade, app.animTime)) {
+                        app.display.upload();
+                        app.cachedShown = true;
+                        app.lastShadeSec = nowSeconds();
+                    }
+                }
+            }
+            app.lastShade = app.shade;
+            app.lastShadeValid = true;
         }
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -796,6 +873,8 @@ int main(int argc, char** argv) {
             {
                 int pdx, pdy;
                 if (script.takePan(pdx, pdy)) panPixels(app, pdx, pdy);
+                const int an = script.takeAnimate();
+                if (an >= 0) app.animate = an != 0;
             }
             const std::string shot = script.tick(
                 (double)SDL_GetPerformanceCounter() / (double)SDL_GetPerformanceFrequency(), pw,
@@ -812,11 +891,12 @@ int main(int argc, char** argv) {
                 const double zoom = 3.2 / (app.render.scale * (app.view.width / app.ss));
                 const int dg = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
                 std::printf("shot %s zoom=%.3g iterate=%.0fms done=%d stride=%d/%d tween=%d "
-                            "inertia=%d centre=%s %s\n",
+                            "inertia=%d display=%.3fms cached=%d fps=%.0f centre=%s %s\n",
                             shot.c_str(), zoom, app.renderer.lastIterateMs(),
                             app.renderer.iterateDone() ? 1 : 0, app.renderer.currentStride(),
                             app.renderer.completedStride(), app.tweening ? 1 : 0,
-                            app.inertia ? 1 : 0, app.render.cx.toString(dg).c_str(),
+                            app.inertia ? 1 : 0, app.renderer.lastShadeMs(),
+                            app.cachedShown ? 1 : 0, app.fps, app.render.cx.toString(dg).c_str(),
                             app.render.cy.toString(dg).c_str());
                 std::printf("  shown scale=%.6g render scale=%.6g gens=%zu\n", app.shown.scale,
                             app.render.scale, app.gens.size());
