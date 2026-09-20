@@ -30,6 +30,10 @@ struct PixelState {
 
 namespace {
 
+// GPU time per slice launch. Short enough that the composite on the other
+// stream and any pending view change wait at most this long.
+constexpr unsigned long long kSliceBudgetNs = 20ull * 1000000ull;
+
 __device__ __forceinline__ FieldSample emptySample() { return FieldSample{}; }  // gen 0
 
 // New pass: reset iteration state only. Field samples from earlier
@@ -324,7 +328,23 @@ __device__ __forceinline__ bool sampleBest(const FieldSample* __restrict__ field
         // remaining generations cannot beat it.
         if (level == 1 && k + 1 < map.genCount && map.gens[k + 1].ratio <= gm.ratio) break;
     }
-    if (bestGen < 0) return false;
+    if (bestGen < 0) {
+        // Nothing covers this point: extend the nearest field edge of the
+        // first generation with data there. Streaky, but only for the frame
+        // or two before the new pass's coarse level lands.
+        for (int k = 0; k < map.genCount; ++k) {
+            const GenMap& gm = map.gens[k];
+            const double u = gm.ox + px * gm.ratio + mx, v = gm.oy + py * gm.ratio + my;
+            const int xi = min(max((int)floor(u + 0.5), 0), fw - 1);
+            const int yi = min(max((int)floor(v + 0.5), 0), fh - 1);
+            int level = 0;
+            const FieldSample sm = fetchGen(field, fw, xi, yi, gm.gen, level);
+            if (level == 0) continue;
+            col = shadeField(field, fw, fh, xi, yi, sm, p, timeSec, gm);
+            return true;
+        }
+        return false;
+    }
     col = shadeField(field, fw, fh, bestX, bestY, best, p, timeSec, map.gens[bestGen]);
     return true;
 }
@@ -527,7 +547,7 @@ void CudaRenderer::resetPass(const ViewParams& view) {
     iterView_ = view;
     bla_.enabled = view.useBla ? 1 : 0;
     sliceStart_ = 0;
-    sliceIters_ = 512;  // modest start each pass; the GPU deadline bounds it anyway
+    sliceIters_ = view.maxIter;  // the GPU-clock deadline bounds each launch
     sliceInFlight_ = false;
     stride_ = firstStride_;
     completedStride_ = 0;
@@ -600,12 +620,6 @@ bool CudaRenderer::iterateBusy() {
             sliceStart_ = 0;
         }
     }
-    // Adapt the slice length toward ~25 ms of GPU time.
-    if (sliceMs_ > 0.f) {
-        float f = 25.f / sliceMs_;
-        f = fminf(fmaxf(f, 0.5f), 4.f);
-        sliceIters_ = (int)fminf(fmaxf((float)sliceIters_ * f, 16.f), 65536.f);
-    }
     return false;
 }
 
@@ -629,13 +643,13 @@ bool CudaRenderer::stepIterate() {
                                              viewW_, viewH_, stride_, iterView_.scale,
                                              iterView_.refOffX, iterView_.refOffY,
                                              iterView_.maxIter, sliceIters_, sliceStart_ns_,
-                                             50ull * 1000000ull, ref_, bla_, gen_, activeCount_);
+                                             kSliceBudgetNs, ref_, bla_, gen_, activeCount_);
     CUDA_CHECK(cudaGetLastError());
     cudaEventRecord((cudaEvent_t)evStop_, stream);
     CUDA_CHECK(cudaMemcpyAsync(activeCountHost_, activeCount_, sizeof(int),
                                cudaMemcpyDeviceToHost, stream));
     cudaEventRecord((cudaEvent_t)evSlice_, stream);
-    sliceStart_ += sliceIters_;
+    sliceStart_ = iterView_.maxIter;
     sliceInFlight_ = true;
     return true;
 }

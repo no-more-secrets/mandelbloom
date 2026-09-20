@@ -174,12 +174,6 @@ void panPixels(App& app, int dx, int dy) {
     app.panDx -= dx * app.ss;
     app.panDy -= dy * app.ss;
     app.panDirty = true;
-    // The field array shifts under every generation, so their centres move
-    // by the same number of field pixels at their own scale.
-    for (auto& g : app.gens) {
-        g.view.cx.subDouble(dx * g.view.scale);
-        g.view.cy.addDouble(dy * g.view.scale);
-    }
 }
 
 // Coast after a drag, slowing with friction.
@@ -201,8 +195,12 @@ void applyInertia(App& app, double dt) {
 void tweenShown(App& app, double dt) {
     if (!app.tweening) return;
     const double k = 1.0 - std::exp(-dt / app.tweenTau);
-    const double logRatio = std::log(app.render.scale / app.shown.scale);
+    double logRatio = std::log(app.render.scale / app.shown.scale);
     app.shown.scale *= std::exp(logRatio * k);
+    // Zooming in: the render pass computes a 1/8 margin around its view, so
+    // the shown view may lag by at most that much or its edges have no data.
+    if (app.shown.scale > app.render.scale * 1.2) app.shown.scale = app.render.scale * 1.2;
+    logRatio = std::log(app.render.scale / app.shown.scale);
     // Centre follows from the anchor so the cursor point never drifts.
     app.shown.cx = app.anchorX;
     app.shown.cy = app.anchorY;
@@ -217,9 +215,12 @@ double halfDiagonal(const App& app) {
 }
 
 // View centre relative to the reference centre, into the view params.
+// The view the field is currently laid out for: the newest generation's.
+const View& fieldView(const App& app) { return app.gens.empty() ? app.render : app.gens[0].view; }
+
 void updateRefOffset(App& app) {
-    app.view.refOffX = BigFloat::diff(app.render.cx, app.refCx);
-    app.view.refOffY = BigFloat::diff(app.render.cy, app.refCy);
+    app.view.refOffX = BigFloat::diff(fieldView(app).cx, app.refCx);
+    app.view.refOffY = BigFloat::diff(fieldView(app).cy, app.refCy);
 }
 
 void rebuildBla(App& app) {
@@ -579,28 +580,44 @@ int main(int argc, char** argv) {
         }
         if (pw <= 0 || ph <= 0) continue;
 
-        if (app.panDirty && !app.dirty) {
-            // Shift what we have, keep the reference unless we drifted more
-            // than a view radius from it, and continue on the exposed strip.
-            updateRefOffset(app);
-            app.renderer.shiftAndResume(app.view, app.panDx, app.panDy);
-            if (std::hypot(app.view.refOffX, app.view.refOffY) > halfDiagonal(app)) {
-                rebuildReference(app);
-                app.renderer.restartPending(app.view);
-            } else {
-                rebuildBla(app);
+        // View changes are applied only between slices, so the slice in
+        // flight finishes (its samples stay valid for its generation) and the
+        // main thread never blocks on the GPU.
+        const bool gpuIdle = !app.renderer.iterateBusy();
+        if (gpuIdle && app.panDirty && !app.dirty) {
+            // Shift in whole 8-pixel steps so the coarse-level anchors stay on
+            // their grid; the remainder stays as an offset between the target
+            // view and the field placement until the next shift.
+            const int qx = (app.panDx / 8) * 8, qy = (app.panDy / 8) * 8;
+            if (qx != 0 || qy != 0) {
+                app.renderer.shiftAndResume(app.view, qx, qy);
+                // The field moved under every generation: their centres move
+                // by the shifted amount at their own scale.
+                for (auto& g : app.gens) {
+                    g.view.cx.addDouble(qx * (g.view.scale / app.ss));
+                    g.view.cy.subDouble(qy * (g.view.scale / app.ss));
+                }
+                app.panDx -= qx;
+                app.panDy -= qy;
+                updateRefOffset(app);
+                if (std::hypot(app.view.refOffX, app.view.refOffY) > halfDiagonal(app)) {
+                    rebuildReference(app);
+                    app.renderer.restartPending(app.view);
+                } else {
+                    rebuildBla(app);
+                }
             }
-            app.panDx = app.panDy = 0;
             app.panDirty = false;
         }
-        if (app.dirty) {
-            rebuildReference(app);
-            // New generation: remember its view; older ones keep theirs.
+        if (gpuIdle && app.dirty) {
+            // New generation: remember its view; older ones keep theirs. Any
+            // pending pan is folded into the new view (the field did not move).
             App::Gen g;
             g.view = app.render;
             g.id = app.nextGen++;
             app.gens.insert(app.gens.begin(), g);
             if (app.gens.size() > MAX_GENS) app.gens.resize(MAX_GENS);
+            rebuildReference(app);
             app.renderer.beginIterate(app.view, g.id);
             app.panDx = app.panDy = 0;
             app.panDirty = false;
@@ -652,8 +669,10 @@ int main(int argc, char** argv) {
                 // The composited image straight from the pixel buffer, plus
                 // the numbers the overlay would show, on stdout.
                 std::vector<uint32_t> px((size_t)pw * ph);
-                if (app.display.readPixels(px.data(), (int)px.size())) {
-                    writePng(shot.c_str(), px.data(), pw, ph);
+                if (!app.display.readPixels(px.data(), (int)px.size())) {
+                    std::printf("shot: readPixels failed\n");
+                } else if (!writePng(shot.c_str(), px.data(), pw, ph)) {
+                    std::printf("shot: writePng failed for %s\n", shot.c_str());
                 }
                 const double zoom = 3.2 / (app.render.scale * (app.view.width / app.ss));
                 const int dg = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
@@ -664,6 +683,13 @@ int main(int argc, char** argv) {
                             app.renderer.completedStride(), app.tweening ? 1 : 0,
                             app.inertia ? 1 : 0, app.render.cx.toString(dg).c_str(),
                             app.render.cy.toString(dg).c_str());
+                std::printf("  shown scale=%.6g render scale=%.6g gens=%zu\n", app.shown.scale,
+                            app.render.scale, app.gens.size());
+                for (const auto& g : app.gens) {
+                    double ox, oy, ratio;
+                    mapOnto(app, g.view, app.ss, app.view.width, app.view.height, ox, oy, ratio);
+                    std::printf("  gen %.0f ox=%.1f oy=%.1f ratio=%.4f\n", g.id, ox, oy, ratio);
+                }
                 std::fflush(stdout);
             }
             if (quit) running = false;
