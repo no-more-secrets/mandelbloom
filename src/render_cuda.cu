@@ -563,7 +563,21 @@ __global__ void filterKernel(const uint16_t* __restrict__ sub, uint16_t* __restr
             }
         }
     }
-    const float inv = wsum > 0.f ? 1.f / wsum : 0.f;
+    if (wsum <= 0.f) {
+        // Radius too small to reach any sample: fall back to the pixel's own
+        // subsamples, box averaged.
+        acc = make_float3(0.f, 0.f, 0.f);
+        for (int j = 0; j < ss; ++j)
+            for (int i = 0; i < ss; ++i) {
+                const ushort4 v = *reinterpret_cast<const ushort4*>(
+                    sub + ((size_t)(Y * ss + j) * vw + (X * ss + i)) * 4);
+                acc.x += h2f(v.x);
+                acc.y += h2f(v.y);
+                acc.z += h2f(v.z);
+            }
+        wsum = (float)(ss * ss);
+    }
+    const float inv = 1.f / wsum;
     ushort4 o;
     o.x = f2h(acc.x * inv);
     o.y = f2h(acc.y * inv);
@@ -1143,7 +1157,7 @@ bool CudaRenderer::shadeCached(const ShadeParams& params, float timeSec, const A
                                                    params, timeSec, paletteLut_);
         filterKernel<<<grid, block, 0, stream>>>(subColour_, hdr_, width_, height_, ss_, marginX_,
                                                  marginY_, aa.pattern, jitterOx_, jitterOy_,
-                                                 aa.filter, fmaxf(aa.radius, 0.3f));
+                                                 aa.filter, fmaxf(aa.radius, 0.05f));
     }
     const cudaError_t err = cudaGetLastError();
     if (!shadePending_) {

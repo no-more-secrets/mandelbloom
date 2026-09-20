@@ -457,7 +457,7 @@ void drawUi(App& app) {
             if (ImGui::Combo("filter", &app.aa.filter, filts, FILTER_COUNT)) app.cachedShown = false;
             if (app.aa.filter != FILTER_BOX) {
                 ImGui::SetNextItemWidth(100 * app.uiScale);
-                if (ImGui::SliderFloat("radius px", &app.aa.radius, 0.5f, 1.5f)) app.cachedShown = false;
+                if (ImGui::SliderFloat("radius px", &app.aa.radius, 0.f, 3.f)) app.cachedShown = false;
             }
         }
         if (ImGui::SliderInt("max iter", &app.view.maxIter, 64, 65536, "%d",
