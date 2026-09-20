@@ -35,8 +35,10 @@ public:
     // Block until the GPU finished the previous frame's copy out of the
     // shared buffer, so CUDA may overwrite it.
     void waitForGpu();
-    // Copy the shared buffer to the back buffer, draw the UI, present.
-    bool present(ImDrawData* drawData, bool vsync);
+    // Copy the shared buffer to the back buffer, draw the UI (rendered to an
+    // 8-bit texture, then composited in linear light lifted to the SDR white
+    // level), present.
+    bool present(ImDrawData* drawData, bool vsync, float whiteScale);
 
     bool imguiInit();
     void imguiNewFrame();
@@ -47,8 +49,11 @@ private:
     void releaseSwapchainResources();
     bool createSharedBuffer();
     void releaseSharedBuffer();
+    bool createUiTexture();
+    bool createComposePipeline();
 
     static constexpr int kFrames = 3;
+    static constexpr int kRtvCount = kFrames + 1;  // back buffers + UI texture
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue_;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swapchain_;
@@ -62,6 +67,12 @@ private:
     uint64_t fenceValue_ = 0;
     uint64_t frameFence_[kFrames] = {};
     Microsoft::WRL::ComPtr<ID3D12Resource> shared_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> uiTex_;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> composeRs_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> composePso_;
+    D3D12_CPU_DESCRIPTOR_HANDLE uiSrvCpu_{};
+    D3D12_GPU_DESCRIPTOR_HANDLE uiSrvGpu_{};
+    bool uiSrvAllocated_ = false;
     HANDLE sharedHandle_ = nullptr;
     size_t sharedSize_ = 0;
     int rowPitch_ = 0;

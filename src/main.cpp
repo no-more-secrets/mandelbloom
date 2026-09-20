@@ -107,15 +107,8 @@ void applyUiScale(App& app) {
     ImGui::StyleColorsDark();
     style.ScaleAllSizes(s);
     style.FontScaleDpi = s;
-    // The back buffer is linear scRGB: convert the sRGB style colours and
-    // lift them to SDR white so the UI looks the same on SDR and HDR.
-    auto lin = [](float v) { return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f); };
-    for (int i = 0; i < ImGuiCol_COUNT; ++i) {
-        ImVec4& c = style.Colors[i];
-        c.x = lin(c.x) * app.sdrWhite;
-        c.y = lin(c.y) * app.sdrWhite;
-        c.z = lin(c.z) * app.sdrWhite;
-    }
+    // Colours stay sRGB: the UI is drawn to an 8-bit texture and composited
+    // in linear light at SDR white by the display.
 }
 
 void readHdrState(App& app) {
@@ -1015,7 +1008,7 @@ int main(int argc, char** argv) {
             }
             if (quit) running = false;
         }
-        app.display.present(ImGui::GetDrawData(), app.vsync);
+        app.display.present(ImGui::GetDrawData(), app.vsync, app.sdrWhite);
     }
 
     app.display.imguiShutdown();
