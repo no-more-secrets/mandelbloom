@@ -1,6 +1,8 @@
-# mandelgpu
+# mandelbloom
 
-Mandelbrot viewer for Windows. CUDA does the iteration, SDL3 and Dear ImGui
+![mandelbloom cover: a minibrot at 3.6e16 zoom in the solar preset with bloom](docs/cover.jpg)
+
+GPU Mandelbrot viewer for Windows, built for 4K HDR and smooth deep zooms. CUDA does the iteration, SDL3 and Dear ImGui
 do the window and UI, Direct3D 12 presents an FP16 scRGB swapchain (HDR on
 HDR displays) that CUDA writes into directly through a shared buffer.
 
