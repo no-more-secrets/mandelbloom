@@ -47,3 +47,8 @@ target_compile_options(mandelgpu PRIVATE
 set(MANDELGPU_OUTPUT_NAME "mandelgpu" CACHE STRING "Executable name (lets a test build coexist with a running one)")
 set_target_properties(mandelgpu PROPERTIES CUDA_SEPARABLE_COMPILATION OFF
                                            OUTPUT_NAME "${MANDELGPU_OUTPUT_NAME}")
+# Windowed app: no console window on launch. Keep the plain main() entry
+# point; stdout still works when the launcher redirects it.
+if(MSVC)
+  target_link_options(mandelgpu PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+endif()
