@@ -46,6 +46,7 @@ Toolkit 13.4, and an NVIDIA GPU. Dependencies come from the vcpkg bundled with V
 | F11 | Fullscreen |
 | F2 | Screenshot to Pictures\mandelgpu (SDR PNG, HDR highlights rolled off) |
 | Shift+F2 | Screenshot PNG plus linear EXR (1.0 = SDR white) |
+| Ctrl+F2 | Screenshot of the presented frame including the UI |
 | Esc | Quit |
 
 ## Presets

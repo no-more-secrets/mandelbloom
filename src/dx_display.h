@@ -13,6 +13,7 @@
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <cstdint>
+#include <vector>
 
 struct ImDrawData;
 
@@ -39,6 +40,10 @@ public:
     // 8-bit texture, then composited in linear light lifted to the SDR white
     // level), present.
     bool present(ImDrawData* drawData, bool vsync, float whiteScale);
+    // Capture the next presented frame (image + UI). requestCapture before
+    // present(); takeCapture after it returns RGBA16F rows of pitchPx pixels.
+    void requestCapture() { captureNext_ = true; }
+    bool takeCapture(std::vector<uint16_t>& rgba16, int& pitchPx);
 
     bool imguiInit();
     void imguiNewFrame();
@@ -73,6 +78,12 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE uiSrvCpu_{};
     D3D12_GPU_DESCRIPTOR_HANDLE uiSrvGpu_{};
     bool uiSrvAllocated_ = false;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback_;
+    size_t readbackSize_ = 0;
+    int readbackPitch_ = 0;
+    bool captureNext_ = false;
+    bool capturePending_ = false;
+    uint64_t captureFence_ = 0;
     HANDLE sharedHandle_ = nullptr;
     size_t sharedSize_ = 0;
     int rowPitch_ = 0;

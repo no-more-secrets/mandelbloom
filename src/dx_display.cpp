@@ -427,9 +427,61 @@ bool DxDisplay::present(ImDrawData* drawData, bool vsync, float whiteScale) {
     cmdList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     cmdList_->DrawInstanced(3, 1, 0, 0);
 
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-    cmdList_->ResourceBarrier(1, &b);
+    if (captureNext_) {
+        // Back buffer -> readback buffer, for a screenshot that includes the UI.
+        readbackPitch_ = ((width_ * 8) + 255) & ~255;
+        const size_t need = (size_t)readbackPitch_ * (size_t)height_;
+        if (!readback_ || readbackSize_ < need) {
+            readback_.Reset();
+            D3D12_HEAP_PROPERTIES hp{};
+            hp.Type = D3D12_HEAP_TYPE_READBACK;
+            D3D12_RESOURCE_DESC rd{};
+            rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rd.Width = need;
+            rd.Height = 1;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels = 1;
+            rd.SampleDesc.Count = 1;
+            rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            if (SUCCEEDED(device_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                           D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                           IID_PPV_ARGS(&readback_))))
+                readbackSize_ = need;
+            else
+                readbackSize_ = 0;
+        }
+        if (readback_) {
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            cmdList_->ResourceBarrier(1, &b);
+            D3D12_TEXTURE_COPY_LOCATION rsrc{};
+            rsrc.pResource = bb;
+            rsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            rsrc.SubresourceIndex = 0;
+            D3D12_TEXTURE_COPY_LOCATION rdst{};
+            rdst.pResource = readback_.Get();
+            rdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            rdst.PlacedFootprint.Footprint.Format = kFormat;
+            rdst.PlacedFootprint.Footprint.Width = (UINT)width_;
+            rdst.PlacedFootprint.Footprint.Height = (UINT)height_;
+            rdst.PlacedFootprint.Footprint.Depth = 1;
+            rdst.PlacedFootprint.Footprint.RowPitch = (UINT)readbackPitch_;
+            cmdList_->CopyTextureRegion(&rdst, 0, 0, 0, &rsrc, nullptr);
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            cmdList_->ResourceBarrier(1, &b);
+            capturePending_ = true;
+        } else {
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+            cmdList_->ResourceBarrier(1, &b);
+        }
+        captureNext_ = false;
+    } else {
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        cmdList_->ResourceBarrier(1, &b);
+    }
     cmdList_->Close();
     ID3D12CommandList* lists[] = {cmdList_.Get()};
     queue_->ExecuteCommandLists(1, lists);
@@ -443,7 +495,26 @@ bool DxDisplay::present(ImDrawData* drawData, bool vsync, float whiteScale) {
     ++fenceValue_;
     queue_->Signal(fence_.Get(), fenceValue_);
     frameFence_[bi] = fenceValue_;
+    if (capturePending_) captureFence_ = fenceValue_;
     if (FAILED(hr)) return fail("Present", hr);
+    return true;
+}
+
+bool DxDisplay::takeCapture(std::vector<uint16_t>& rgba16, int& pitchPx) {
+    if (!capturePending_ || !readback_) return false;
+    capturePending_ = false;
+    if (fence_->GetCompletedValue() < captureFence_) {
+        fence_->SetEventOnCompletion(captureFence_, fenceEvent_);
+        WaitForSingleObject(fenceEvent_, INFINITE);
+    }
+    void* mapped = nullptr;
+    D3D12_RANGE range{0, readbackSize_};
+    if (FAILED(readback_->Map(0, &range, &mapped))) return false;
+    rgba16.resize(readbackSize_ / 2);
+    std::memcpy(rgba16.data(), mapped, readbackSize_);
+    D3D12_RANGE none{0, 0};
+    readback_->Unmap(0, &none);
+    pitchPx = readbackPitch_ / 8;
     return true;
 }
 
@@ -482,6 +553,7 @@ void DxDisplay::shutdown() {
     releaseSharedBuffer();
     releaseSwapchainResources();
     uiTex_.Reset();
+    readback_.Reset();
     composePso_.Reset();
     composeRs_.Reset();
     if (fenceEvent_) {

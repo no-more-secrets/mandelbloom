@@ -360,16 +360,8 @@ void applyPresetTo(App& app, const Preset& p) {
 
 void applyPreset(App& app, int which) { applyPresetTo(app, builtinPreset(which)); }
 
-// Save the current output. PNG: SDR, sRGB, highlights above SDR white
-// rolled off softly. EXR: linear, 1.0 = SDR white, headroom preserved.
-void takeScreenshot(App& app, bool alsoExr) {
-    std::vector<float> lin;
-    if (!app.renderer.readOutputLinear(lin)) {
-        app.toast = "screenshot failed";
-        app.toastUntil = nowSeconds() + 3.0;
-        return;
-    }
-    const int w = app.view.width / app.ss, h = app.view.height / app.ss;
+// Screenshot file stem: Pictures/mandelgpu/mandel_<stamp>_<zoom>.
+std::string screenshotStem(App& app, int w) {
     const char* picsC = SDL_GetUserFolder(SDL_FOLDER_PICTURES);  // owned by SDL
     std::string dir = picsC ? picsC : "";
     dir += "mandelgpu";
@@ -383,9 +375,11 @@ void takeScreenshot(App& app, bool alsoExr) {
     const double zoom = 3.2 / (app.render.scale * w);
     char base[128];
     std::snprintf(base, sizeof base, "mandel_%s_%.2e", stamp, zoom);
-    const std::string stem = dir + "/" + base;
+    return dir + "/" + base;
+}
 
-    // Soft roll-off: linear below the knee, asymptotic to 1 above it.
+// Linear (1.0 = SDR white) -> 8-bit sRGB with highlights rolled off softly.
+void linearToSdrPng(const float* lin, int w, int h, std::vector<uint32_t>& px) {
     const float knee = 0.8f;
     auto roll = [&](float v) {
         if (v <= knee) return v;
@@ -397,20 +391,77 @@ void takeScreenshot(App& app, bool alsoExr) {
         v = v <= 0.0031308f ? 12.92f * v : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
         return (uint32_t)(v * 255.f + 0.5f);
     };
-    std::vector<uint32_t> px((size_t)w * h);
+    px.resize((size_t)w * h);
     for (size_t i = 0; i < px.size(); ++i) {
-        const float* c = lin.data() + i * 3;
+        const float* c = lin + i * 3;
         px[i] = enc(roll(c[0])) | (enc(roll(c[1])) << 8) | (enc(roll(c[2])) << 16) | 0xFF000000u;
     }
+}
+
+void writeLocationFile(App& app, const std::string& stem) {
+    std::ofstream loc(stem + ".txt");
+    const int dg = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
+    loc << app.render.cx.toString(dg) << " " << app.render.cy.toString(dg) << " "
+        << app.render.scale << " " << app.view.maxIter << "\n";
+}
+
+// Ctrl+F2: the presented frame including the UI, read back from the D3D12
+// back buffer (scRGB), divided by SDR white and saved like F2.
+void takeUiScreenshot(App& app) {
+    std::vector<uint16_t> raw;
+    int pitchPx = 0;
+    if (!app.display.takeCapture(raw, pitchPx)) {
+        app.toast = "screenshot failed";
+        app.toastUntil = nowSeconds() + 3.0;
+        return;
+    }
+    const int w = app.display.width(), h = app.display.height();
+    auto halfToFloat = [](uint16_t v) {
+        const uint32_t sgn = (v >> 15) & 1u, exp = (v >> 10) & 0x1Fu, man = v & 0x3FFu;
+        float f;
+        if (exp == 0) f = std::ldexp((float)man, -24);
+        else if (exp == 31) f = man ? 0.f : 1e30f;
+        else f = std::ldexp((float)(man | 0x400u), (int)exp - 25);
+        return sgn ? -f : f;
+    };
+    const float inv = app.sdrWhite > 0.f ? 1.f / app.sdrWhite : 1.f;
+    std::vector<float> lin((size_t)w * h * 3);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const uint16_t* p = raw.data() + ((size_t)y * pitchPx + x) * 4;
+            float* o = lin.data() + ((size_t)y * w + x) * 3;
+            o[0] = halfToFloat(p[0]) * inv;
+            o[1] = halfToFloat(p[1]) * inv;
+            o[2] = halfToFloat(p[2]) * inv;
+        }
+    const std::string stem = screenshotStem(app, w) + "_ui";
+    std::vector<uint32_t> px;
+    linearToSdrPng(lin.data(), w, h, px);
+    const bool ok = writePng((stem + ".png").c_str(), px.data(), w, h);
+    writeLocationFile(app, stem);
+    app.lastShotPath = stem;
+    app.toast = ok ? "saved " + stem.substr(stem.find_last_of('/') + 1) + ".png" : "screenshot failed";
+    app.toastUntil = nowSeconds() + 4.0;
+    std::printf("screenshot %s ok=%d\n", stem.c_str(), ok ? 1 : 0);
+}
+
+// Save the current output. PNG: SDR, sRGB, highlights above SDR white
+// rolled off softly. EXR: linear, 1.0 = SDR white, headroom preserved.
+void takeScreenshot(App& app, bool alsoExr) {
+    std::vector<float> lin;
+    if (!app.renderer.readOutputLinear(lin)) {
+        app.toast = "screenshot failed";
+        app.toastUntil = nowSeconds() + 3.0;
+        return;
+    }
+    const int w = app.view.width / app.ss, h = app.view.height / app.ss;
+    const std::string stem = screenshotStem(app, w);
+    const std::string base = stem.substr(stem.find_last_of('/') + 1);
+    std::vector<uint32_t> px;
+    linearToSdrPng(lin.data(), w, h, px);
     bool ok = writePng((stem + ".png").c_str(), px.data(), w, h);
     if (alsoExr) ok = writeExr((stem + ".exr").c_str(), lin.data(), w, h) && ok;
-    {
-        // Location file so the shot can be revisited from the command line.
-        std::ofstream loc(stem + ".txt");
-        const int dg = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
-        loc << app.render.cx.toString(dg) << " " << app.render.cy.toString(dg) << " "
-            << app.render.scale << " " << app.view.maxIter << "\n";
-    }
+    writeLocationFile(app, stem);
     app.lastShotPath = stem;
     app.toast = ok ? std::string("saved ") + base + (alsoExr ? ".png + .exr" : ".png")
                    : "screenshot failed";
@@ -443,7 +494,9 @@ bool handleEvent(App& app, const SDL_Event& e) {
             if (e.key.key == SDLK_R) resetView(app);
             if (e.key.key == SDLK_TAB) app.showUi = !app.showUi;
             if (e.key.key == SDLK_F11) setFullscreen(app, !app.fullscreen);
-            if (e.key.key == SDLK_F2) app.screenshotRequest = (e.key.mod & SDL_KMOD_SHIFT) ? 2 : 1;
+            if (e.key.key == SDLK_F2)
+                app.screenshotRequest = (e.key.mod & SDL_KMOD_CTRL) ? 3
+                                        : (e.key.mod & SDL_KMOD_SHIFT) ? 2 : 1;
             break;
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
             if (io.WantCaptureMouse) break;
@@ -584,7 +637,7 @@ void drawUi(App& app) {
         ImGui::SetNextItemWidth(100 * app.uiScale);
         ImGui::SliderFloat("##itau", &app.inertiaTau, 0.05f, 1.0f, "%.2f s");
         ImGui::TextDisabled("drag: pan  wheel: zoom  R: reset  Tab: hide  F11: fullscreen");
-        ImGui::TextDisabled("F2: screenshot PNG   Shift+F2: PNG + EXR");
+        ImGui::TextDisabled("F2: screenshot   Shift+F2: + EXR   Ctrl+F2: with UI");
 
         if (ImGui::CollapsingHeader("Shading")) {
             ShadeParams& sp = app.shade;
@@ -1138,11 +1191,11 @@ int main(int argc, char** argv) {
             }
             if (quit) running = false;
         }
+        if (app.screenshotRequest == 3) app.display.requestCapture();
         app.display.present(ImGui::GetDrawData(), app.vsync, app.sdrWhite);
-        if (app.screenshotRequest) {
-            takeScreenshot(app, app.screenshotRequest == 2);
-            app.screenshotRequest = 0;
-        }
+        if (app.screenshotRequest == 3) takeUiScreenshot(app);
+        else if (app.screenshotRequest) takeScreenshot(app, app.screenshotRequest == 2);
+        app.screenshotRequest = 0;
     }
 
     app.display.imguiShutdown();

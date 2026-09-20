@@ -1,5 +1,6 @@
 #include "script.h"
 #include <SDL3/SDL.h>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -124,7 +125,7 @@ std::string Script::tick(double now, int winW, int winH, bool& quit) {
             waitUntil_ = now + 0.016;
             return "";
         } else if (s.cmd == "screenshot") {
-            shotReq_ = std::atoi(s.arg.c_str()) >= 2 ? 2 : 1;
+            shotReq_ = std::min(std::max(std::atoi(s.arg.c_str()), 1), 3);
             waitUntil_ = now + 0.016;
             return "";
         } else if (s.cmd == "animate") {
