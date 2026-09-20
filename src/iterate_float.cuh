@@ -120,7 +120,8 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                               int sliceIters, const unsigned long long* __restrict__ startNs,
                               unsigned long long budgetNs, DeviceReferenceF ref, DeviceBlaF bla,
                               int gen, int ss, int aaPattern, int jox, int joy,
-                              int* __restrict__ activeCount, int* __restrict__ minIter) {
+                              int* __restrict__ activeCount, int* __restrict__ minIter,
+                              double refRe, double refIm, int interiorCheck) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
     float myMin = 3.0e38f;  // smallest iteration count this thread escaped at
     int x, y;
@@ -155,7 +156,10 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
         const int refLast = ref.length - 1;
         const bool refShort = refLast < maxIter;  // reference escaped early
         bool unreliable = false;
-        const int stop = min(maxIter, n + sliceIters);
+        const bool interior =
+            interiorCheck && n == 0 &&
+            inCardioidOrBulb(refRe + ldexp((double)dcr, eP), refIm + ldexp((double)dci, eP));
+        const int stop = interior ? n : min(maxIter, n + sliceIters);
         bool escaped = false;
         int budgetCheck = 0;
 
@@ -252,7 +256,7 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
         st.n = n;
         st.hint = hint;
         if (escaped) st.status = 1;
-        else if (n >= maxIter) st.status = 2;
+        else if (n >= maxIter || interior) st.status = 2;
         const bool pending = st.status == 0;
         if (!pending) {
             FieldSample s{};

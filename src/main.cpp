@@ -44,7 +44,9 @@ struct VideoParams {
     float headroom = 0.f;        // peak / SDR white for the tone map; 0: the display's
     int cq = 20;                 // NVENC constant quality
     int subsamples = 3;          // composite samples per axis per output pixel
-    bool debug = false;          // print field statistics per keyframe
+    bool debug = false;          // print timing per second
+    bool dumpKeys = false;       // write every keyframe as a PNG and print field statistics (slow)
+    bool iterRamp = true;        // shallow keyframes get fewer iterations (2000 -> full by mid-depth)
     std::string codec;           // ffmpeg encoder; empty: hevc_nvenc
     std::string outPath;         // empty: Videos\Mandelbloom\mandel_<stamp>_<zoom>.mp4
 };
@@ -74,6 +76,11 @@ struct VideoJob {
     int iterating = -1, nextKey = 0;    // keyframe in the live field, next to start
     int totalFrames = 0, frame = 0;
     double t0 = 0, keyMs = 0;
+    double lastKeySec = 0, frameSec = 0;  // recent keyframe time, smoothed frame time
+    double lastFrameStamp = 0;
+    // Debug timing: wall seconds per phase since the last report, slices issued.
+    double tPump = 0, tFrames = 0, tLive = 0, tPreview = 0, tReport = 0;
+    int slices = 0, framesSince = 0;
     View savedRender, savedShown;
     ViewParams savedView;
 };
@@ -321,6 +328,10 @@ const View& fieldView(const App& app) { return app.gens.empty() ? app.render : a
 void updateRefOffset(App& app) {
     app.view.refOffX = BigFloat::diff(fieldView(app).cx, app.refCx);
     app.view.refOffY = BigFloat::diff(fieldView(app).cy, app.refCy);
+    app.view.refRe = app.refCx.toDouble();
+    app.view.refIm = app.refCy.toDouble();
+    // A double c is exact to ~1e-16; keep the test well clear of that.
+    app.view.interiorCheck = app.view.scale > 1e-12 ? 1 : 0;
 }
 
 void rebuildBla(App& app) {
@@ -697,6 +708,14 @@ void videoStartKey(App& app, int k) {
     const View kv = videoKeyView(app, k);
     app.render = kv;
     syncViewScale(app);
+    // Iterations needed grow roughly linearly with depth; shallow keyframes
+    // would otherwise spend the full budget on every interior pixel.
+    if (job.p.iterRamp && job.keyCount > 1) {
+        const int full = job.savedView.maxIter;
+        const int lo = std::min(full, 2000);
+        const double f = std::min(1.0, 2.0 * k / (double)(job.keyCount - 1));
+        app.view.maxIter = (int)std::lround(lo + (full - lo) * f);
+    }
     App::Gen g;
     g.view = kv;
     g.id = app.nextGen;
@@ -723,8 +742,10 @@ void videoStartKey(App& app, int k) {
 
 void videoFinish(App& app, bool cancelled) {
     VideoJob& job = app.video;
+    // A cancel still closes the stream cleanly so the frames written so far
+    // play; only a broken pipe kills ffmpeg.
     int code = 0;
-    if (cancelled) job.enc.cancel();
+    if (cancelled && !job.error.empty()) job.enc.cancel();
     else code = job.enc.finish();
     app.renderer.endVideo();
     app.render = job.savedRender;
@@ -743,7 +764,8 @@ void videoFinish(App& app, bool cancelled) {
     if (cancelled && !job.error.empty())
         std::snprintf(msg, sizeof msg, "video failed: %s", job.error.c_str());
     else if (cancelled)
-        std::snprintf(msg, sizeof msg, "video cancelled after %d frames", job.frame);
+        std::snprintf(msg, sizeof msg, "video cancelled, kept %d frames in %s", job.frame,
+                      job.outPath.c_str());
     else if (code != 0)
         std::snprintf(msg, sizeof msg, "ffmpeg exited with %d (see .ffmpeg.log)", code);
     else
@@ -902,10 +924,11 @@ void videoPumpKeys(App& app) {
         }
         if (!app.renderer.iterateDone()) {
             app.renderer.stepIterate();
+            ++job.slices;
             return;
         }
         VideoJob::Key& key = job.keys[(size_t)job.iterating];
-        if (job.p.debug) {
+        if (job.p.dumpKeys) {
             CudaRenderer::DebugStats st;
             if (app.renderer.debugStats(key.gen, st))
                 std::printf("video keyframe %d gen %d: total=%d match=%d zero=%d other=%d active=%d "
@@ -916,10 +939,11 @@ void videoPumpKeys(App& app) {
             std::fflush(stdout);
         }
         app.renderer.stashField(key.slot);
-        if (job.p.debug) videoDumpKey(app, job.iterating, "");
+        if (job.p.dumpKeys) videoDumpKey(app, job.iterating, "");
         key.minIter = app.renderer.minIter();
         key.ready = true;
         job.keyMs += app.renderer.lastIterateMs();
+        job.lastKeySec = app.renderer.lastIterateMs() / 1000.0;
         job.iterating = -1;
         ++job.keysDone;
     }
@@ -939,8 +963,11 @@ void videoStep(App& app) {
         videoFinish(app, true);
         return;
     }
+    double tA = nowSeconds();
     videoPumpKeys(app);
-    const double budgetEnd = nowSeconds() + 0.05;  // then let the window update
+    double tB = nowSeconds();
+    job.tPump += tB - tA;
+    const double budgetEnd = tB + 0.05;  // then let the window update
     while (job.frame < job.totalFrames && nowSeconds() < budgetEnd) {
         const double s = videoFrameScale(job, job.frame);
         const int outer = videoOuter(job, s);
@@ -991,10 +1018,52 @@ void videoStep(App& app) {
             break;
         }
         ++job.frame;
+        ++job.framesSince;
+        {
+            const double now = nowSeconds();
+            if (job.lastFrameStamp > 0) {
+                const double dtf = now - job.lastFrameStamp;
+                job.frameSec = job.frameSec > 0 ? 0.9 * job.frameSec + 0.1 * dtf : dtf;
+            }
+            job.lastFrameStamp = now;
+        }
         videoPumpKeys(app);
     }
+    tA = nowSeconds();
+    job.tFrames += tA - tB;
+    if (job.frame == 0 && job.iterating >= 0 && !app.gens.empty()) {
+        // Nothing encoded yet: show the keyframe being computed, as the
+        // interactive view would.
+        app.shown.scale = app.render.scale;
+        CompositeMap m;
+        m.ss = app.ss;
+        m.genCount = 1;
+        GenMap& gm = m.gens[0];
+        mapOnto(app, app.render, app.ss, app.view.width, app.view.height, gm.ox, gm.oy, gm.ratio);
+        gm.pixelScale = (float)(app.render.scale / app.ss);
+        gm.gen = app.gens[0].id;
+        gm.slot = 0;
+        app.renderer.composite(app.shade, 0.f, m);
+        app.renderer.postProcess(app.post, 0);
+    }
+    tB = nowSeconds();
+    job.tLive += tB - tA;
     if (job.previewOk) app.renderer.previewToDisplay(app.sdrWhite);
     app.renderer.syncDisplay();
+    tA = nowSeconds();
+    job.tPreview += tA - tB;
+    if (job.p.debug && tA - job.tReport >= 2.0) {
+        std::printf("video t=%.0fs frames=%d (+%d) keys=%d/%d iterating=%d slices=%d pump=%.2fs "
+                    "frames=%.2fs live=%.2fs preview=%.2fs iterMs=%.0f stride=%d" "%s",
+                    tA - job.t0, job.frame, job.framesSince, job.keysDone, job.keyCount,
+                    job.iterating, job.slices, job.tPump, job.tFrames, job.tLive, job.tPreview,
+                    app.renderer.lastIterateMs(), app.renderer.currentStride(), "\n");
+        std::fflush(stdout);
+        job.tReport = tA;
+        job.tPump = job.tFrames = job.tLive = job.tPreview = 0;
+        job.slices = 0;
+        job.framesSince = 0;
+    }
     if (!job.cancel && job.frame >= job.totalFrames) videoFinish(app, false);
 }
 
@@ -1005,12 +1074,15 @@ void drawVideoUi(App& app) {
     if (job.active) {
         const double el = nowSeconds() - job.t0;
         const float prog = job.totalFrames > 0 ? (float)job.frame / job.totalFrames : 0.f;
-        const double eta = job.frame > 0 ? el / job.frame * (job.totalFrames - job.frame) : 0.0;
+        const double eta = (job.keyCount - job.keysDone) * job.lastKeySec +
+                           (job.totalFrames - job.frame) * job.frameSec;
         char label[96];
         std::snprintf(label, sizeof label, "%d / %d frames", job.frame, job.totalFrames);
         ImGui::ProgressBar(prog, ImVec2(-FLT_MIN, 0), label);
         ImGui::Text("keyframes %d / %d   elapsed %.0f s   eta %.0f s", job.keysDone, job.keyCount,
                     el, eta);
+        if (job.iterating >= 0)
+            ImGui::Text("computing keyframe %d (%d iterations max)", job.iterating, app.view.maxIter);
         ImGui::TextWrapped("%s", job.outPath.c_str());
         if (ImGui::Button("cancel (Esc)")) job.cancel = true;
         return;
@@ -1035,6 +1107,8 @@ void drawVideoUi(App& app) {
     if (ImGui::SliderFloat("hold start", &hs, 0.f, 10.f, "%.1f s")) vp.holdStart = hs;
     if (ImGui::SliderFloat("hold end", &he, 0.f, 10.f, "%.1f s")) vp.holdEnd = he;
     ImGui::Checkbox("HDR (10-bit PQ)", &vp.hdr);
+    ImGui::SameLine();
+    ImGui::Checkbox("iteration ramp", &vp.iterRamp);
     ImGui::SliderInt("quality (cq)", &vp.cq, 10, 35);
     const double doublings = std::log2(std::max(zoomEnd, 1.0) / std::max(vp.zoomFrom, 1.0));
     ImGui::Text("%.0f doublings, %.2f per second", doublings, vp.seconds > 0 ? doublings / vp.seconds : 0.0);
@@ -1386,8 +1460,12 @@ int main(int argc, char** argv) {
             argVideoParams.subsamples = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--video-codec") == 0 && i + 1 < argc) {
             argVideoParams.codec = argv[++i];
+        } else if (std::strcmp(argv[i], "--video-noramp") == 0) {
+            argVideoParams.iterRamp = false;
         } else if (std::strcmp(argv[i], "--video-debug") == 0) {
             argVideoParams.debug = true;
+        } else if (std::strcmp(argv[i], "--video-dumpkeys") == 0) {
+            argVideoParams.dumpKeys = true;
         } else if (std::strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
             std::sscanf(argv[++i], "%dx%d", &argWinW, &argWinH);
         } else {
@@ -1825,7 +1903,10 @@ int main(int argc, char** argv) {
                 }
                 std::fflush(stdout);
             }
-            if (quit) running = false;
+            if (quit) {
+                if (app.video.active) videoFinish(app, true);  // keeps the frames so far
+                running = false;
+            }
         }
         if (app.screenshotRequest == 3) app.display.requestCapture();
         app.display.present(ImGui::GetDrawData(), app.vsync, app.sdrWhite);

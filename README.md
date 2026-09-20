@@ -94,7 +94,10 @@ are rendered 2x apart in zoom with the same supersampling as the viewer, and
 every frame is composited from the finer keyframe in the centre and the
 coarser one around it, so per-frame shading, animation and post-processing
 all apply. A 4K60 frame costs a few milliseconds; deep keyframes cost about
-as much as one interactive render each. The output goes to
+as much as one interactive render each. Shallow keyframes get a ramped
+iteration limit (2000 rising to the full limit by mid-depth,
+`--video-noramp` to disable) and the main cardioid and period-2 bulb are
+settled without iterating. The output goes to
 `Videos\Mandelbloom\mandel_<stamp>_<zoom>.mp4` with a `.txt` command line and
 a `.preset` beside it.
 

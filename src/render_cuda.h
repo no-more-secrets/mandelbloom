@@ -19,6 +19,11 @@ struct ViewParams {
     bool useBla = true;
     bool useFloat = true;  // float kernel with per-value exponents (default); else double
     int aaPattern = AA_GRID;  // subsample placement (needs a re-iterate to change)
+    // Reference centre as doubles, for the main-cardioid / period-2 bulb
+    // test that settles interior pixels at once. Only used while the pixel
+    // scale is coarse enough for a double c to be exact at the boundary.
+    double refRe = 0.0, refIm = 0.0;
+    int interiorCheck = 0;
 };
 
 // BLA table as uploaded to the device (see bla.h for the layout).

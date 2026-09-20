@@ -146,6 +146,15 @@ __device__ __forceinline__ float writeSample(FieldSample* __restrict__ field, si
     return s.iter;
 }
 
+// c inside the main cardioid or the period-2 bulb: never escapes.
+__device__ __forceinline__ bool inCardioidOrBulb(double cr, double ci) {
+    const double xq = cr - 0.25, y2 = ci * ci;
+    const double q = xq * xq + y2;
+    if (q * (q + xq) <= 0.25 * y2) return true;
+    const double xb = cr + 1.0;
+    return xb * xb + y2 <= 0.0625;
+}
+
 __device__ __forceinline__ unsigned long long globalTimerNs() {
     unsigned long long t;
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -187,7 +196,8 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
                              int sliceIters, const unsigned long long* __restrict__ startNs,
                              unsigned long long budgetNs, DeviceReference ref, DeviceBla bla,
                              int gen, int ss, int aaPattern, int jox, int joy,
-                             int* __restrict__ activeCount, int* __restrict__ minIter) {
+                             int* __restrict__ activeCount, int* __restrict__ minIter,
+                             double refRe, double refIm, int interiorCheck) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
     float myMin = 3.0e38f;  // smallest iteration count this thread escaped at
     int x, y;
@@ -219,7 +229,9 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
         const int refLast = ref.length - 1;
         const bool refShort = refLast < maxIter;  // reference escaped early
         bool unreliable = false;
-        const int stop = min(maxIter, n + sliceIters);
+        const bool interior =
+            interiorCheck && n == 0 && inCardioidOrBulb(refRe + dcr, refIm + dci);
+        const int stop = interior ? n : min(maxIter, n + sliceIters);
         bool escaped = false;
         double dzmag2 = dzr * dzr + dzi * dzi;
         int budgetCheck = 0;
@@ -296,7 +308,7 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
         st.m = m;
         st.n = n;
         if (escaped) st.status = 1;
-        else if (n >= maxIter) st.status = 2;
+        else if (n >= maxIter || interior) st.status = 2;
         const bool pending = st.status == 0;
         // In-progress pixels keep whatever older sample sits there.
         if (!pending) {
@@ -898,11 +910,15 @@ bool CudaRenderer::allocField(int width, int height, int ss, int slots) {
     const size_t fn = (size_t)fieldW_ * fieldH_;
     CUDA_CHECK(cudaMalloc(&field_, sizeof(FieldSample) * fn * (size_t)(1 + slots)));
     CUDA_CHECK(cudaMalloc(&state_, sizeof(PixelState) * fn));
-    CUDA_CHECK(cudaMalloc(&fieldAlt_, sizeof(FieldSample) * fn));
-    CUDA_CHECK(cudaMalloc(&stateAlt_, sizeof(PixelState) * fn));
-    CUDA_CHECK(cudaMalloc(&shadeCache_, sizeof(ShadeInput) * n * (size_t)(ss_ * ss_)));
+    if (slots == 0) {
+        // Interactive only: pan shift buffers and the settled shading cache.
+        // Video mode skips them (at 4K with 2x supersampling they are ~4 GB).
+        CUDA_CHECK(cudaMalloc(&fieldAlt_, sizeof(FieldSample) * fn));
+        CUDA_CHECK(cudaMalloc(&stateAlt_, sizeof(PixelState) * fn));
+        CUDA_CHECK(cudaMalloc(&shadeCache_, sizeof(ShadeInput) * n * (size_t)(ss_ * ss_)));
+        CUDA_CHECK(cudaMalloc(&subColour_, sizeof(uint16_t) * 4 * (size_t)viewW_ * viewH_));
+    }
     CUDA_CHECK(cudaMalloc(&hdr_, sizeof(uint16_t) * 4 * n));
-    CUDA_CHECK(cudaMalloc(&subColour_, sizeof(uint16_t) * 4 * (size_t)viewW_ * viewH_));
     jitterOx_ = jitterOy_ = 0;
     {
         const size_t aw = (width + 3) / 4, ah = (height + 3) / 4;
@@ -1338,13 +1354,14 @@ bool CudaRenderer::stepIterate() {
             stride_, (float)mP, eP, iterView_.refOffX / iterView_.scale,
             iterView_.refOffY / iterView_.scale, iterView_.maxIter, sliceIters_, sliceStart_ns_,
             kSliceBudgetNs, rf, bf, gen_, ss_, iterView_.aaPattern, jitterOx_, jitterOy_,
-            activeCount_, minIter_);
+            activeCount_, minIter_, iterView_.refRe, iterView_.refIm, iterView_.interiorCheck);
     } else {
         iterateSlice<<<grid, block, 0, stream>>>(
             state_, field_, fieldW_, fieldH_, marginX_, marginY_, viewW_, viewH_, stride_,
             iterView_.scale, iterView_.refOffX, iterView_.refOffY, iterView_.maxIter, sliceIters_,
             sliceStart_ns_, kSliceBudgetNs, ref_, bla_, gen_, ss_, iterView_.aaPattern, jitterOx_,
-            jitterOy_, activeCount_, minIter_);
+            jitterOy_, activeCount_, minIter_, iterView_.refRe, iterView_.refIm,
+            iterView_.interiorCheck);
     }
     CUDA_CHECK(cudaGetLastError());
     cudaEventRecord((cudaEvent_t)evStop_, stream);
