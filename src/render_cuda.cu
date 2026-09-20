@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cmath>
 #include "render_cuda.h"
+#include "shade.cuh"
 
 #define CUDA_CHECK(call)                                                          \
     do {                                                                          \
@@ -17,29 +18,11 @@
 
 namespace {
 
-__device__ __forceinline__ uint32_t packRGBA(float r, float g, float b) {
-    r = fminf(fmaxf(r, 0.f), 1.f);
-    g = fminf(fmaxf(g, 0.f), 1.f);
-    b = fminf(fmaxf(b, 0.f), 1.f);
-    uint32_t ir = (uint32_t)(r * 255.f + 0.5f);
-    uint32_t ig = (uint32_t)(g * 255.f + 0.5f);
-    uint32_t ib = (uint32_t)(b * 255.f + 0.5f);
-    return ir | (ig << 8) | (ib << 16) | 0xFF000000u;
-}
-
-// Cosine palette. t in iterations, period 64.
-__device__ __forceinline__ uint32_t palette(float t) {
-    const float k = 6.2831853f / 64.f;
-    float r = 0.5f + 0.5f * cosf(k * t + 0.0f);
-    float g = 0.5f + 0.5f * cosf(k * t + 2.1f);
-    float b = 0.5f + 0.5f * cosf(k * t + 4.2f);
-    return packRGBA(r, g, b);
-}
-
-// Milestone 1 kernel: plain double-precision escape time with smooth
-// coloring. Placeholder until the perturbation path lands.
-__global__ void mandelDouble(uint32_t* __restrict__ out, int w, int h,
-                             double cx, double cy, double scale, int maxIter) {
+// Milestone 1 iteration kernel: plain double precision, with the
+// derivative dz/dc carried along for the distance estimate. Placeholder
+// until the perturbation path lands.
+__global__ void iterateDouble(FieldSample* __restrict__ field, int w, int h, double cx,
+                              double cy, double scale, int maxIter) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= w || y >= h) return;
@@ -47,10 +30,17 @@ __global__ void mandelDouble(uint32_t* __restrict__ out, int w, int h,
     const double cr = cx + ((double)x - 0.5 * w) * scale;
     const double ci = cy - ((double)y - 0.5 * h) * scale;
 
-    double zr = 0.0, zi = 0.0, zr2 = 0.0, zi2 = 0.0;
+    double zr = 0.0, zi = 0.0;    // z
+    double dr = 0.0, di = 0.0;    // dz/dc
+    double zr2 = 0.0, zi2 = 0.0;
     int i = 0;
     const double bailout = 65536.0;
     while (i < maxIter && zr2 + zi2 < bailout) {
+        // d' = 2 z d + 1
+        const double ndr = 2.0 * (zr * dr - zi * di) + 1.0;
+        const double ndi = 2.0 * (zr * di + zi * dr);
+        dr = ndr;
+        di = ndi;
         zi = 2.0 * zr * zi + ci;
         zr = zr2 - zi2 + cr;
         zr2 = zr * zr;
@@ -58,23 +48,39 @@ __global__ void mandelDouble(uint32_t* __restrict__ out, int w, int h,
         ++i;
     }
 
-    uint32_t px;
+    FieldSample s;
     if (i >= maxIter) {
-        px = 0xFF000000u;
+        s.iter = -1.f;
+        s.de = 0.f;
+        s.angle = 0.f;
     } else {
-        // Continuous escape time: mu = i + 1 - log2(log2|z|)
-        float logzn = 0.5f * logf((float)(zr2 + zi2));
-        float nu = log2f(logzn / 0.6931472f);
-        float mu = (float)i + 1.f - nu;
-        px = palette(mu);
+        const double mag2 = zr2 + zi2;
+        const double logMag = 0.5 * log(mag2);
+        // Continuous escape time: mu = i + 1 - log2(log|z|)
+        s.iter = (float)(i + 1.0 - log2(logMag / 0.6931471805599453));
+        // Distance estimate: |z| log|z| / |dz/dc|
+        const double dmag = sqrt(dr * dr + di * di);
+        s.de = dmag > 0.0 ? (float)(sqrt(mag2) * logMag / dmag) : 0.f;
+        s.angle = (float)atan2(zi, zr);
     }
-    out[(size_t)y * w + x] = px;
+    s.pad = 0.f;
+    field[(size_t)y * w + x] = s;
+}
+
+__global__ void shadeKernel(const FieldSample* __restrict__ field, uint32_t* __restrict__ out,
+                            int w, int h, ShadeParams p, float timeSec, float pixelScale) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= w || y >= h) return;
+    const size_t idx = (size_t)y * w + x;
+    out[idx] = packSRGB8(shadeSample(field[idx], p, timeSec, pixelScale));
 }
 
 }  // namespace
 
 CudaRenderer::~CudaRenderer() {
     unregisterPbo();
+    freeField();
     if (evStart_) cudaEventDestroy((cudaEvent_t)evStart_);
     if (evStop_) cudaEventDestroy((cudaEvent_t)evStop_);
 }
@@ -101,19 +107,41 @@ void CudaRenderer::unregisterPbo() {
     }
 }
 
+void CudaRenderer::freeField() {
+    if (field_) {
+        cudaFree(field_);
+        field_ = nullptr;
+    }
+}
+
 bool CudaRenderer::bindPixelBuffer(unsigned glPbo, int width, int height) {
     unregisterPbo();
+    freeField();
     width_ = width;
     height_ = height;
     if (!glPbo || width <= 0 || height <= 0) return true;
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&pboResource_, glPbo,
                                             cudaGraphicsRegisterFlagsWriteDiscard));
+    CUDA_CHECK(cudaMalloc(&field_, sizeof(FieldSample) * (size_t)width * height));
     return true;
 }
 
-bool CudaRenderer::render(const ViewParams& view) {
-    if (!pboResource_ || view.width != width_ || view.height != height_) return false;
+bool CudaRenderer::iterate(const ViewParams& view) {
+    if (!field_ || view.width != width_ || view.height != height_) return false;
+    const dim3 block(16, 16);
+    const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
+    cudaEventRecord((cudaEvent_t)evStart_, 0);
+    iterateDouble<<<grid, block>>>(field_, width_, height_, view.cx, view.cy, view.scale,
+                                   view.maxIter);
+    cudaEventRecord((cudaEvent_t)evStop_, 0);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)evStop_));
+    cudaEventElapsedTime(&iterateMs_, (cudaEvent_t)evStart_, (cudaEvent_t)evStop_);
+    return true;
+}
 
+bool CudaRenderer::shade(const ShadeParams& params, float timeSec, double pixelScale) {
+    if (!pboResource_ || !field_) return false;
     CUDA_CHECK(cudaGraphicsMapResources(1, &pboResource_, 0));
     uint32_t* devPtr = nullptr;
     size_t bytes = 0;
@@ -123,19 +151,18 @@ bool CudaRenderer::render(const ViewParams& view) {
         std::fprintf(stderr, "map failed: %s\n", cudaGetErrorString(err));
         return false;
     }
-
     const dim3 block(16, 16);
     const dim3 grid((width_ + block.x - 1) / block.x, (height_ + block.y - 1) / block.y);
     cudaEventRecord((cudaEvent_t)evStart_, 0);
-    mandelDouble<<<grid, block>>>(devPtr, width_, height_, view.cx, view.cy, view.scale,
-                                  view.maxIter);
+    shadeKernel<<<grid, block>>>(field_, devPtr, width_, height_, params, timeSec,
+                                 (float)pixelScale);
     cudaEventRecord((cudaEvent_t)evStop_, 0);
     err = cudaGetLastError();
     cudaEventSynchronize((cudaEvent_t)evStop_);
-    cudaEventElapsedTime(&lastMs_, (cudaEvent_t)evStart_, (cudaEvent_t)evStop_);
+    cudaEventElapsedTime(&shadeMs_, (cudaEvent_t)evStart_, (cudaEvent_t)evStop_);
     CUDA_CHECK(cudaGraphicsUnmapResources(1, &pboResource_, 0));
     if (err != cudaSuccess) {
-        std::fprintf(stderr, "kernel failed: %s\n", cudaGetErrorString(err));
+        std::fprintf(stderr, "shade kernel failed: %s\n", cudaGetErrorString(err));
         return false;
     }
     return true;

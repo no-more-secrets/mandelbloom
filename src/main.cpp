@@ -18,7 +18,12 @@ struct App {
     GlDisplay display;
     CudaRenderer renderer;
     ViewParams view;
-    bool dirty = true;
+    ShadeParams shade;
+    bool dirty = true;        // view changed: re-iterate and re-shade
+    bool shadeDirty = true;   // only coloring changed
+    bool animate = false;
+    float animSpeed = 0.05f;  // palette cycles per second
+    float animTime = 0.f;
     bool dragging = false;
     bool showUi = true;
     double fps = 0.0;
@@ -118,9 +123,33 @@ void drawUi(App& app) {
             app.dirty = true;
         }
         ImGui::Separator();
-        ImGui::Text("render  %.2f ms", app.renderer.lastRenderMs());
+        ImGui::Text("iterate %.2f ms", app.renderer.lastIterateMs());
+        ImGui::Text("shade   %.2f ms", app.renderer.lastShadeMs());
         ImGui::Text("frame   %.0f fps", app.fps);
         ImGui::TextDisabled("drag: pan  wheel: zoom  R: reset  Tab: hide");
+
+        if (ImGui::CollapsingHeader("Shading")) {
+            ShadeParams& sp = app.shade;
+            bool ch = false;
+            ch |= ImGui::Checkbox("animate", &app.animate);
+            ImGui::SameLine();
+            ch |= ImGui::SliderFloat("speed", &app.animSpeed, -1.f, 1.f, "%.3f cyc/s");
+            ch |= ImGui::SliderFloat("density", &sp.density, 4.f, 1024.f, "%.1f",
+                                     ImGuiSliderFlags_Logarithmic);
+            ch |= ImGui::SliderFloat("offset", &sp.offset, 0.f, 1.f);
+            bool logScale = sp.logScale != 0;
+            if (ImGui::Checkbox("log scale", &logScale)) { sp.logScale = logScale; ch = true; }
+            ch |= ImGui::SliderFloat("edge (DE)", &sp.deStrength, 0.f, 4.f);
+            ch |= ImGui::SliderFloat("exposure", &sp.exposure, 0.f, 4.f);
+            ch |= ImGui::ColorEdit3("inside", sp.inside, ImGuiColorEditFlags_Float);
+            ImGui::TextDisabled("palette a + b cos(2pi(c t + d))");
+            ch |= ImGui::DragFloat3("a", sp.a, 0.01f, -1.f, 2.f);
+            ch |= ImGui::DragFloat3("b", sp.b, 0.01f, -1.f, 2.f);
+            ch |= ImGui::DragFloat3("c", sp.c, 0.01f, -4.f, 4.f);
+            ch |= ImGui::DragFloat3("d", sp.d, 0.01f, -1.f, 1.f);
+            if (ImGui::Button("reset palette")) { sp = ShadeParams(); ch = true; }
+            if (ch) app.shadeDirty = true;
+        }
     }
     ImGui::End();
 }
@@ -191,8 +220,14 @@ int main(int, char**) {
         }
 
         if (app.dirty && pw > 0 && ph > 0) {
-            if (app.renderer.render(app.view)) app.display.upload();
+            app.renderer.iterate(app.view);
             app.dirty = false;
+            app.shadeDirty = true;
+        }
+        if (app.animate) app.shadeDirty = true;
+        if (app.shadeDirty && pw > 0 && ph > 0) {
+            if (app.renderer.shade(app.shade, app.animTime, app.view.scale)) app.display.upload();
+            app.shadeDirty = false;
         }
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -212,6 +247,7 @@ int main(int, char**) {
         const double dt = (double)(now - lastTick) / (double)SDL_GetPerformanceFrequency();
         lastTick = now;
         if (dt > 0) app.fps = 0.9 * app.fps + 0.1 * (1.0 / dt);
+        if (app.animate) app.animTime += (float)dt * app.animSpeed;
     }
 
     ImGui_ImplOpenGL3_Shutdown();
