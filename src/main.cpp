@@ -1214,7 +1214,9 @@ void drawUi(App& app) {
             ImGui::TextDisabled("presets");
             for (int i = 0; i < BUILTIN_PRESET_COUNT; ++i) {
                 if (i % 4 != 0) ImGui::SameLine();
+                ImGui::PushID(1000 + i);  // "angle" and "distance" also name sliders
                 if (ImGui::SmallButton(kBuiltinPresetNames[i])) applyPreset(app, i);
+                ImGui::PopID();
             }
             if (!app.savedPresetsValid) {
                 app.savedPresets = listSavedPresets();
