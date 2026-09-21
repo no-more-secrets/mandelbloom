@@ -80,9 +80,12 @@ The palette position comes from the iteration count through a transfer:
 linear (density = iterations per cycle), sqrt, or log. "Anchor to view
 minimum" subtracts the smallest escape iteration in the view first, so a
 linear transfer keeps its bands tightening as the zoom deepens (the KF /
-Maths Town look) instead of the whole view drifting into one colour. The log
-transfer without the anchor is the older behaviour and what the built-in
-presets other than classic use.
+Maths Town look) instead of the whole view drifting into one colour. "Auto
+density" sets the density from the view's median iteration gradient so the
+typical band stays a chosen number of pixels wide, so bands stop stretching
+as you zoom into them. The log transfer without the
+anchor is the older behaviour and what the built-in presets other than
+classic use.
 
 ## Zoom videos
 

@@ -121,9 +121,15 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                               unsigned long long budgetNs, DeviceReferenceF ref, DeviceBlaF bla,
                               int gen, int ss, int aaPattern, int jox, int joy,
                               int* __restrict__ activeCount, int* __restrict__ minIter,
-                              double refRe, double refIm, int interiorCheck) {
+                              double refRe, double refIm, int interiorCheck,
+                              int* __restrict__ hist, float histScale) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
     float myMin = 3.0e38f;  // smallest iteration count this thread escaped at
+    // Block-local histogram of escape iterations, flushed at the end.
+    __shared__ int shHist[HIST_BINS];
+    for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < HIST_BINS; i += blockDim.x * blockDim.y)
+        shHist[i] = 0;
+    __syncthreads();
     int x, y;
     bool inBounds;
     if (stride == 1) {
@@ -266,7 +272,10 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                 const float mag2 = zr * zr + zi * zi;
                 const float logMag = 0.5f * logf(mag2);
                 s.iter = (float)n + 1.f - log2f(logMag / 0.69314718f);
-                if (s.iter >= 0.f) myMin = fminf(myMin, s.iter);
+                if (s.iter >= 0.f) {
+                    myMin = fminf(myMin, s.iter);
+                    atomicAdd(&shHist[min(HIST_BINS - 1, (int)(s.iter * histScale))], 1);
+                }
                 const float wdmag = sqrtf(wdr * wdr + wdi * wdi);
                 // DE in pixels: |z| log|z| / |D| / P
                 if (wdmag > 0.f) {
@@ -293,4 +302,7 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
     // Warp-reduced minimum escape iteration (non-negative floats order as ints).
     for (int o = 16; o > 0; o >>= 1) myMin = fminf(myMin, __shfl_xor_sync(0xffffffffu, myMin, o));
     if ((threadIdx.x & 31) == 0 && myMin < 3.0e38f) atomicMin(minIter, __float_as_int(myMin));
+    __syncthreads();
+    for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < HIST_BINS; i += blockDim.x * blockDim.y)
+        if (shHist[i]) atomicAdd(&hist[i], shHist[i]);
 }

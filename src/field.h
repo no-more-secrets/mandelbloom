@@ -65,6 +65,11 @@ struct ShadeParams {
     int transfer = TRANSFER_LOG;
     int anchor = 0;
     float iterBase = 0.f;    // set by the app every frame when anchor is on
+    // Auto density: set density so the median band on screen is bandPx
+    // display pixels wide (from the median iteration gradient of the view),
+    // so bands neither stretch nor crowd as the zoom changes. Linear only.
+    int autoDensity = 0;
+    float bandPx = 100.f;
     float special = 4.f;     // per-mode parameter (steps/waves/panels per cycle, DE falloff)
 
     // Palette: gradient stops blended in OKLab, or a cosine palette.

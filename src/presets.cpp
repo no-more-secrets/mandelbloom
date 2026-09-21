@@ -44,6 +44,8 @@ std::vector<Field> fields(Preset& p) {
         {"logScale", Field::I, &s.logScale, 1},
         {"transfer", Field::I, &s.transfer, 1},
         {"anchor", Field::I, &s.anchor, 1},
+        {"autoDensity", Field::I, &s.autoDensity, 1},
+        {"bandPx", Field::F, &s.bandPx, 1},
         {"iterBase", Field::F, &s.iterBase, 1},
         {"special", Field::F, &s.special, 1},
         {"paletteType", Field::I, &s.paletteType, 1},
@@ -102,9 +104,11 @@ Preset builtinPreset(int which) {
     Preset p;
     ShadeParams& sp = p.shade;
     switch (which) {
-        case 0:  // Classic: bands tighten with depth, like KF / Maths Town
+        case 0:  // Classic: linear bands, anchored and auto-scaled to the view
             sp.transfer = TRANSFER_LINEAR;
             sp.anchor = 1;
+            sp.autoDensity = 1;
+            sp.bandPx = 100.f;
             break;
         case 1: {  // Pastel lines
             const float pos[5] = {0.f, 0.25f, 0.5f, 0.75f, 1.f};

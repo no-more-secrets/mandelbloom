@@ -69,7 +69,7 @@ struct VideoJob {
     int keyCount = 0, keysDone = 0;
     struct Key {
         int slot = 0, gen = 0;
-        float minIter = -1.f;
+        float minIter = -1.f, gradMed = -1.f;
         bool ready = false;
     };
     std::vector<Key> keys;
@@ -105,7 +105,9 @@ struct App {
         View view;
         int id = 0;
         float minIter = -1.f;  // smallest escape iteration seen, -1 unknown
+        float gradMed = -1.f;  // median iteration gradient per field pixel, -1 unknown
     };
+    int gradStride = -1;       // completed stride the newest gen's gradMed was measured at
     std::vector<Gen> gens;
     int nextGen = 1;
     int ss = 1;          // supersampling factor per axis (field = display * ss)
@@ -391,6 +393,7 @@ bool paletteEqual(const ShadeParams& a, const ShadeParams& b) {
 bool staticEqual(const ShadeParams& a, const ShadeParams& b) {
     return a.mode == b.mode && a.density == b.density && a.offset == b.offset &&
            a.transfer == b.transfer && a.anchor == b.anchor && a.iterBase == b.iterBase &&
+           a.autoDensity == b.autoDensity && a.bandPx == b.bandPx &&
            a.special == b.special && a.deStrength == b.deStrength &&
            a.lines == b.lines && a.lineDensity == b.lineDensity && a.lineWidth == b.lineWidth;
 }
@@ -557,6 +560,36 @@ void setAnimate(App& app, bool on) {
         app.animTime = 0.f;
     }
     app.animate = on;
+}
+
+// Median iteration gradient (per field pixel) from the renderer's gradient
+// histogram, or -1 when too few samples.
+float medianGradient(const App& app, int count) {
+    if (count < 2000) return -1.f;
+    const int* h = app.renderer.gradHistogram();
+    long long cum = 0;
+    for (int i = 0; i < HIST_BINS; ++i) {
+        cum += h[i];
+        if (cum * 2 >= count) return std::exp2((i + 0.5f) * (48.f / HIST_BINS) - 24.f);
+    }
+    return -1.f;
+}
+
+// Density (iterations per palette cycle) that makes a band gradPerPx
+// iterations/pixel steep come out sp.bandPx display pixels wide.
+float densityForGradient(const ShadeParams& sp, float gradPerPx) {
+    return std::max(1.f, std::max(sp.bandPx, 4.f) * gradPerPx);
+}
+
+// Measure the newest generation's gradient at the finest completed stride.
+void measureGradient(App& app) {
+    if (app.gens.empty()) return;
+    const int cs = app.renderer.completedStride();
+    if (cs <= 0 || cs == app.gradStride) return;
+    app.gradStride = cs;
+    const int n = app.renderer.gradientHistogram(app.gens[0].id, cs);
+    const float g = medianGradient(app, n);
+    if (g > 0.f) app.gens[0].gradMed = g;
 }
 
 // Sidecar preset describing the current look exactly.
@@ -941,6 +974,7 @@ void videoPumpKeys(App& app) {
         app.renderer.stashField(key.slot);
         if (job.p.dumpKeys) videoDumpKey(app, job.iterating, "");
         key.minIter = app.renderer.minIter();
+        key.gradMed = medianGradient(app, app.renderer.gradientHistogram(key.gen, 1));
         key.ready = true;
         job.keyMs += app.renderer.lastIterateMs();
         job.lastKeySec = app.renderer.lastIterateMs() / 1000.0;
@@ -1001,6 +1035,23 @@ void videoStep(App& app) {
             base = std::floor(std::max(base, 0.f));
         }
         app.shade.iterBase = base;
+        if (app.shade.autoDensity && app.shade.transfer == TRANSFER_LINEAR) {
+            // Gradient per display pixel from each keyframe through its ratio,
+            // blended by position between them.
+            const double frac = std::min(std::max(std::log2(job.startScale / s) - outer, 0.0), 1.0);
+            float go = -1.f, gi = -1.f;
+            for (int i = 0; i < m.genCount; ++i) {
+                const int k = (inner >= 0 && i == 0) ? inner : outer;
+                const float gm = job.keys[(size_t)k].gradMed;
+                if (gm <= 0.f) continue;
+                const float gd = gm * (float)m.gens[i].ratio;
+                if (k == inner) gi = gd;
+                else go = gd;
+            }
+            float g = go > 0.f ? go : gi;
+            if (go > 0.f && gi > 0.f) g = (float)(go + (gi - go) * frac);
+            if (g > 0.f) app.shade.density = densityForGradient(app.shade, g);
+        }
         const float t = app.animate ? (float)(job.frame / job.p.fps) : 0.f;
         app.renderer.composite(app.shade, t, m);
         app.renderer.postProcess(app.post, (uint32_t)job.frame);
@@ -1262,8 +1313,18 @@ void drawUi(App& app) {
                 ImGui::SliderFloat("decades per cycle", &sp.special, 0.5f, 8.f, "%.1f");
             }
             ImGui::Combo("transfer", &sp.transfer, "linear\0sqrt\0log\0");
-            ImGui::SliderFloat("density", &sp.density, 4.f, 16384.f, "%.1f",
-                               ImGuiSliderFlags_Logarithmic);
+            {
+                bool autoD = sp.autoDensity != 0;
+                if (ImGui::Checkbox("auto density", &autoD)) sp.autoDensity = autoD;
+                if (sp.autoDensity) {
+                    ImGui::SliderFloat("band width", &sp.bandPx, 10.f, 600.f, "%.0f px",
+                                       ImGuiSliderFlags_Logarithmic);
+                    ImGui::BeginDisabled();
+                }
+                ImGui::SliderFloat("density", &sp.density, 4.f, 16384.f, "%.1f",
+                                   ImGuiSliderFlags_Logarithmic);
+                if (sp.autoDensity) ImGui::EndDisabled();
+            }
             ImGui::SliderFloat("offset", &sp.offset, 0.f, 1.f);
             {
                 bool anchor = sp.anchor != 0;
@@ -1596,6 +1657,8 @@ int main(int argc, char** argv) {
                 else if (k == "density") sp.density = v;
                 else if (k == "transfer") sp.transfer = (int)v;
                 else if (k == "anchor") sp.anchor = (int)v;
+                else if (k == "auto") sp.autoDensity = (int)v;
+                else if (k == "bandpx") sp.bandPx = v;
                 else if (k == "animate") app.animate = v != 0.f;
                 else if (k == "cycle") sp.cycleSpeed = v;
                 else if (k == "light") sp.lightSpeed = v;
@@ -1736,6 +1799,7 @@ int main(int argc, char** argv) {
             if (app.gens.size() > MAX_GENS) app.gens.resize(MAX_GENS);
             rebuildReference(app);
             app.renderer.beginIterate(app.view, g.id);
+            app.gradStride = -1;
             app.panDx = app.panDy = 0;
             app.panDirty = false;
             app.dirty = false;
@@ -1753,6 +1817,7 @@ int main(int argc, char** argv) {
                 int fx, fy;
                 if (app.renderer.findUnreliable(fx, fy)) rereferenceAt(app, fx, fy);
             }
+            if (sliceDone) measureGradient(app);
             if (!app.renderer.iterateDone()) app.renderer.stepIterate();
         }
 
@@ -1780,8 +1845,27 @@ int main(int argc, char** argv) {
                         if (g.id == app.renderer.currentGen()) g.minIter = cur;
                 float base = 0.f;
                 for (const auto& g : app.gens)
-                    if (g.minIter >= 0.f) { base = std::floor(g.minIter); break; }
+                    if (g.minIter >= 0.f) {
+                        base = std::floor(g.minIter);
+                        break;
+                    }
                 app.shade.iterBase = app.shade.anchor ? base : 0.f;
+                // Auto density: the newest generation with a gradient measure,
+                // scaled by how it maps onto the shown view, with a short lag
+                // so generations hand over smoothly.
+                if (app.shade.autoDensity && app.shade.transfer == TRANSFER_LINEAR) {
+                    for (const auto& g : app.gens) {
+                        if (g.gradMed <= 0.f) continue;
+                        double ox, oy, ratio;
+                        mapOnto(app, g.view, app.ss, app.view.width, app.view.height, ox, oy, ratio);
+                        const float target = densityForGradient(app.shade, g.gradMed * (float)ratio);
+                        const float a = 1.f - std::exp(-(float)dt / 0.15f);
+                        app.shade.density += (target - app.shade.density) * a;
+                        if (std::fabs(target - app.shade.density) < 0.01f * target)
+                            app.shade.density = target;
+                        break;
+                    }
+                }
             }
             const bool paletteChanged = !app.lastShadeValid || !paletteEqual(app.shade, app.lastShade);
             const bool staticChanged = !app.lastShadeValid || !staticEqual(app.shade, app.lastShade);
@@ -1885,9 +1969,10 @@ int main(int argc, char** argv) {
                             app.cachedShown ? 1 : 0, app.fps, app.renderer.progress(),
                             app.renderer.etaMs(), app.render.cx.toString(dg).c_str(),
                             app.render.cy.toString(dg).c_str());
-                std::printf("  ref iters=%d escaped=%d rerefs=%d base=%.0f transfer=%d anchor=%d\n", app.ref.length,
+                std::printf("  ref iters=%d escaped=%d rerefs=%d base=%.0f transfer=%d anchor=%d density=%.2f grad=%.4f\n", app.ref.length,
                             app.ref.escaped ? 1 : 0, app.rerefRounds,
-                            app.shade.iterBase, app.shade.transfer, app.shade.anchor);
+                            app.shade.iterBase, app.shade.transfer, app.shade.anchor, app.shade.density,
+                            app.gens.empty() ? -1.f : app.gens[0].gradMed);
                 std::printf("  shown scale=%.6g render scale=%.6g gens=%zu\n", app.shown.scale,
                             app.render.scale, app.gens.size());
                 if (!app.gens.empty()) {

@@ -55,6 +55,7 @@ struct GenMap {
 };
 
 #define MAX_GENS 8
+#define HIST_BINS 1024  // escape-iteration histogram bins over [0, maxIter]
 
 struct CompositeMap {
     GenMap gens[MAX_GENS];  // newest first
@@ -123,6 +124,16 @@ public:
     // so far (-1 until a slice has completed with escaped pixels).
     int currentGen() const { return gen_; }
     float minIter() const { return minIterGen_; }
+    // Histogram of escape iterations of the generation being iterated,
+    // HIST_BINS bins over [0, histMaxIter()); updated after every slice.
+    const int* histogram() const { return histHost_; }
+    int histMaxIter() const { return iterView_.maxIter; }
+    // Histogram of log2 of the iteration gradient (iterations per field
+    // pixel) over the view for generation `gen`, using samples `step` field
+    // pixels apart (the finest completed stride). HIST_BINS bins over
+    // log2 in [-24, 24). Synchronous; returns the sample count.
+    int gradientHistogram(int gen, int step);
+    const int* gradHistogram() const { return gradHost_; }
     int iterateProgress() const { return sliceStart_; }  // iterations issued so far
     // Coarse-to-fine: the pass runs at stride 8, 4, 2, 1. completedStride is
     // the finest stride whose pixels are all finished (0 = none yet).
@@ -236,6 +247,10 @@ private:
     int* minIter_ = nullptr;          // device: float bits of the smallest escape iteration
     int* minIterHost_ = nullptr;      // pinned
     float minIterGen_ = -1.f;
+    int* hist_ = nullptr;             // device, HIST_BINS
+    int* histHost_ = nullptr;         // pinned copy
+    int* gradHist_ = nullptr;         // device, HIST_BINS
+    int* gradHost_ = nullptr;         // pinned copy
     // Video mode.
     uint16_t* videoOut_ = nullptr;   // owned RGBA16F output, video size
     uint16_t* sharedOut_ = nullptr;  // the display buffer while video mode is on

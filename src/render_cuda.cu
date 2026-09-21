@@ -197,9 +197,15 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
                              unsigned long long budgetNs, DeviceReference ref, DeviceBla bla,
                              int gen, int ss, int aaPattern, int jox, int joy,
                              int* __restrict__ activeCount, int* __restrict__ minIter,
-                             double refRe, double refIm, int interiorCheck) {
+                             double refRe, double refIm, int interiorCheck,
+                             int* __restrict__ hist, float histScale) {
     const unsigned long long deadlineNs = *startNs + budgetNs;
     float myMin = 3.0e38f;  // smallest iteration count this thread escaped at
+    // Block-local histogram of escape iterations, flushed at the end.
+    __shared__ int shHist[HIST_BINS];
+    for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < HIST_BINS; i += blockDim.x * blockDim.y)
+        shHist[i] = 0;
+    __syncthreads();
     int x, y;
     bool inBounds;
     if (stride == 1) {
@@ -313,7 +319,10 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
         // In-progress pixels keep whatever older sample sits there.
         if (!pending) {
             const float it = writeSample(field, idx, st, zr, zi, scale, escaped, gen);
-            if (it >= 0.f) myMin = fminf(myMin, it);
+            if (it >= 0.f) {
+                myMin = fminf(myMin, it);
+                atomicAdd(&shHist[min(HIST_BINS - 1, (int)(it * histScale))], 1);
+            }
         }
         state[idx] = st;
         active = pending;
@@ -325,6 +334,9 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
     // Warp-reduced minimum escape iteration (non-negative floats order as ints).
     for (int o = 16; o > 0; o >>= 1) myMin = fminf(myMin, __shfl_xor_sync(0xffffffffu, myMin, o));
     if ((threadIdx.x & 31) == 0 && myMin < 3.0e38f) atomicMin(minIter, __float_as_int(myMin));
+    __syncthreads();
+    for (int i = threadIdx.y * blockDim.x + threadIdx.x; i < HIST_BINS; i += blockDim.x * blockDim.y)
+        if (shHist[i]) atomicAdd(&hist[i], shHist[i]);
 }
 
 // Best sample of generation g at field pixel (x, y): the pixel itself, or
@@ -639,6 +651,10 @@ CudaRenderer::~CudaRenderer() {
     if (activeCount_) cudaFree(activeCount_);
     if (minIter_) cudaFree(minIter_);
     minIter_ = nullptr;
+    if (hist_) cudaFree(hist_);
+    hist_ = nullptr;
+    if (gradHist_) cudaFree(gradHist_);
+    gradHist_ = nullptr;
     if (levelCount_) cudaFree(levelCount_);
     if (levelCountHost_) cudaFreeHost(levelCountHost_);
     if (paletteLut_) cudaFree(paletteLut_);
@@ -646,6 +662,10 @@ CudaRenderer::~CudaRenderer() {
     if (activeCountHost_) cudaFreeHost(activeCountHost_);
     if (minIterHost_) cudaFreeHost(minIterHost_);
     minIterHost_ = nullptr;
+    if (histHost_) cudaFreeHost(histHost_);
+    histHost_ = nullptr;
+    if (gradHost_) cudaFreeHost(gradHost_);
+    gradHost_ = nullptr;
     if (stream_) cudaStreamDestroy((cudaStream_t)stream_);
     if (dispStream_) cudaStreamDestroy((cudaStream_t)dispStream_);
 }
@@ -675,6 +695,9 @@ bool CudaRenderer::init() {
     dispStream_ = ds;
     CUDA_CHECK(cudaMalloc(&activeCount_, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&minIter_, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&hist_, sizeof(int) * HIST_BINS));
+    CUDA_CHECK(cudaMemset(hist_, 0, sizeof(int) * HIST_BINS));
+    CUDA_CHECK(cudaMalloc(&gradHist_, sizeof(int) * HIST_BINS));
     CUDA_CHECK(cudaMemset(minIter_, 0x7f, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&levelCount_, sizeof(int)));
     CUDA_CHECK(cudaMallocHost(&levelCountHost_, sizeof(int)));
@@ -683,6 +706,10 @@ bool CudaRenderer::init() {
     CUDA_CHECK(cudaMallocHost(&activeCountHost_, sizeof(int)));
     *activeCountHost_ = 0;
     CUDA_CHECK(cudaMallocHost(&minIterHost_, sizeof(int)));
+    CUDA_CHECK(cudaMallocHost(&histHost_, sizeof(int) * HIST_BINS));
+    std::memset(histHost_, 0, sizeof(int) * HIST_BINS);
+    CUDA_CHECK(cudaMallocHost(&gradHost_, sizeof(int) * HIST_BINS));
+    std::memset(gradHost_, 0, sizeof(int) * HIST_BINS);
     *minIterHost_ = 0x7f7f7f7f;
     minIterGen_ = -1.f;
     return true;
@@ -934,6 +961,61 @@ bool CudaRenderer::allocField(int width, int height, int ss, int slots) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaDeviceSynchronize());
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Iteration-gradient histogram (auto density)
+
+namespace {
+
+__global__ void gradHistKernel(const FieldSample* __restrict__ field, int fw, int fh, int mx,
+                               int my, int w, int h, int gen, int step, int* __restrict__ hist) {
+    __shared__ int sh[HIST_BINS];
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x, nt = blockDim.x * blockDim.y;
+    for (int i = tid; i < HIST_BINS; i += nt) sh[i] = 0;
+    __syncthreads();
+    const int x = mx + (blockIdx.x * blockDim.x + threadIdx.x) * step;
+    const int y = my + (blockIdx.y * blockDim.y + threadIdx.y) * step;
+    if (x + step < mx + w && y + step < my + h) {
+        const FieldSample s = field[(size_t)y * fw + x];
+        if ((int)s.gen == gen && s.iter >= 0.f) {
+            const FieldSample sx = field[(size_t)y * fw + x + step];
+            const FieldSample sy = field[(size_t)(y + step) * fw + x];
+            if ((int)sx.gen == gen && (int)sy.gen == gen && sx.iter >= 0.f && sy.iter >= 0.f) {
+                const float dx = (sx.iter - s.iter) / step, dy = (sy.iter - s.iter) / step;
+                const float g = sqrtf(dx * dx + dy * dy);
+                if (g > 0.f) {
+                    const int bin = min(max((int)((log2f(g) + 24.f) * (HIST_BINS / 48.f)), 0),
+                                        HIST_BINS - 1);
+                    atomicAdd(&sh[bin], 1);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < HIST_BINS; i += nt)
+        if (sh[i]) atomicAdd(&hist[i], sh[i]);
+}
+
+}  // namespace
+
+int CudaRenderer::gradientHistogram(int gen, int step) {
+    if (!field_ || !gradHist_ || step < 1) return 0;
+    cudaStream_t stream = (cudaStream_t)dispStream_;
+    const int sw = (viewW_ + step - 1) / step, sh = (viewH_ + step - 1) / step;
+    const dim3 block(32, 8);
+    const dim3 grid((sw + block.x - 1) / block.x, (sh + block.y - 1) / block.y);
+    if (cudaMemsetAsync(gradHist_, 0, sizeof(int) * HIST_BINS, stream) != cudaSuccess) return 0;
+    gradHistKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, marginX_, marginY_, viewW_,
+                                               viewH_, gen, step, gradHist_);
+    if (cudaGetLastError() != cudaSuccess) return 0;
+    if (cudaMemcpyAsync(gradHost_, gradHist_, sizeof(int) * HIST_BINS, cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess)
+        return 0;
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return 0;
+    int total = 0;
+    for (int i = 0; i < HIST_BINS; ++i) total += gradHost_[i];
+    return total;
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,6 +1313,7 @@ bool CudaRenderer::beginIterate(const ViewParams& view, int gen) {
     gen_ = gen;
     minIterGen_ = -1.f;
     CUDA_CHECK(cudaMemsetAsync(minIter_, 0x7f, sizeof(int), stream));  // "none yet"
+    CUDA_CHECK(cudaMemsetAsync(hist_, 0, sizeof(int) * HIST_BINS, stream));
     const int count = fieldW_ * fieldH_;
     resetState<<<(count + 255) / 256, 256, 0, stream>>>(state_, count);
     CUDA_CHECK(cudaGetLastError());
@@ -1354,20 +1437,23 @@ bool CudaRenderer::stepIterate() {
             stride_, (float)mP, eP, iterView_.refOffX / iterView_.scale,
             iterView_.refOffY / iterView_.scale, iterView_.maxIter, sliceIters_, sliceStart_ns_,
             kSliceBudgetNs, rf, bf, gen_, ss_, iterView_.aaPattern, jitterOx_, jitterOy_,
-            activeCount_, minIter_, iterView_.refRe, iterView_.refIm, iterView_.interiorCheck);
+            activeCount_, minIter_, iterView_.refRe, iterView_.refIm, iterView_.interiorCheck,
+            hist_, (float)HIST_BINS / (float)std::max(1, iterView_.maxIter));
     } else {
         iterateSlice<<<grid, block, 0, stream>>>(
             state_, field_, fieldW_, fieldH_, marginX_, marginY_, viewW_, viewH_, stride_,
             iterView_.scale, iterView_.refOffX, iterView_.refOffY, iterView_.maxIter, sliceIters_,
             sliceStart_ns_, kSliceBudgetNs, ref_, bla_, gen_, ss_, iterView_.aaPattern, jitterOx_,
             jitterOy_, activeCount_, minIter_, iterView_.refRe, iterView_.refIm,
-            iterView_.interiorCheck);
+            iterView_.interiorCheck, hist_, (float)HIST_BINS / (float)std::max(1, iterView_.maxIter));
     }
     CUDA_CHECK(cudaGetLastError());
     cudaEventRecord((cudaEvent_t)evStop_, stream);
     CUDA_CHECK(cudaMemcpyAsync(activeCountHost_, activeCount_, sizeof(int),
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemcpyAsync(minIterHost_, minIter_, sizeof(int), cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaMemcpyAsync(histHost_, hist_, sizeof(int) * HIST_BINS, cudaMemcpyDeviceToHost,
                                stream));
     cudaEventRecord((cudaEvent_t)evSlice_, stream);
     sliceStart_ = iterView_.maxIter;
