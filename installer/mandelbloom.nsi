@@ -19,6 +19,10 @@
 
 Unicode true
 SetCompressor /SOLID lzma
+; Crisp text under Windows display scaling; MUI2 fits the bitmaps to the
+; scaled controls, so the bitmaps are supplied at 3x.
+ManifestDPIAware true
+ManifestDPIAwareness "PerMonitorV2,PerMonitor,System"
 Name "${APPNAME}"
 OutFile "${OUTFILE}"
 BrandingText "${COMPANY}"
@@ -50,6 +54,11 @@ VIAddVersionKey "LegalCopyright" "${COMPANY}"
 
 !define MUI_ICON "..\src\icon.ico"
 !define MUI_UNICON "..\src\icon.ico"
+!define MUI_WELCOMEFINISHPAGE_BITMAP "..\installer\welcome.bmp"
+!define MUI_UNWELCOMEFINISHPAGE_BITMAP "..\installer\welcome.bmp"
+!define MUI_HEADERIMAGE
+!define MUI_HEADERIMAGE_BITMAP "..\installer\header.bmp"
+!define MUI_HEADERIMAGE_UNBITMAP "..\installer\header.bmp"
 !define MUI_ABORTWARNING
 !define MUI_WELCOMEPAGE_TEXT "This installs ${APPNAME}, a GPU Mandelbrot viewer for 4K HDR and deep zooms.$\r$\n$\r$\nIt needs a 64-bit Windows PC with an NVIDIA GPU (driver with CUDA 13 support).$\r$\n$\r$\nClick Next to continue."
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${EXE}"
