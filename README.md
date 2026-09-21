@@ -119,7 +119,15 @@ into `build\tools` on first use). It installs to `Program Files\NMS\Mandelbloom`
 with a Start Menu entry under NMS, an optional desktop shortcut, and an
 uninstaller in Apps & features. User data stays in `%APPDATA%\NMS\Mandelbloom`.
 The version is `project(... VERSION x.y.z)` in CMakeLists.txt. The icon master is
-`docs\icon.png`; the script regenerates `src\icon.ico` from it with ImageMagick. `-TestMode`
+`docs\icon.png`; the script regenerates `src\icon.ico` from it with ImageMagick.
+
+`-Sign` signs Mandelbloom.exe and the installer with the NMS SSL.com OV
+certificate through eSigner CKA, the same flow as ThisIsMyPC: CodeSignTool
+`scan_code` for the account's malware blocker, then signtool with an SSL.com
+timestamp. It takes the username and credential ID from `ESIGNER_USERNAME` and
+`ESIGNER_CREDENTIAL_ID`, and prompts for the password unless ThisIsMyPC saved
+one. `installer\sign.ps1 -File <exe>` signs any file on its own. Two signing
+credits per release. `-TestMode`
 builds a per-user variant into `%LOCALAPPDATA%` for automated checks.
 
 ## Testing without touching the desktop

@@ -3,7 +3,8 @@
 #   .\installer\build-installer.ps1 -TestMode    -> build\installer\Mandelbloom-Setup-test.exe (per-user, no UAC)
 # The version comes from project(... VERSION x.y.z) in CMakeLists.txt.
 # NSIS is used from build\tools\nsis-* (downloaded on first use).
-param([switch]$TestMode, [switch]$SkipBuild)
+#   .\installer\build-installer.ps1 -Sign        -> also signs Mandelbloom.exe and the installer (see sign.ps1)
+param([switch]$TestMode, [switch]$SkipBuild, [switch]$Sign)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 
@@ -39,6 +40,7 @@ foreach ($d in 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') {
     Copy-Item (Join-Path $crt.FullName $d) $stage
 }
 Copy-Item "$root\README.md" "$stage\README.txt"
+if ($Sign) { & "$PSScriptRoot\sign.ps1" -File "$stage\Mandelbloom.exe" }
 
 $makensis = Get-ChildItem "$root\build\tools\nsis-*\makensis.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $makensis) {
@@ -57,4 +59,5 @@ $nsisArgs = @("/DVERSION=$version", "/DSTAGE=$stage", "/DOUTFILE=$out")
 if ($TestMode) { $nsisArgs += '/DTESTMODE' }
 & $makensis.FullName /V2 @nsisArgs "$root\installer\mandelbloom.nsi"
 if (-not $?) { exit 1 }
+if ($Sign) { & "$PSScriptRoot\sign.ps1" -File $out }
 Write-Host "installer: $out"

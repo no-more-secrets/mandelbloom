@@ -1,0 +1,14 @@
+{
+  "codeSignTool": {
+    "version": "1.3.3",
+    "downloadPage": "https://www.ssl.com/guide/esigner-codesigntool-command-guide/",
+    "archiveUrl": "https://ssl.com/download/codesigntool-for-windows/",
+    "archiveSha256": "317D429BE3AA12A5F2C1FFDD575EAB0CB0CE5E2408AB0056BCDCAAB29875F73D",
+    "jarRelativePath": "jar\\code_sign_tool-1.3.3.jar",
+    "jarSha256": "CAA356347AA64BA04666545D548DAD87211C9AA960F16DB8797A880A67BA91D1",
+    "javaRelativePath": "jdk-11.0.2\\bin\\java.exe",
+    "javaSha256": "BB8DF03053F4F60FF36EC9DF61EADC75BCD551CF94210D96896129B1AB6239A0"
+  },
+  "signer": "No More Secrets, LLC",
+  "timestampUrl": "http://ts.ssl.com"
+}
