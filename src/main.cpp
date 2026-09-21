@@ -70,6 +70,8 @@ struct VideoJob {
     struct Key {
         int slot = 0, gen = 0;
         float minIter = -1.f, gradMed = -1.f;
+        float iterP999 = -1.f;  // 99.9th percentile of escape iterations
+        int maxIter = 0;        // limit this keyframe was rendered with
         bool ready = false;
     };
     std::vector<Key> keys;
@@ -562,6 +564,22 @@ void setAnimate(App& app, bool on) {
     app.animate = on;
 }
 
+// Escape-iteration percentile of the generation being iterated, from the
+// renderer's histogram (escaped pixels only). -1 until something escaped.
+float iterPercentile(const App& app, float q) {
+    const int* h = app.renderer.histogram();
+    long long total = 0;
+    for (int i = 0; i < HIST_BINS; ++i) total += h[i];
+    if (total <= 0) return -1.f;
+    long long cum = 0;
+    const long long want = (long long)(q * (double)total);
+    for (int i = 0; i < HIST_BINS; ++i) {
+        cum += h[i];
+        if (cum >= want) return (i + 1.f) * (float)app.renderer.histMaxIter() / HIST_BINS;
+    }
+    return (float)app.renderer.histMaxIter();
+}
+
 // Median iteration gradient (per field pixel) from the renderer's gradient
 // histogram, or -1 when too few samples.
 float medianGradient(const App& app, int count) {
@@ -741,14 +759,24 @@ void videoStartKey(App& app, int k) {
     const View kv = videoKeyView(app, k);
     app.render = kv;
     syncViewScale(app);
-    // Iterations needed grow roughly linearly with depth; shallow keyframes
-    // would otherwise spend the full budget on every interior pixel.
+    // Shallow keyframes would spend the full budget on every interior pixel.
+    // Give each keyframe four times what the previous one actually needed
+    // (its 99.9th percentile of escape iterations), so a clipped keyframe
+    // raises the limit immediately and deep ones get the full budget.
+    app.view.maxIter = job.savedView.maxIter;
     if (job.p.iterRamp && job.keyCount > 1) {
         const int full = job.savedView.maxIter;
-        const int lo = std::min(full, 2000);
-        const double f = std::min(1.0, 2.0 * k / (double)(job.keyCount - 1));
-        app.view.maxIter = (int)std::lround(lo + (full - lo) * f);
+        int limit = std::min(full, 2000);
+        if (k > 0) {
+            const VideoJob::Key& prev = job.keys[(size_t)k - 1];
+            limit = prev.iterP999 > 0.f ? (int)std::min((double)full, 4.0 * prev.iterP999) : full;
+            limit = std::max(limit, 2000);
+            // Never below what the previous keyframe was given while it clipped.
+            if (prev.iterP999 > 0.9f * prev.maxIter) limit = std::min(full, prev.maxIter * 4);
+        }
+        app.view.maxIter = limit;
     }
+    job.keys[(size_t)k].maxIter = app.view.maxIter;
     App::Gen g;
     g.view = kv;
     g.id = app.nextGen;
@@ -974,8 +1002,15 @@ void videoPumpKeys(App& app) {
         app.renderer.stashField(key.slot);
         if (job.p.dumpKeys) videoDumpKey(app, job.iterating, "");
         key.minIter = app.renderer.minIter();
+        key.iterP999 = iterPercentile(app, 0.999f);
         key.gradMed = medianGradient(app, app.renderer.gradientHistogram(key.gen, 1));
         key.ready = true;
+        if (job.p.debug) {
+            std::printf("video keyframe %d: limit %d p999 %.0f min %.0f iterMs %.0f" "%s",
+                        job.iterating, key.maxIter, key.iterP999, key.minIter,
+                        app.renderer.lastIterateMs(), "\n");
+            std::fflush(stdout);
+        }
         job.keyMs += app.renderer.lastIterateMs();
         job.lastKeySec = app.renderer.lastIterateMs() / 1000.0;
         job.iterating = -1;
