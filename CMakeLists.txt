@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.28)
 if(NOT CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 89)   # Ada (RTX 40xx); must precede project()
 endif()
-project(mandelgpu LANGUAGES CXX CUDA)
+project(mandelgpu VERSION 0.1.0 LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,7 +41,8 @@ target_link_libraries(mandelgpu PRIVATE
   unofficial::tinyexr::tinyexr
   ${GMP_LIBRARY}
 )
-target_compile_definitions(mandelgpu PRIVATE SDL_MAIN_HANDLED NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(mandelgpu PRIVATE SDL_MAIN_HANDLED NOMINMAX WIN32_LEAN_AND_MEAN
+                                             MANDELGPU_VERSION="${PROJECT_VERSION}")
 if(MSVC)
   target_compile_options(mandelgpu PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4 /permissive- /Zc:preprocessor>)
 endif()
@@ -50,6 +51,12 @@ target_compile_options(mandelgpu PRIVATE
 set(MANDELGPU_OUTPUT_NAME "mandelgpu" CACHE STRING "Executable name (lets a test build coexist with a running one)")
 set_target_properties(mandelgpu PROPERTIES CUDA_SEPARABLE_COMPILATION OFF
                                            OUTPUT_NAME "${MANDELGPU_OUTPUT_NAME}")
+# Icon and version resource.
+if(WIN32)
+  set(MANDELGPU_ICON "${CMAKE_SOURCE_DIR}/src/icon.ico")
+  configure_file(src/app.rc.in "${CMAKE_BINARY_DIR}/app.rc" @ONLY)
+  target_sources(mandelgpu PRIVATE "${CMAKE_BINARY_DIR}/app.rc")
+endif()
 # Windowed app: no console window on launch. Keep the plain main() entry
 # point; stdout still works when the launcher redirects it.
 if(MSVC)

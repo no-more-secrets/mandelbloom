@@ -12,7 +12,7 @@ $env:PATH = "$vs\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin;" +
             "C:\Program Files (x86)\Microsoft Visual Studio\Installer;" + $env:PATH
 Set-Location $PSScriptRoot
 if ($Clean) { Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue }
-$bin = if ($Preset -eq 'msvc') { 'build/msvc' } else { 'build/test' }
+$bin = switch ($Preset) { 'msvc' { 'build/msvc' } 'msvc-test' { 'build/test' } default { "build/$Preset" } }
 if ($Clean -or $Configure -or -not (Test-Path "$bin/build.ninja")) {
     cmake --preset $Preset
     if (-not $?) { exit 1 }

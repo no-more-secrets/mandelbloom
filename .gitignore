@@ -2,3 +2,5 @@ build/
 .vs/
 *.user
 vcpkg_installed/
+dist/
+imgui.ini

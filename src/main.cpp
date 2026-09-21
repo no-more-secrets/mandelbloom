@@ -899,6 +899,17 @@ bool startVideo(App& app) {
             << " --video-ease " << p.ease << " --video-nits " << job.nits << "\n";
     }
     VideoEncodeSettings es;
+    // ffmpeg beside the executable wins over PATH (installed copies).
+    if (const char* base = SDL_GetBasePath()) {
+        for (const char* rel : {"ffmpeg.exe", "ffmpeg\\bin\\ffmpeg.exe", "ffmpeg\\ffmpeg.exe"}) {
+            std::error_code ec;
+            const std::string cand = std::string(base) + rel;
+            if (std::filesystem::exists(cand, ec)) {
+                es.ffmpeg = cand;
+                break;
+            }
+        }
+    }
     es.outPath = job.outPath;
     es.width = w;
     es.height = h;
@@ -1207,7 +1218,7 @@ void drawUi(App& app) {
     ImGui::SetNextWindowPos(ImVec2(10 * app.uiScale, 10 * app.uiScale), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.75f);
     if (ImGui::Begin("mandelbloom", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-        ImGui::TextUnformatted(app.renderer.deviceName());
+        ImGui::Text("Mandelbloom %s   %s", MANDELGPU_VERSION, app.renderer.deviceName());
         ImGui::Separator();
         const int digits = std::max(5, (int)std::ceil(-std::log10(app.render.scale)) + 3);
         ImGui::Text("center  %s", app.render.cx.toString(digits).c_str());
@@ -1585,6 +1596,9 @@ int main(int argc, char** argv) {
     App app;
     float initialScale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
     if (initialScale <= 0.f) initialScale = 1.f;
+    // Window icon from the executable's resources (id 101 in app.rc).
+    SDL_SetHint(SDL_HINT_WINDOWS_INTRESOURCE_ICON, "101");
+    SDL_SetHint(SDL_HINT_WINDOWS_INTRESOURCE_ICON_SMALL, "101");
     app.window = SDL_CreateWindow("mandelbloom",
                                   argWinW > 0 ? argWinW : (int)(1280 * initialScale),
                                   argWinH > 0 ? argWinH : (int)(800 * initialScale),
@@ -1606,6 +1620,14 @@ int main(int argc, char** argv) {
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
+    // Layout state goes with the other user data, not next to the executable
+    // (Program Files is read-only for users).
+    static std::string imguiIni;
+    if (char* pref = SDL_GetPrefPath("NMS", "Mandelbloom")) {
+        imguiIni = std::string(pref) + "imgui.ini";
+        SDL_free(pref);
+        ImGui::GetIO().IniFilename = imguiIni.c_str();
+    }
     ImGui::StyleColorsDark();
     ImGui_ImplSDL3_InitForD3D(app.window);
     if (!app.display.imguiInit()) return 1;

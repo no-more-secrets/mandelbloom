@@ -110,6 +110,17 @@ mandelgpu.exe <re> <im> <scale> <iters> --ss 2 --loadfile look.preset --video ou
   --video-ease 0.3 --video-cq 20 [--video-sdr] [--video-nits 280] [--video-codec libx265]
 ```
 
+## Installer
+
+`installer\build-installer.ps1` builds the Release executable (named
+Mandelbloom.exe), stages it with SDL3, GMP/MPFR, miniz and the VC++ runtime
+DLLs, and packs `dist\Mandelbloom-Setup-<version>.exe` with NSIS (downloaded
+into `build\tools` on first use). It installs to `Program Files\NMS\Mandelbloom`
+with a Start Menu entry under NMS, an optional desktop shortcut, and an
+uninstaller in Apps & features. User data stays in `%APPDATA%\NMS\Mandelbloom`.
+The version is `project(... VERSION x.y.z)` in CMakeLists.txt. `-TestMode`
+builds a per-user variant into `%LOCALAPPDATA%` for automated checks.
+
 ## Testing without touching the desktop
 
 `--script "wait:1500;wheel:5;drag:300,120,12;pan:8,0;shot:out.png;quit"`

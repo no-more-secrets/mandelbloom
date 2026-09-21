@@ -11,17 +11,37 @@
         "VCPKG_TARGET_TRIPLET": "x64-windows",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
-    }
-    ,
+    },
     {
       "name": "msvc-test",
       "inherits": "msvc",
       "binaryDir": "${sourceDir}/build/test",
-      "cacheVariables": { "MANDELGPU_OUTPUT_NAME": "mandelgpu-test" }
+      "cacheVariables": {
+        "MANDELGPU_OUTPUT_NAME": "mandelgpu-test"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "msvc",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "MANDELGPU_OUTPUT_NAME": "Mandelbloom"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "msvc", "configurePreset": "msvc" },
-    { "name": "msvc-test", "configurePreset": "msvc-test" }
+    {
+      "name": "msvc",
+      "configurePreset": "msvc"
+    },
+    {
+      "name": "msvc-test",
+      "configurePreset": "msvc-test"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    }
   ]
 }
