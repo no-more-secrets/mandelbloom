@@ -12,6 +12,14 @@ $cm = Get-Content "$root\CMakeLists.txt" -Raw
 if ($cm -notmatch 'project\(\s*\w+\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)') { throw 'no VERSION in CMakeLists.txt' }
 $version = $Matches[1]
 
+# Ask for the eSigner password once; both signing steps reuse it.
+$signPassword = $null
+if ($Sign) {
+    $saved = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'ThisIsMyPC\ReleaseSigning\esigner-password.clixml'
+    if (Test-Path -LiteralPath $saved -PathType Leaf) { $signPassword = Import-Clixml -LiteralPath $saved }
+    if (-not $signPassword) { $signPassword = Read-Host 'SSL.com eSigner account password' -AsSecureString }
+}
+
 # The icon master is docs\icon.png; src\icon.ico is derived from it.
 $master = "$root\docs\icon.png"; $ico = "$root\src\icon.ico"
 if ((Test-Path $master) -and (-not (Test-Path $ico) -or (Get-Item $master).LastWriteTime -gt (Get-Item $ico).LastWriteTime)) {
@@ -40,7 +48,7 @@ foreach ($d in 'msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll') {
     Copy-Item (Join-Path $crt.FullName $d) $stage
 }
 Copy-Item "$root\README.md" "$stage\README.txt"
-if ($Sign) { & "$PSScriptRoot\sign.ps1" -File "$stage\Mandelbloom.exe" }
+if ($Sign) { & "$PSScriptRoot\sign.ps1" -File "$stage\Mandelbloom.exe" -Password $signPassword }
 
 $makensis = Get-ChildItem "$root\build\tools\nsis-*\makensis.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $makensis) {
@@ -59,5 +67,5 @@ $nsisArgs = @("/DVERSION=$version", "/DSTAGE=$stage", "/DOUTFILE=$out")
 if ($TestMode) { $nsisArgs += '/DTESTMODE' }
 & $makensis.FullName /V2 @nsisArgs "$root\installer\mandelbloom.nsi"
 if (-not $?) { exit 1 }
-if ($Sign) { & "$PSScriptRoot\sign.ps1" -File $out }
+if ($Sign) { & "$PSScriptRoot\sign.ps1" -File $out -Password $signPassword }
 Write-Host "installer: $out"
