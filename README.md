@@ -8,7 +8,8 @@ The cover, reproducible (the preset is `docs/cover.preset`):
 mandelgpu.exe -0.67032685353483673009225 0.4581119683700364283828 2.29e-20 19552 --ss 2 --aa 2,3,1.5 --loadfile docs\cover.preset
 ```
 
-GPU Mandelbrot viewer for Windows, built for 4K HDR and smooth deep zooms. CUDA does the iteration, SDL3 and Dear ImGui
+GPU Mandelbrot viewer for Windows, built for 4K HDR and smooth deep zooms.
+Needs an NVIDIA GPU from the RTX 20 series up (Turing, Ampere, Ada, Blackwell) with a driver that supports CUDA 13. CUDA does the iteration, SDL3 and Dear ImGui
 do the window and UI, Direct3D 12 presents an FP16 scRGB swapchain (HDR on
 HDR displays) that CUDA writes into directly through a shared buffer.
 
@@ -162,3 +163,13 @@ Timings on an RTX 4080, 1920x1200, 1x:
 |---|---|---|
 | 8e5 zoom, 4000 iterations | 770 ms | 150 ms |
 | 1.7e25 zoom, 20000 iterations | 406 ms | 88 ms |
+
+<br>
+
+## Credits
+
+(dependencies / inspo list w/ licenses)
+
+Developed with Claude Fable 5.1
+
+Copyright (c) 2026 No More Secrets, LLC. Licensed under [GPL-3.0](LICENSE).

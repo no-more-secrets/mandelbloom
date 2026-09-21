@@ -1,8 +1,11 @@
 cmake_minimum_required(VERSION 3.28)
 if(NOT CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 89)   # Ada (RTX 40xx); must precede project()
+  # Turing (RTX 20xx), Ampere (A100, RTX 30xx), Ada (RTX 40xx), Blackwell
+  # (RTX 50xx) as native code, plus PTX for whatever comes next. Must precede
+  # project().
+  set(CMAKE_CUDA_ARCHITECTURES 75-real 80-real 86-real 89-real 120-real 120-virtual)
 endif()
-project(mandelgpu VERSION 0.1.0 LANGUAGES CXX CUDA)
+project(mandelgpu VERSION 0.1.1 LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
