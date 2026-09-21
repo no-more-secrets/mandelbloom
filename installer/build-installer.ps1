@@ -11,6 +11,15 @@ $cm = Get-Content "$root\CMakeLists.txt" -Raw
 if ($cm -notmatch 'project\(\s*\w+\s+VERSION\s+([0-9]+\.[0-9]+\.[0-9]+)') { throw 'no VERSION in CMakeLists.txt' }
 $version = $Matches[1]
 
+# The icon master is docs\icon.png; src\icon.ico is derived from it.
+$master = "$root\docs\icon.png"; $ico = "$root\src\icon.ico"
+if ((Test-Path $master) -and (-not (Test-Path $ico) -or (Get-Item $master).LastWriteTime -gt (Get-Item $ico).LastWriteTime)) {
+    if (Get-Command magick -ErrorAction SilentlyContinue) {
+        & magick $master -define icon:auto-resize=256,128,64,48,32,16 $ico
+        Write-Host 'icon rebuilt from docs\icon.png'
+    } else { Write-Warning 'ImageMagick (magick) not found: src\icon.ico not refreshed from docs\icon.png' }
+}
+
 if (-not $SkipBuild) {
     & "$root\build.ps1" -Preset release
     if (-not $?) { exit 1 }

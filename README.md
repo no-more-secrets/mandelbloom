@@ -118,7 +118,8 @@ DLLs, and packs `dist\Mandelbloom-Setup-<version>.exe` with NSIS (downloaded
 into `build\tools` on first use). It installs to `Program Files\NMS\Mandelbloom`
 with a Start Menu entry under NMS, an optional desktop shortcut, and an
 uninstaller in Apps & features. User data stays in `%APPDATA%\NMS\Mandelbloom`.
-The version is `project(... VERSION x.y.z)` in CMakeLists.txt. `-TestMode`
+The version is `project(... VERSION x.y.z)` in CMakeLists.txt. The icon master is
+`docs\icon.png`; the script regenerates `src\icon.ico` from it with ImageMagick. `-TestMode`
 builds a per-user variant into `%LOCALAPPDATA%` for automated checks.
 
 ## Testing without touching the desktop

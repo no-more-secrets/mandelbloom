@@ -56,6 +56,7 @@ if(WIN32)
   set(MANDELGPU_ICON "${CMAKE_SOURCE_DIR}/src/icon.ico")
   configure_file(src/app.rc.in "${CMAKE_BINARY_DIR}/app.rc" @ONLY)
   target_sources(mandelgpu PRIVATE "${CMAKE_BINARY_DIR}/app.rc")
+  set_source_files_properties("${CMAKE_BINARY_DIR}/app.rc" PROPERTIES OBJECT_DEPENDS "${MANDELGPU_ICON}")
 endif()
 # Windowed app: no console window on launch. Keep the plain main() entry
 # point; stdout still works when the launcher redirects it.
