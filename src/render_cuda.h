@@ -23,7 +23,7 @@ struct ViewParams {
     // test that settles interior pixels at once. Only used while the pixel
     // scale is coarse enough for a double c to be exact at the boundary.
     double refRe = 0.0, refIm = 0.0;
-    int interiorCheck = 0;
+    int interiorCheck = 0;  // bit 0: cardioid/bulb test (coarse zooms), bit 1: |dz/dz0| test
 };
 
 // BLA table as uploaded to the device (see bla.h for the layout).
@@ -130,9 +130,10 @@ public:
     int histMaxIter() const { return iterView_.maxIter; }
     // Histogram of log2 of the iteration gradient (iterations per field
     // pixel) over the view for generation `gen`, using samples `step` field
-    // pixels apart (the finest completed stride). HIST_BINS bins over
-    // log2 in [-24, 24). Synchronous; returns the sample count.
-    int gradientHistogram(int gen, int step);
+    // pixels apart (the finest completed stride), over the central `centre`
+    // fraction of the view's width and height. HIST_BINS bins over log2 in
+    // [-24, 24). Synchronous; returns the sample count.
+    int gradientHistogram(int gen, int step, float centre = 1.f);
     const int* gradHistogram() const { return gradHost_; }
     int iterateProgress() const { return sliceStart_; }  // iterations issued so far
     // Coarse-to-fine: the pass runs at stride 8, 4, 2, 1. completedStride is

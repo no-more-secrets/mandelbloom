@@ -101,7 +101,9 @@ all apply. A 4K60 frame costs a few milliseconds; deep keyframes cost about
 as much as one interactive render each. Shallow keyframes get a ramped
 iteration limit (2000 rising to the full limit by mid-depth,
 `--video-noramp` to disable) and the main cardioid and period-2 bulb are
-settled without iterating. The output goes to
+settled without iterating. The float kernel also tracks |dz/dz0| and settles
+a pixel as interior once it drops below 2^-30 ("interior check"), so the
+iteration limit (up to 2,000,000) costs nothing on interior pixels. The output goes to
 `Videos\Mandelbloom\mandel_<stamp>_<zoom>.mp4` with a `.txt` command line and
 a `.preset` beside it.
 

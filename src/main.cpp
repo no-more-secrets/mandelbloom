@@ -69,7 +69,7 @@ struct VideoJob {
     int keyCount = 0, keysDone = 0;
     struct Key {
         int slot = 0, gen = 0;
-        float minIter = -1.f, gradMed = -1.f;
+        float minIter = -1.f, gradMed = -1.f, iterMed = -1.f;
         float iterP999 = -1.f;  // 99.9th percentile of escape iterations
         int maxIter = 0;        // limit this keyframe was rendered with
         bool ready = false;
@@ -108,6 +108,7 @@ struct App {
         int id = 0;
         float minIter = -1.f;  // smallest escape iteration seen, -1 unknown
         float gradMed = -1.f;  // median iteration gradient per field pixel, -1 unknown
+        float iterMed = -1.f;  // median escape iteration, -1 unknown
     };
     int gradStride = -1;       // completed stride the newest gen's gradMed was measured at
     std::vector<Gen> gens;
@@ -132,6 +133,7 @@ struct App {
     BlaTable bla;
     std::vector<BlaNodeF> blaF;
     float blaEpsLog2 = -24.f;
+    bool interiorDeriv = true;  // settle interior pixels when |dz/dz0| vanishes
     ShadeParams shade;
     PostParams post;
     PostParams lastPost;
@@ -335,7 +337,7 @@ void updateRefOffset(App& app) {
     app.view.refRe = app.refCx.toDouble();
     app.view.refIm = app.refCy.toDouble();
     // A double c is exact to ~1e-16; keep the test well clear of that.
-    app.view.interiorCheck = app.view.scale > 1e-12 ? 1 : 0;
+    app.view.interiorCheck = (app.view.scale > 1e-12 ? 1 : 0) | (app.interiorDeriv ? 2 : 0);
 }
 
 void rebuildBla(App& app) {
@@ -593,10 +595,16 @@ float medianGradient(const App& app, int count) {
     return -1.f;
 }
 
-// Density (iterations per palette cycle) that makes a band gradPerPx
-// iterations/pixel steep come out sp.bandPx display pixels wide.
-float densityForGradient(const ShadeParams& sp, float gradPerPx) {
-    return std::max(1.f, std::max(sp.bandPx, 4.f) * gradPerPx);
+// Density that makes a band gradPerPx iterations/pixel steep come out
+// sp.bandPx display pixels wide, at iteration count n (after the anchor).
+float densityForGradient(const ShadeParams& sp, float gradPerPx, float n) {
+    const float w = std::max(sp.bandPx, 4.f);
+    n = std::max(n, 1.f);
+    switch (sp.transfer) {
+        case TRANSFER_SQRT: return std::max(0.1f, 4.f * w * gradPerPx / std::sqrt(n));
+        case TRANSFER_LOG: return std::max(0.1f, 64.f * 0.6931472f * n / (w * gradPerPx));
+        default: return std::max(0.1f, w * gradPerPx);
+    }
 }
 
 // Measure the newest generation's gradient at the finest completed stride.
@@ -605,9 +613,13 @@ void measureGradient(App& app) {
     const int cs = app.renderer.completedStride();
     if (cs <= 0 || cs == app.gradStride) return;
     app.gradStride = cs;
-    const int n = app.renderer.gradientHistogram(app.gens[0].id, cs);
+    // The zoom converges on the centre: measure the central half of the view.
+    const int n = app.renderer.gradientHistogram(app.gens[0].id, cs, 0.5f);
     const float g = medianGradient(app, n);
-    if (g > 0.f) app.gens[0].gradMed = g;
+    if (g > 0.f) {
+        app.gens[0].gradMed = g;
+        app.gens[0].iterMed = iterPercentile(app, 0.5f);
+    }
 }
 
 // Sidecar preset describing the current look exactly.
@@ -1014,7 +1026,8 @@ void videoPumpKeys(App& app) {
         if (job.p.dumpKeys) videoDumpKey(app, job.iterating, "");
         key.minIter = app.renderer.minIter();
         key.iterP999 = iterPercentile(app, 0.999f);
-        key.gradMed = medianGradient(app, app.renderer.gradientHistogram(key.gen, 1));
+        key.gradMed = medianGradient(app, app.renderer.gradientHistogram(key.gen, 1, 0.5f));
+        key.iterMed = iterPercentile(app, 0.5f);
         key.ready = true;
         if (job.p.debug) {
             std::printf("video keyframe %d: limit %d p999 %.0f min %.0f iterMs %.0f" "%s",
@@ -1081,22 +1094,25 @@ void videoStep(App& app) {
             base = std::floor(std::max(base, 0.f));
         }
         app.shade.iterBase = base;
-        if (app.shade.autoDensity && app.shade.transfer == TRANSFER_LINEAR) {
+        if (app.shade.autoDensity) {
             // Gradient per display pixel from each keyframe through its ratio,
             // blended by position between them.
             const double frac = std::min(std::max(std::log2(job.startScale / s) - outer, 0.0), 1.0);
-            float go = -1.f, gi = -1.f;
+            float go = -1.f, gi = -1.f, no = -1.f, ni = -1.f;
             for (int i = 0; i < m.genCount; ++i) {
                 const int k = (inner >= 0 && i == 0) ? inner : outer;
-                const float gm = job.keys[(size_t)k].gradMed;
-                if (gm <= 0.f) continue;
-                const float gd = gm * (float)m.gens[i].ratio;
-                if (k == inner) gi = gd;
-                else go = gd;
+                const VideoJob::Key& kk = job.keys[(size_t)k];
+                if (kk.gradMed <= 0.f) continue;
+                const float gd = kk.gradMed * (float)m.gens[i].ratio;
+                if (k == inner) { gi = gd; ni = kk.iterMed; }
+                else { go = gd; no = kk.iterMed; }
             }
-            float g = go > 0.f ? go : gi;
-            if (go > 0.f && gi > 0.f) g = (float)(go + (gi - go) * frac);
-            if (g > 0.f) app.shade.density = densityForGradient(app.shade, g);
+            float g = go > 0.f ? go : gi, nm = go > 0.f ? no : ni;
+            if (go > 0.f && gi > 0.f) {
+                g = (float)(go + (gi - go) * frac);
+                nm = (float)(no + (ni - no) * frac);
+            }
+            if (g > 0.f) app.shade.density = densityForGradient(app.shade, g, nm - base);
         }
         const float t = app.animate ? (float)(job.frame / job.p.fps) : 0.f;
         app.renderer.composite(app.shade, t, m);
@@ -1246,7 +1262,7 @@ void drawUi(App& app) {
                 if (ImGui::SliderFloat("radius px", &app.aa.radius, 0.f, 3.f)) app.cachedShown = false;
             }
         }
-        if (ImGui::SliderInt("max iter", &app.view.maxIter, 64, 65536, "%d",
+        if (ImGui::SliderInt("max iter", &app.view.maxIter, 64, 2000000, "%d",
                              ImGuiSliderFlags_Logarithmic)) {
             app.dirty = true;
         }
@@ -1258,6 +1274,11 @@ void drawUi(App& app) {
         if (ImGui::Checkbox("use BLA", &app.view.useBla)) app.dirty = true;
         ImGui::SameLine();
         if (ImGui::Checkbox("float kernel", &app.view.useFloat)) app.dirty = true;
+        ImGui::SameLine();
+        if (ImGui::Checkbox("interior check", &app.interiorDeriv)) {
+            updateRefOffset(app);
+            app.dirty = true;
+        }
         ImGui::SameLine();
         ImGui::SetNextItemWidth(120 * app.uiScale);
         if (ImGui::SliderFloat("eps log2", &app.blaEpsLog2, -40.f, -8.f, "%.0f")) app.dirty = true;
@@ -1503,6 +1524,7 @@ int main(int argc, char** argv) {
     int argSs = 1;
     bool argNoBla = false;
     bool argDouble = false;
+    bool argNoInterior = false;  // disable the |dz/dz0| interior check (comparison)
     std::string argPost;
     std::string argShade;  // "offset=0.329,density=107.8,animate=0,cycle=-0.42" 
     std::string argLoad;  // saved preset name
@@ -1526,6 +1548,8 @@ int main(int argc, char** argv) {
             argNoBla = true;
         } else if (std::strcmp(argv[i], "--double") == 0) {
             argDouble = true;
+        } else if (std::strcmp(argv[i], "--nointerior") == 0) {
+            argNoInterior = true;
         } else if (std::strcmp(argv[i], "--post") == 0 && i + 1 < argc) {
             argPost = argv[++i];
         } else if (std::strcmp(argv[i], "--shade") == 0 && i + 1 < argc) {
@@ -1698,6 +1722,7 @@ int main(int argc, char** argv) {
     if (argFullscreen) setFullscreen(app, true);
     app.ss = std::min(3, std::max(1, argSs));
     if (argNoBla) app.view.useBla = false;
+    if (argNoInterior) app.interiorDeriv = false;
     if (argDouble) app.view.useFloat = false;
     if (!argShade.empty()) {
         size_t start = 0;
@@ -1910,12 +1935,14 @@ int main(int argc, char** argv) {
                 // Auto density: the newest generation with a gradient measure,
                 // scaled by how it maps onto the shown view, with a short lag
                 // so generations hand over smoothly.
-                if (app.shade.autoDensity && app.shade.transfer == TRANSFER_LINEAR) {
+                if (app.shade.autoDensity) {
                     for (const auto& g : app.gens) {
                         if (g.gradMed <= 0.f) continue;
                         double ox, oy, ratio;
                         mapOnto(app, g.view, app.ss, app.view.width, app.view.height, ox, oy, ratio);
-                        const float target = densityForGradient(app.shade, g.gradMed * (float)ratio);
+                        const float nMed = g.iterMed - (app.shade.anchor ? base : 0.f);
+                        const float target =
+                            densityForGradient(app.shade, g.gradMed * (float)ratio, nMed);
                         const float a = 1.f - std::exp(-(float)dt / 0.15f);
                         app.shade.density += (target - app.shade.density) * a;
                         if (std::fabs(target - app.shade.density) < 0.01f * target)

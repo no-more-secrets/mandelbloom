@@ -236,7 +236,7 @@ __global__ void iterateSlice(PixelState* __restrict__ state, FieldSample* __rest
         const bool refShort = refLast < maxIter;  // reference escaped early
         bool unreliable = false;
         const bool interior =
-            interiorCheck && n == 0 && inCardioidOrBulb(refRe + dcr, refIm + dci);
+            (interiorCheck & 1) && n == 0 && inCardioidOrBulb(refRe + dcr, refIm + dci);
         const int stop = interior ? n : min(maxIter, n + sliceIters);
         bool escaped = false;
         double dzmag2 = dzr * dzr + dzi * dzi;
@@ -968,15 +968,16 @@ bool CudaRenderer::allocField(int width, int height, int ss, int slots) {
 
 namespace {
 
-__global__ void gradHistKernel(const FieldSample* __restrict__ field, int fw, int fh, int mx,
-                               int my, int w, int h, int gen, int step, int* __restrict__ hist) {
+// x0, y0, w, h: the region measured (field pixels, margin included).
+__global__ void gradHistKernel(const FieldSample* __restrict__ field, int fw, int fh, int x0,
+                               int y0, int w, int h, int gen, int step, int* __restrict__ hist) {
     __shared__ int sh[HIST_BINS];
     const int tid = threadIdx.y * blockDim.x + threadIdx.x, nt = blockDim.x * blockDim.y;
     for (int i = tid; i < HIST_BINS; i += nt) sh[i] = 0;
     __syncthreads();
-    const int x = mx + (blockIdx.x * blockDim.x + threadIdx.x) * step;
-    const int y = my + (blockIdx.y * blockDim.y + threadIdx.y) * step;
-    if (x + step < mx + w && y + step < my + h) {
+    const int x = x0 + (blockIdx.x * blockDim.x + threadIdx.x) * step;
+    const int y = y0 + (blockIdx.y * blockDim.y + threadIdx.y) * step;
+    if (x + step < x0 + w && y + step < y0 + h && x + step < fw && y + step < fh) {
         const FieldSample s = field[(size_t)y * fw + x];
         if ((int)s.gen == gen && s.iter >= 0.f) {
             const FieldSample sx = field[(size_t)y * fw + x + step];
@@ -999,15 +1000,18 @@ __global__ void gradHistKernel(const FieldSample* __restrict__ field, int fw, in
 
 }  // namespace
 
-int CudaRenderer::gradientHistogram(int gen, int step) {
+int CudaRenderer::gradientHistogram(int gen, int step, float centre) {
     if (!field_ || !gradHist_ || step < 1) return 0;
     cudaStream_t stream = (cudaStream_t)dispStream_;
-    const int sw = (viewW_ + step - 1) / step, sh = (viewH_ + step - 1) / step;
+    centre = fminf(fmaxf(centre, 0.05f), 1.f);
+    const int rw = std::max(step * 2, (int)(viewW_ * centre)), rh = std::max(step * 2, (int)(viewH_ * centre));
+    const int x0 = marginX_ + (viewW_ - rw) / 2, y0 = marginY_ + (viewH_ - rh) / 2;
+    const int sw = (rw + step - 1) / step, sh = (rh + step - 1) / step;
     const dim3 block(32, 8);
     const dim3 grid((sw + block.x - 1) / block.x, (sh + block.y - 1) / block.y);
     if (cudaMemsetAsync(gradHist_, 0, sizeof(int) * HIST_BINS, stream) != cudaSuccess) return 0;
-    gradHistKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, marginX_, marginY_, viewW_,
-                                               viewH_, gen, step, gradHist_);
+    gradHistKernel<<<grid, block, 0, stream>>>(field_, fieldW_, fieldH_, x0, y0, rw, rh, gen, step,
+                                               gradHist_);
     if (cudaGetLastError() != cudaSuccess) return 0;
     if (cudaMemcpyAsync(gradHost_, gradHist_, sizeof(int) * HIST_BINS, cudaMemcpyDeviceToHost,
                         stream) != cudaSuccess)

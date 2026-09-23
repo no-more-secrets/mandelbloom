@@ -23,8 +23,8 @@ struct PixelStateF {
     int n;
     int status;  // 0 active, 1 escaped, 2 inside
     int hint;    // BLA level used last time (search starts one above it)
-    int pad;
-    int flags;   // bit 0: ran past the end of an escaped reference (unreliable)
+    float pm;    // |dz/dz1|^2 mantissa in [0.5, 1) (0 = not started); exponent in flags >> 1
+    int flags;   // bit 0: ran past the end of an escaped reference (unreliable); bits 1..: pm exponent
 };
 static_assert(sizeof(PixelStateF) == 48, "PixelStateF must match PixelState's stride");
 
@@ -157,13 +157,24 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
         int ez = st.ez, ed = st.ed;
         int m = st.m, n = st.n;
         int hint = st.hint;
+        // Squared magnitude of the derivative of the iterate with respect to
+        // z1 (the product of |2 z_k|^2). It shrinks geometrically on an
+        // attracting cycle, so a vanishing value settles an interior pixel
+        // long before maxIter. Kept as mantissa + exponent.
+        const bool derivCheck = (interiorCheck & 2) != 0;
+        float pm = st.pm;
+        int pe = st.flags >> 1;
+        if (pm == 0.f) {
+            pm = 0.5f;
+            pe = 1;
+        }
         float zr = 0.f, zi = 0.f;
         const float bailout = 65536.f;
         const int refLast = ref.length - 1;
         const bool refShort = refLast < maxIter;  // reference escaped early
         bool unreliable = false;
-        const bool interior =
-            interiorCheck && n == 0 &&
+        bool interior =
+            (interiorCheck & 1) && n == 0 &&
             inCardioidOrBulb(refRe + ldexp((double)dcr, eP), refIm + ldexp((double)dci, eP));
         const int stop = interior ? n : min(maxIter, n + sliceIters);
         bool escaped = false;
@@ -198,6 +209,11 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                         ed = ue;
                         fx::renorm(wdr, wdi, ed);
                     }
+                    if (derivCheck) {
+                        int k;
+                        pm = frexpf(pm * (nd->ar * nd->ar + nd->ai * nd->ai), &k);
+                        pe += k + 2 * nd->ae;
+                    }
                     m += nd->l;
                     n += nd->l;
                     stepped = true;
@@ -207,6 +223,13 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                 const float2 Z = ref.z[m];
                 const float dzr = ldexpf(wzr, ez), dzi = ldexpf(wzi, ez);
                 const float fzr = Z.x + dzr, fzi = Z.y + dzi;
+                // z0 is the critical point (zero), so the multiplier starts
+                // at z1: skip the factor 2 z0.
+                if (derivCheck && n > 0) {
+                    int k;
+                    pm = frexpf(pm * (4.f * (fzr * fzr + fzi * fzi)), &k);
+                    pe += k;
+                }
                 // D' = 2 z D + 1
                 {
                     float nr = 2.f * (fzr * wdr - fzi * wdi);
@@ -241,6 +264,10 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                 escaped = true;
                 break;
             }
+            if (derivCheck && (pe < -60 || pm == 0.f)) {  // |dz/dz1| < 2^-30
+                interior = true;
+                break;
+            }
             const float dzmag2 = ldexpf(wzr * wzr + wzi * wzi, 2 * ez);
             if (zmag2 < dzmag2 || m >= refLast) {
                 if (m >= refLast && refShort) unreliable = true;
@@ -251,7 +278,8 @@ __global__ void iterateSliceF(PixelStateF* __restrict__ state, FieldSample* __re
                 m = 0;
             }
         }
-        if (unreliable) st.flags |= 1;
+        st.pm = pm;
+        st.flags = (pe << 1) | (unreliable ? 1 : 0);
         st.wzr = wzr;
         st.wzi = wzi;
         st.ez = ez;
