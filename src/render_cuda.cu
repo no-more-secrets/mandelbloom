@@ -848,17 +848,20 @@ void CudaRenderer::freeBla() {
 bool CudaRenderer::uploadBla(const BlaNode* nodes, const BlaNodeF* nodesF, int count,
                              const int* levelOffset, int levels, int steps) {
     CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream_));
-    if (count > blaNodeCapacity_ || levels > blaLevelCapacity_) {
+    // The double table only exists while the double kernel is selected: at
+    // millions of iterations it is the largest allocation.
+    if (count > blaNodeCapacity_ || levels > blaLevelCapacity_ || (doubleTables_ && !blaNodes_)) {
         freeBla();
         blaNodeCapacity_ = count + count / 4 + 1024;
         blaLevelCapacity_ = levels + 8;
-        CUDA_CHECK(cudaMalloc(&blaNodes_, sizeof(BlaNode) * (size_t)blaNodeCapacity_));
+        if (doubleTables_) CUDA_CHECK(cudaMalloc(&blaNodes_, sizeof(BlaNode) * (size_t)blaNodeCapacity_));
         CUDA_CHECK(cudaMalloc(&blaNodesF_, sizeof(BlaNodeF) * (size_t)blaNodeCapacity_));
         CUDA_CHECK(cudaMalloc(&blaOffsets_, sizeof(int) * (size_t)blaLevelCapacity_));
     }
     if (count > 0) {
-        CUDA_CHECK(cudaMemcpy(blaNodes_, nodes, sizeof(BlaNode) * (size_t)count,
-                              cudaMemcpyHostToDevice));
+        if (blaNodes_)
+            CUDA_CHECK(cudaMemcpy(blaNodes_, nodes, sizeof(BlaNode) * (size_t)count,
+                                  cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(blaNodesF_, nodesF, sizeof(BlaNodeF) * (size_t)count,
                               cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(blaOffsets_, levelOffset, sizeof(int) * (size_t)levels,
@@ -873,15 +876,19 @@ bool CudaRenderer::uploadBla(const BlaNode* nodes, const BlaNodeF* nodesF, int c
 
 bool CudaRenderer::uploadReference(const double* zr, const double* zi, int length, bool escaped) {
     CUDA_CHECK(cudaStreamSynchronize((cudaStream_t)stream_));  // no slice may read the old orbit
-    if (length > refCapacity_) {
+    if (length > refCapacity_ || (doubleTables_ && !refZr_)) {
         freeReference();
         refCapacity_ = length + length / 4 + 1024;
-        CUDA_CHECK(cudaMalloc(&refZr_, sizeof(double) * (size_t)refCapacity_));
-        CUDA_CHECK(cudaMalloc(&refZi_, sizeof(double) * (size_t)refCapacity_));
+        if (doubleTables_) {
+            CUDA_CHECK(cudaMalloc(&refZr_, sizeof(double) * (size_t)refCapacity_));
+            CUDA_CHECK(cudaMalloc(&refZi_, sizeof(double) * (size_t)refCapacity_));
+        }
         CUDA_CHECK(cudaMalloc(&refF_, sizeof(float2) * (size_t)refCapacity_));
     }
-    CUDA_CHECK(cudaMemcpy(refZr_, zr, sizeof(double) * (size_t)length, cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(refZi_, zi, sizeof(double) * (size_t)length, cudaMemcpyHostToDevice));
+    if (refZr_) {
+        CUDA_CHECK(cudaMemcpy(refZr_, zr, sizeof(double) * (size_t)length, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(refZi_, zi, sizeof(double) * (size_t)length, cudaMemcpyHostToDevice));
+    }
     {
         std::vector<float2> f((size_t)length);
         for (int i = 0; i < length; ++i) f[(size_t)i] = make_float2((float)zr[i], (float)zi[i]);

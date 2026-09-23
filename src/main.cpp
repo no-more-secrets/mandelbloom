@@ -341,6 +341,7 @@ void updateRefOffset(App& app) {
 }
 
 void rebuildBla(App& app) {
+    app.renderer.setDoubleTables(!app.view.useFloat);
     const double cMax = halfDiagonal(app) + std::hypot(app.view.refOffX, app.view.refOffY);
     buildBla(app.ref, cMax, std::exp2((double)app.blaEpsLog2), app.bla);
     buildBlaFloat(app.bla, app.blaF);
@@ -360,6 +361,7 @@ void rereferenceAt(App& app, int fx, int fy) {
     app.refCy.addDouble(offY);
     updateRefOffset(app);
     computeReference(app.refCx, app.refCy, app.view.maxIter, 65536.0, app.ref);
+    app.renderer.setDoubleTables(!app.view.useFloat);
     app.renderer.uploadReference(app.ref.zr.data(), app.ref.zi.data(), app.ref.length,
                                  app.ref.escaped);
     rebuildBla(app);
@@ -375,6 +377,7 @@ void rebuildReference(App& app) {
     app.rerefCheckedStride = 0;
     updateRefOffset(app);
     computeReference(app.refCx, app.refCy, app.view.maxIter, 65536.0, app.ref);
+    app.renderer.setDoubleTables(!app.view.useFloat);
     app.renderer.uploadReference(app.ref.zr.data(), app.ref.zi.data(), app.ref.length,
                                  app.ref.escaped);
     rebuildBla(app);
@@ -2053,10 +2056,11 @@ int main(int argc, char** argv) {
                             app.cachedShown ? 1 : 0, app.fps, app.renderer.progress(),
                             app.renderer.etaMs(), app.render.cx.toString(dg).c_str(),
                             app.render.cy.toString(dg).c_str());
-                std::printf("  ref iters=%d escaped=%d rerefs=%d base=%.0f transfer=%d anchor=%d density=%.2f grad=%.4f\n", app.ref.length,
+                std::printf("  ref iters=%d escaped=%d rerefs=%d base=%.0f transfer=%d anchor=%d density=%.2f grad=%.4f refMs=%.0f blaMs=%.0f nodes=%zu\n", app.ref.length,
                             app.ref.escaped ? 1 : 0, app.rerefRounds,
                             app.shade.iterBase, app.shade.transfer, app.shade.anchor, app.shade.density,
-                            app.gens.empty() ? -1.f : app.gens[0].gradMed);
+                            app.gens.empty() ? -1.f : app.gens[0].gradMed, app.ref.computeMs,
+                            app.bla.buildMs, app.bla.nodes.size());
                 std::printf("  shown scale=%.6g render scale=%.6g gens=%zu\n", app.shown.scale,
                             app.render.scale, app.gens.size());
                 if (!app.gens.empty()) {

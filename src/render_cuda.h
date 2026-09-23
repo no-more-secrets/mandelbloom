@@ -96,6 +96,9 @@ public:
     // (1.0 = SDR white; values above 1 are HDR headroom).
     bool readOutputLinear(std::vector<float>& rgb);
     // Upload a new reference orbit (host arrays of `length` doubles).
+    // Whether the double kernel's copies of the reference and BLA table are
+    // kept on the device (set before uploading; the float kernel needs neither).
+    void setDoubleTables(bool on) { doubleTables_ = on; }
     bool uploadReference(const double* zr, const double* zi, int length, bool escaped);
     // Upload a BLA table built for the current reference and view.
     bool uploadBla(const struct BlaNode* nodes, const struct BlaNodeF* nodesF, int count,
@@ -242,6 +245,7 @@ private:
     int blaNodeCapacity_ = 0;
     int blaLevelCapacity_ = 0;
     DeviceBla bla_;
+    bool doubleTables_ = false;
     int* activeCount_ = nullptr;      // device
     unsigned long long* sliceStart_ns_ = nullptr;  // device, GPU clock at slice start
     int* activeCountHost_ = nullptr;  // pinned
