@@ -168,7 +168,26 @@ Timings on an RTX 4080, 1920x1200, 1x:
 
 ## Credits
 
-(dependencies / inspo list w/ licenses)
+Ideas and methods this viewer stands on:
+
+- [Fraktaler 3](https://fraktaler.mathr.co.uk/) by Claude Heiland-Allen (AGPL-3.0): the bilinear approximation formulas and merge rules, the float-with-exponent number type, and the distance-estimate and Milnor-normal shading it documents.
+- [Kalles Fraktaler 2+](https://mathr.co.uk/kf/kf.html) by Karl Runmo and Claude Heiland-Allen (AGPL-3.0): the general shape of a deep-zoom viewer, the iteration transfer and colouring conventions, and the zoom-video approach of keyframes 2x apart composited per frame.
+- [Imagina](https://github.com/5E-324/Imagina) by Zhuoran Ma: perturbation with rebasing, which removes the need for glitch detection in most places.
+- [FractalShark](https://github.com/mattsaccount364/FractalShark) by Matthew Hicks (GPL-3.0): a reference for running the whole perturbation pipeline on the GPU with CUDA.
+- K. I. Martin's *Superfractalthing* paper introduced perturbation rendering of the Mandelbrot set.
+- [Maths Town](https://www.youtube.com/@MathsTown) and the [KFMovieMaker](https://www.maths.town/after-effects-plugins/kfmoviemaker/) plugin for the look of the shading and zoom videos.
+
+Libraries shipped in the installer:
+
+- [SDL3](https://libsdl.org/) (zlib licence): window, input, display properties.
+- [Dear ImGui](https://github.com/ocornut/imgui) (MIT): the overlay UI, with its SDL3 and Direct3D 12 backends.
+- [GMP](https://gmplib.org/) (LGPL-3.0 / GPL-2.0) and [MPFR](https://www.mpfr.org/) (LGPL-3.0): high-precision reference orbits.
+- [tinyexr](https://github.com/syoyo/tinyexr) (BSD-3-Clause) with [miniz](https://github.com/richgel999/miniz) (MIT): EXR screenshots.
+- [stb_image_write](https://github.com/nothings/stb) (MIT / public domain): PNG screenshots.
+- NVIDIA CUDA Toolkit runtime (NVIDIA EULA), linked statically.
+- Microsoft Visual C++ runtime (app-local redistributable).
+
+Tools used to build and package: CMake, Ninja, [vcpkg](https://vcpkg.io/), [NSIS](https://nsis.sourceforge.io/) (zlib licence), ImageMagick for the icon, and SSL.com eSigner for signing. Video export uses an [FFmpeg](https://ffmpeg.org/) you install yourself (LGPL/GPL), driven as a separate process.
 
 Developed with Claude Fable 5.1
 
